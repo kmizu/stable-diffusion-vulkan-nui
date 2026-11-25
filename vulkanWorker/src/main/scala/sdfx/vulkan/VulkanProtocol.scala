@@ -9,11 +9,19 @@ import sdfx.core.protocol.*
 import ujson.{Arr, Obj, Value}
 
 private[vulkan] object VulkanProtocol:
-  val samplers = Map("DPM++ 2M" -> "dpm++2m", "Euler" -> "euler", "Euler a" -> "euler_a")
-  val schedulers = Map("Karras" -> "karras", "Uniform" -> "discrete")
-  def defaultSchedule(sampler: String): String = if sampler == "DPM++ 2M" then "Karras" else "Uniform"
-  val samplerList = SamplerList(Seq("DPM++ 2M", "Euler", "Euler a").map(s => SamplerInfo(s, true, defaultSchedule(s))),
-    Seq("Automatic", "Karras", "Uniform"))
+  private val samplerDefinitions = Vector(
+    ("DPM++ 2M", "dpm++2m", "Karras"), ("Euler", "euler", "Uniform"), ("Euler a", "euler_a", "Uniform"),
+    ("DPM++ 2M SDE", "dpm++2m_sde", "Exponential"), ("DPM++ 2S a", "dpm++2s_a", "Karras"),
+    ("LMS", "lms", "Uniform"), ("Heun", "heun", "Uniform"), ("DPM2", "dpm2", "Karras"), ("LCM", "lcm", "Uniform"))
+  val samplers = samplerDefinitions.map((name, method, _) => name -> method).toMap
+  private val schedulerDefinitions = Vector("Karras" -> "karras", "Uniform" -> "discrete",
+    "Exponential" -> "exponential", "SGM Uniform" -> "sgm_uniform", "Align Your Steps" -> "ays",
+    "Simple" -> "simple", "Normal" -> "discrete", "Beta" -> "beta")
+  val schedulers = schedulerDefinitions.toMap
+  val samplerList = SamplerList(samplerDefinitions.map((name, _, schedule) => SamplerInfo(name, true, schedule)),
+    "Automatic" +: schedulerDefinitions.map(_._1), upscalers = (VulkanImageInputs.upscalers.keys.toSeq ++ Seq("Nearest", "Lanczos")).distinct.sorted,
+    preprocessors = sdfx.vulkan.tools.VulkanTools.preprocessors)
+  def defaultSchedule(sampler: String): String = samplerList.samplers.find(_.name == sampler).get.defaultScheduler
   def unsupported(what: String): Nothing = throw EngineError("unsupported", s"Vulkan worker does not support $what")
   def invalid(what: String): Nothing = throw EngineError("invalid_params", what)
 
@@ -33,17 +41,14 @@ private[vulkan] object VulkanProtocol:
     checkFields(raw("params"), wire("params"))
     p.validate.headOption.foreach(invalid)
     if req.outputDir.isBlank then invalid("output_dir is required")
-    if p.isImg2Img then unsupported("img2img")
-    if p.hires.enabled then unsupported("hires fix")
-    if p.loras.nonEmpty || req.loraPaths.nonEmpty || req.manualLoras.exists(_.nonEmpty) ||
-        req.hiresLoras.exists(_.nonEmpty) || req.img2imgHiresLoras.exists(_.nonEmpty) then unsupported("LoRA")
-    if p.controlnet.exists(_.enabled) || req.controlnetPaths.nonEmpty then unsupported("ControlNet")
-    if req.embeddingPaths.nonEmpty then unsupported("textual inversion embeddings")
-    if p.hooks.nonEmpty then unsupported(s"engine hooks: ${p.hooks.keys.toSeq.sorted.mkString(", ")}")
-    if p.vae.exists(s => !Set("", "None", "Automatic")(s)) then unsupported("external VAE")
+    p.hooks.foreach { (key, config) =>
+      if !VulkanGraph.hooks(key) && !Set("embedding_merge", "save_intermediate", "steps_animation", "apg", "cfg_schedule", "tiling", "neveroom", "model_sampling", "model_keyword", "pnginfo_injection", "inpaint_difference", "img2img_hires_fix")(key) then unsupported(s"engine hook $key")
+      if config.objOpt.isEmpty then invalid(s"Invalid configuration for $key")
+      if key == "pnginfo_injection" && config.obj.keys.exists(_ != "enabled") then invalid("Invalid PNG resource hash configuration")
+      config.obj.get("enabled").foreach(value => decode(value.bool))
+    }
     if p.subseedStrength != 0 then unsupported("variation strength")
-    if p.eta.nonEmpty then unsupported("eta")
-    if req.systemInfoFields.nonEmpty then unsupported("system info fields")
+    if p.eta.exists(v => !v.isFinite || v < 0) then invalid("eta must be finite and nonnegative")
     if !samplers.contains(p.samplerName) then unsupported(s"sampler ${p.samplerName}")
     val schedule = if p.scheduler == "Automatic" then defaultSchedule(p.samplerName) else p.scheduler
     if !schedulers.contains(schedule) then unsupported(s"scheduler ${p.scheduler}")

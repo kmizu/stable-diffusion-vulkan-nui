@@ -15,7 +15,9 @@ final class VulkanBackendProvider extends EngineBackendProvider:
       codeSource.getParent.getParent.resolve("vulkan")
     }
     val runtime = packaged.getOrElse(home.root.toAbsolutePath.resolve("vulkan")).normalize()
-    val javaExe = runtime.resolve("jre/bin/java.exe")
+    val sourceBuild = packaged.isEmpty && !Files.isDirectory(runtime) &&
+      Files.isRegularFile(home.root.resolve("build.sbt"))
+    val javaExe = if sourceBuild then Paths.get(sys.props("java.home"), "bin", "java.exe") else runtime.resolve("jre/bin/java.exe")
     if dryRun then
       val exe = if sys.props("os.name").startsWith("Windows") then "java.exe" else "java"
       val current = Path.of(sys.props("java.home"), "bin", exe)
@@ -25,14 +27,16 @@ final class VulkanBackendProvider extends EngineBackendProvider:
         .getOrElse(throw IllegalArgumentException("JVM dry-run worker missing from classpath"))
       return EngineLaunch(Seq(java.toString, "-Djava.awt.headless=true", "-cp", cp, "sdfx.engine.JvmDryRunWorker"),
         home.root.toAbsolutePath.normalize())
-    val jar = runtime.resolve("vulkan-worker.jar")
-    val libraries = runtime.resolve("bin")
+    val jar = if sourceBuild then home.root.resolve("target/vulkan-worker.jar") else runtime.resolve("vulkan-worker.jar")
+    val libraries = if sourceBuild then environment.get("SDFX_VULKAN_LIBRARY_DIR").map(Path.of(_))
+      .getOrElse(home.root.resolve("target/vulkan-upstream/bin")).toAbsolutePath else runtime.resolve("bin")
     require(Files.isRegularFile(javaExe), s"Vulkan Java 25 runtime missing: $javaExe")
     require(Files.isRegularFile(jar), s"Vulkan worker missing: $jar")
     require(Files.isDirectory(libraries), s"Vulkan native library directory missing: $libraries")
     val inheritedPath = environment.collectFirst { case (key, value) if key.equalsIgnoreCase("PATH") => value }
     val workerEnv = Map(
       "SDFX_VULKAN_LIBRARY_DIR" -> libraries.toString,
+      "SDFX_VULKAN_OFFLINE" -> environment.getOrElse("SDFX_VULKAN_OFFLINE",settings.hfOffline.toString),
       "PATH" -> (libraries.toString +: inheritedPath.toList).mkString(java.io.File.pathSeparator)
     ) ++ environment.get("SDFX_VULKAN_DEVICE").orElse(settings.vulkanDevice).map("SDFX_VULKAN_DEVICE" -> _)
     EngineLaunch(

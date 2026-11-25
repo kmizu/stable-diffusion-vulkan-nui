@@ -2,9 +2,11 @@
 
 **English** | [日本語](README.md)
 
-Launch `SDV-NUI.exe` on Windows to generate images with SD1.5 or SDXL using Vulkan. [Setup and build instructions](docs/WINDOWS_VULKAN.md)
+Launch `SDV-NUI.exe` on Windows and select your checkpoint directory and Vulkan GPU in Settings. SD1.5 and SDXL support txt2img, img2img, inpainting, hires, LoRA and ControlNet. The Java 25 worker calls stable-diffusion.cpp directly. The distribution runs without Python, PyTorch or CUDA.
 
-[kmizu/stable-diffusion-vulkan-nui](https://github.com/kmizu/stable-diffusion-vulkan-nui)
+[Setup and build instructions](docs/WINDOWS_VULKAN.md) · [Feature porting status](docs/vulkan-parity.md)
+
+<details><summary>Original Stable Diffusion NUI documentation</summary>
 
 **Manual: <https://kmizu.github.io/stable-diffusion-nui/en/>** (Japanese: <https://kmizu.github.io/stable-diffusion-nui/>)
 
@@ -360,3 +362,5 @@ The Scala runtime is included in the fat jar (the `ui` jar), so you normally do 
 
 AGPL-3.0 (`LICENSE`). This is because processing from the AUTOMATIC1111 web UI, Forge and reForge (AGPL-3.0) and from ComfyUI and Fooocus (GPL-3.0) has been ported.
 The licences of each port source, re-implementation source and dependency are in `THIRD_PARTY_NOTICES.md` and `licenses/` (regenerate with `python scripts/third_party.py`).
+
+</details>

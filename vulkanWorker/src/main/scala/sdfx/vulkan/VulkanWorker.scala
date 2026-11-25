@@ -1,5 +1,6 @@
 package sdfx.vulkan
 
+import java.awt.image.BufferedImage
 import java.io.{BufferedReader, InputStreamReader, OutputStream, OutputStreamWriter}
 import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.{Files, Path}
@@ -11,8 +12,9 @@ import scala.jdk.CollectionConverters.*
 import scala.util.Using
 import scala.util.control.NonFatal
 import sdfx.core.imagebrowser.BrowserFiles
-import sdfx.core.infotext.HardwareInfo
+import sdfx.core.infotext.{HardwareInfo, Img2ImgHiresMetadata}
 import sdfx.core.protocol.*
+import sdfx.vulkan.tools.VulkanTools
 import ujson.{Arr, Obj, Str, Value}
 
 object VulkanWorker:
@@ -27,6 +29,9 @@ object VulkanWorker:
 
 private final class VulkanWorker(backend: VulkanInference, selection: Option[String], out: OutputStream):
   import VulkanProtocol.*
+  private var activeResourceFiles = Map.empty[String,VulkanHashes.File]
+  private val toolSession = new VulkanTools.Session
+  private val controlModels = new sdfx.vulkan.tools.VulkanControlModels
   private val adapters = backend.devices().asScala.toVector
   private val device = select(adapters, selection)
   private val writer = new OutputStreamWriter(out, UTF_8)
@@ -35,9 +40,17 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
   private val jobs = mutable.LinkedHashMap.empty[String, Job]
   private var protection = InterruptionProtection()
   @volatile private var loaded = Option.empty[LoadedModel]
+  private val benchmarks = new sdfx.vulkan.tools.VulkanBenchmarks
+  private val benchmarkCommands = Set("system_benchmark", "vram_estimator")
+  @volatile private var loadRequest = Option.empty[LoadModelRequest]
+  private var activeOptions = Option.empty[VulkanInference.ModelOptions]
 
-  private final class Job(val id: String, val kind: String, val owner: Option[String]):
+  private final class Job(val id: String, val kind: String, val owner: Option[String], val imagePassword: Option[String]):
     @volatile var cancelled = false
+    @volatile var interrupts = 0
+    var frames = Option.empty[sdfx.vulkan.tools.VulkanFrames]
+    var commit: () => Unit = () => ()
+    var publishing = false
     var running = false
     val files = mutable.ArrayBuffer.empty[Path]
     def check(): Unit = if cancelled then throw CancellationException()
@@ -69,7 +82,16 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
 
   private def hello = Obj("protocol" -> 1, "engine_version" -> "vulkan-sd.cpp-f296cb0", "cuda" -> false,
     "dry_run" -> false, "device" -> display(device), "vulkan_devices" -> Arr.from(adapters.map(display)),
-    "features" -> Arr("txt2img", "list_devices", "prevent_interrupt"))
+    "features" -> Arr.from(Vector("txt2img", "lora", "embeddings", "external_vae", "controlnet", "img2img", "animatediff", "animatediff_encode", "photomaker", "inpaint", "hires_fix", "img2img_hires_fix", "temporal_lab", "vae_tools", "list_devices", "system_info", "vram_estimator", "prevent_interrupt") ++ VulkanTools.features))
+
+  private def status =
+    val data = VulkanDiagnostics.status(device, backend.memory(device.id()), loaded)
+    loadRequest.foreach { r =>
+      data("runtime")("dtype") = r.dtype
+      data("runtime")("vram_mode") = r.vramMode
+      data("runtime")("vae_tiling") = r.vaeTiling
+    }
+    data
 
   def serve(in: BufferedReader): Unit =
     val greeting = hello
@@ -90,7 +112,7 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
             val kind = decode(msg("type").str)
             val params = msg.getOrElse("params", Obj())
             if params.objOpt.isEmpty then invalid("params must be an object")
-            if msg.contains("image_password") || msg.contains("allow_plaintext_video") then unsupported("protected image transport")
+            if !Set("vae_tools","temporal_lab")(kind) && msg.contains("image_password") || msg.contains("allow_plaintext_video") then unsupported("protected image transport")
             val owner = decode(msg.get("owner_id").map(_.str))
             kind match
               case "shutdown" =>
@@ -100,10 +122,9 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
               case "ping" => result(key, hello)
               case "list_samplers" => result(key, Json.toJs(samplerList))
               case "list_models" => result(key, models(params))
-              case "list_files" => result(key, Obj("files" -> Arr()))
               case "list_devices" => result(key, Obj("devices" -> Arr.from(adapters.map(d => Obj("id" -> d.id(), "name" -> d.name())))))
-              case "system_status" => result(key, Obj("loaded" -> loaded.nonEmpty, "device" -> display(device), "dry_run" -> false))
-              case "memory" => unsupported("adapter memory telemetry")
+              case "system_status" => result(key, status)
+              case "memory" => result(key, Json.toJs(VulkanDiagnostics.memory(backend.memory(device.id()))))
               case "interruption_protection" => lock.synchronized {
                 params.obj.get("enabled").foreach { v =>
                   val enabled = decode(v.bool)
@@ -116,7 +137,7 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
                 val expectedOwner = decode(params.obj.get("owner_id").map(_.str))
                 val job = jobs.values.find(j => target.forall(_ == j.id) && expectedOwner.forall(j.owner.contains))
                 val canCancel = kind == "interrupt" && !protection.enabled
-                val tooLate = canCancel && job.exists(j => j.running && j.kind != "txt2img")
+                val tooLate = canCancel && job.exists(j => j.running && (j.publishing || (!isGeneration(j.kind) && !benchmarkCommands(j.kind) && j.kind != "system_info" && j.kind != "clip_interrogator" && j.kind != "vae_tools" && j.kind != "temporal_lab" && !VulkanTools.commands(j.kind))))
                 val affected = canCancel && !tooLate && job.isDefined
                 if affected then job.foreach(cancel)
                 val decision = InterruptionDecision(!protection.enabled && !tooLate, protection.enabled, protection,
@@ -125,8 +146,8 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
                 response("active_id") = job.filter(j => affected && j.running).fold[Value](ujson.Null)(j => Str(j.id))
                 result(key, response)
               }
-              case "txt2img" | "load_model" | "unload" | "set_vae" =>
-                val job = new Job(key, kind, owner)
+              case k if VulkanTools.commands(k) || benchmarkCommands(k) || Set("txt2img", "img2img", "clip_interrogator", "temporal_lab", "vae_tools", "system_info", "load_model", "unload", "set_vae")(k) =>
+                val job = new Job(key, kind, owner, decode(msg.get("image_password").map(_.str)))
                 lock.synchronized {
                   if jobs.contains(key) then invalid("Duplicate in-flight request id")
                   jobs(key) = job
@@ -138,37 +159,122 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
       // On EOF release the context only after all admitted native calls have returned.
       stopJobs()
       executor.close()
+      try backend.unload() finally controlModels.close()
+
+  private def isGeneration(kind: String): Boolean = kind == "txt2img" || kind == "img2img"
 
   private def cancel(job: Job): Unit =
+    if job.publishing then return
+    job.interrupts += 1
     job.cancelled = true
-    if job.running && job.kind == "txt2img" then backend.cancel()
+    if job.running && (isGeneration(job.kind) || job.kind == "vae_tools" || job.kind == "clip_interrogator" || benchmarkCommands(job.kind)) then backend.cancel()
 
   private def stopJobs(): Unit = lock.synchronized { jobs.values.foreach(cancel) }
+
+  private def modelUpscale(path: Path, image: BufferedImage, width: Int, height: Int): BufferedImage =
+    val scaled = backend.upscale(path, device.id(), image, width, height)
+    sdfx.vulkan.tools.DiffusionImageResize.lanczos(scaled, width, height)
 
   private def execute(job: Job, raw: Value): Unit =
     try
       lock.synchronized { job.check(); job.running = true }
       val response = job.kind match
+        case "temporal_lab" =>
+          sdfx.vulkan.tools.VulkanTemporal.execute(raw, () => job.check(), () => lock.synchronized {
+            job.check()
+            job.publishing = true
+          }, (step,total,phase) => emit(Obj("id" -> job.id,"type" -> "event","event" -> "progress",
+            "step" -> step,"total" -> total,"pass" -> phase)),job.imagePassword)
+        case "clip_interrogator" =>
+          sdfx.vulkan.tools.VulkanClip.execute(raw,backend,device.id(),() => job.check(),(stage,step,total) =>
+            emit(Obj("type" -> "event","id" -> job.id,"event" -> "progress","pass" -> stage,"step" -> step,"total" -> total)))
+        case "vae_tools" =>
+          sdfx.vulkan.tools.VulkanVae.execute(raw, backend, currentModel, () => job.cancelled, () => lock.synchronized {
+            job.check()
+            job.publishing = true
+          }, (name, fields) => {
+            fields("event") = name
+            fields("type") = "event"
+            fields("id") = job.id
+            emit(fields)
+          }, job.imagePassword)
+        case k if VulkanTools.commands(k) =>
+          VulkanTools.execute(k, raw, () => job.cancelled, () => lock.synchronized {
+            job.check()
+            job.publishing = true
+          }, (name, fields) => {
+            fields("event") = name
+            fields("type") = "event"
+            fields("id") = job.id
+            emit(fields)
+          }, display(device), loaded.map(_.kind), modelUpscale, toolSession, loaded)
+        case k if benchmarkCommands(k) =>
+          benchmarks.run(k, raw, status, loadRequest, () => backend.memory(device.id()), () => job.cancelled,
+            (name, fields) =>
+              fields("event") = name
+              fields("type") = "event"
+              fields("id") = job.id
+              emit(fields),
+            (p, dir) =>
+              val request = GenerationRequest(p, dir.toString, previewEvery = 0)
+              Json.fromJs[GenerationResult](generate(job, generation(Json.toJs(request)))))
+        case "system_info" => VulkanDiagnostics.inventory(raw, status, hello("features"), () => job.check())
         case "load_model" => load(raw)
         case "unload" =>
           backend.unload()
           loaded = None
+          loadRequest = None
+          activeOptions = None
           Obj()
         case "set_vae" =>
-          if raw.obj.get("path").exists(_ != ujson.Null) then unsupported("external VAE")
-          Json.toJs(currentModel)
-        case "txt2img" => generate(job, generation(raw))
+          val model = currentModel
+          val path = decode(raw.obj.get("path").filterNot(_ == ujson.Null).map(_.str)).map(VulkanConditioning.file(_, "VAE"))
+          if path == model.vaePath then Json.toJs(model)
+          else loadModel(loadRequest.get.copy(vaePath = path))
+        case "txt2img" | "img2img" =>
+          sdfx.vulkan.tools.VulkanEmbeddings.withGeneration(raw, currentModel, () => job.cancelled) { prepared =>
+            runGeneration(job,prepared)
+          }
       lock.synchronized {
         job.check()
+        job.commit()
         result(job.id, response)
         jobs.remove(job.id)
       }
     catch case e if NonFatal(e) || e.isInstanceOf[OutOfMemoryError] =>
+      job.frames.foreach(_.incomplete(() => job.interrupts > 1))
       job.files.foreach(p => try Files.deleteIfExists(p) catch case NonFatal(ex) => System.err.println(ex.getMessage))
       lock.synchronized {
         error(Str(job.id), if job.cancelled then CancellationException() else e)
         jobs.remove(job.id)
       }
+
+  private def runGeneration(job: Job, raw: Value): Value =
+    val gen = generation(raw)
+    val req = gen.request
+    val mode = req.previewMethod match
+      case "none" => "none"
+      case "approx" => "proj"
+      // Decode with the active VAE when separate TAESD weights are unavailable.
+      case "taesd" => if sdfx.vulkan.tools.VulkanVae.tinyPath(currentModel,None).isDefined then "tae" else "vae"
+      case "vae" => "vae"
+      case method => invalid(s"Unknown preview method: $method")
+    job.frames = sdfx.vulkan.tools.VulkanFrames.start(req, () => job.cancelled)
+    val recording = job.frames.map(_.config)
+    val noisy = recording.exists(_.imageType == "Noisy")
+    val preview = req.previewEvery > 0 && mode != "none"
+    val decoder = recording.fold(mode)(c => if c.imageType == "Preview" && mode == "proj" then "proj" else "vae")
+    Using.resource(backend.generationSettings(if recording.isDefined then 1 else req.previewEvery, decoder,
+      req.params.eta.map(Double.box).orNull, preview || !noisy, noisy,
+      (step, pass, passSteps, isNoisy, frame) =>
+        if isNoisy == noisy then job.frames.foreach(_.frame(step,pass,passSteps,frame))
+        if !job.cancelled && preview && !isNoisy && step % req.previewEvery == 0 then
+          val bytes = new java.io.ByteArrayOutputStream()
+          if ImageIO.write(frame, "jpeg", bytes) then
+            emit(Obj("id" -> job.id, "type" -> "event", "event" -> "preview", "step" -> step,
+              "jpeg_b64" -> java.util.Base64.getEncoder.encodeToString(bytes.toByteArray))))) { _ =>
+      generate(job, gen)
+    }
 
   private def currentModel: LoadedModel =
     loaded.getOrElse(throw EngineError("no_model", "Load a checkpoint before generation"))
@@ -176,54 +282,180 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
   private def load(raw: Value): Value =
     val req = decode(Json.fromJs[LoadModelRequest](raw))
     checkFields(raw, Json.toJs(req))
-    if req.vaePath.nonEmpty || req.vaeTiling || req.vaeSlicing || req.vaeFp16 then unsupported("custom VAE settings")
-    if req.fp8Storage then unsupported("FP8 storage")
-    if !Set("gpu", "auto")(req.vramMode) then unsupported(s"VRAM mode ${req.vramMode}")
-    val weights = req.dtype match
-      case "fp16" => "f16"
-      case "fp32" => "f32"
-      case other => unsupported(s"dtype $other")
+    loadModel(req)
+
+  private def loadModel(req: LoadModelRequest): Value =
+    val opts = VulkanConditioning.options(req, device.id())
     val path = Path.of(req.path).toAbsolutePath.normalize()
     if !Files.isRegularFile(path) || !checkpoint(path) then invalid(s"A .safetensors checkpoint file is required: $path")
     val start = System.nanoTime()
     try
       val hash = BrowserFiles.sha256(path).take(10)
-      backend.load(path, device.id(), weights)
+      val vae = Option(opts.vae()).filter(_.nonEmpty)
+      val vaeHash = vae.map(p => BrowserFiles.sha256(Path.of(p)).take(10))
+      backend.load(path, device.id(), opts)
       val kind = backend.modelVersion() match
         case "SD 1.x" => "sd15"
         case "SDXL" => "sdxl"
         case other => other
       val model = LoadedModel(path.getFileName.toString.dropRight(".safetensors".length), path.toString,
-        kind, hash, (System.nanoTime() - start) / 1000000, modelToken = Some(UUID.randomUUID().toString))
+        kind, hash, (System.nanoTime() - start) / 1000000, vae.map(VulkanConditioning.stem), vaeHash,
+        modelToken = Some(UUID.randomUUID().toString), vaePath = vae)
       loaded = Some(model)
+      loadRequest = Some(req.copy(path = path.toString, vaePath = vae))
+      activeOptions = Some(opts)
+      activeResourceFiles = Map.empty
       Json.toJs(model)
     catch
       case e: VulkanInference.NativeFailure => throw e
       case NonFatal(e) => throw EngineError("model_load_failed", s"${display(device)}: ${e.getMessage}")
 
+  private def prepareConditioning(req: GenerationRequest, job: Job, resources: Option[VulkanHashes.Run] = None): VulkanInference.Conditioning =
+    val previous = loadRequest.get
+    req.params.vae.filter(_.nonEmpty).foreach { name =>
+      val matches = if Set("Automatic", "None")(name) then previous.vaePath.isEmpty
+        else previous.vaePath.exists(path => path == name || VulkanConditioning.stem(path) == name.replace('\\', '/').split('/').last)
+      if !matches then invalid(s"Select VAE '$name' with set_vae before generation")
+    }
+    val selected = req.params.controlnet.filter(_.enabled).map(_.model).toSet
+    val controls = req.controlnetPaths.collect { case (name,path) if selected(name) =>
+      name -> controlModels.resolve(path,currentModel.kind,() => job.cancelled)
+    }
+    val (control, conditioning) = VulkanConditioning.prepare(req.copy(controlnetPaths = controls), previous, () => job.cancelled)
+    val names = req.embeddingPaths.map(VulkanConditioning.stem).toSet
+    val extra = toolSession.embeddingPaths(currentModel).filterNot(p => names(VulkanConditioning.stem(p)))
+    val embeddings = VulkanConditioning.activeEmbeddings(req.copy(embeddingPaths = req.embeddingPaths ++ extra))
+    val baseOptions = VulkanConditioning.options(previous, device.id(), control, embeddings, req.params.hooks)
+    val tiny = Option.when(req.previewMethod == "taesd")(sdfx.vulkan.tools.VulkanVae.tinyPath(currentModel,None)).flatten
+    val opts = tiny.fold(baseOptions)(path => baseOptions.withTinyPreview(path.toString))
+    if !activeOptions.contains(opts) then
+      val controlFile = controls.find(_._2 == control).map { (name,normalized) =>
+        val selectedPath = Path.of(req.controlnetPaths(name))
+        val file = if Files.isDirectory(selectedPath) then selectedPath.resolve(Path.of(normalized).getFileName) else selectedPath
+        s"controlnet:${file.getFileName}" -> file.toString
+      }
+      val paths = opts.embeddings().asScala.map(e => s"embed:${e.name()}" -> e.path()).toVector ++ controlFile
+      val files = paths.map((k,v) => k -> new VulkanHashes.File(Path.of(v))).toMap
+      backend.load(Path.of(previous.path), device.id(), opts)
+      activeOptions = Some(opts)
+      activeResourceFiles = files
+    resources.foreach { run =>
+      activeResourceFiles.foreach(run.record)
+      req.params.loras.foreach { lora =>
+        req.loraPaths.get(lora.name).foreach(path => run.record(s"lora:${lora.name}", new VulkanHashes.File(Path.of(path))))
+      }
+    }
+    conditioning
+
   private def generate(job: Job, gen: Generation): Value =
     val model = currentModel
     val req = gen.request
     val p = req.params
+    if isGeneration(job.kind) && ((job.kind == "img2img") != p.isImg2Img) then invalid("img2img requests require an init image and the img2img operation")
+    val hires = VulkanImageInputs.hires(req)
+    val separateHires = VulkanImageInputs.separateHires(req)
+    val refinement = Img2ImgHiresMetadata.active(p.hooks)
     val dir = Files.createDirectories(Path.of(req.outputDir).toAbsolutePath.normalize())
     val start = System.nanoTime()
     val firstSeed = if p.seed >= 0 then p.seed else ThreadLocalRandom.current().nextLong(1L << 32)
-    val imgs = (0 until p.imagesPerJob).map { i =>
+    val keyword = sdfx.vulkan.tools.VulkanKeyword.plan(req, model, toolSession, firstSeed, () => job.cancelled)
+    keyword.foreach(plan => job.commit = plan.commit)
+    val resources = Option.when(p.hooks.get("pnginfo_injection").exists(!_.obj.get("enabled").contains(ujson.Bool(false))))(new VulkanHashes.Run)
+    val conditioning = Option.when(keyword.isEmpty)(prepareConditioning(req, job, resources))
+    val difference = p.hooks.get("inpaint_difference").filterNot(_.obj.get("enabled").contains(ujson.Bool(false))).map { config =>
+      val path = p.img2img.getOrElse(invalid("Inpaint Difference requires an img2img input")).initImage
+      val image = sdfx.vulkan.tools.DiffusionImageInput.readRgb(Path.of(path), maxBytes = 200000000L)
+      (image, VulkanTools.differenceMask(config, image, () => job.cancelled))
+    }
+    val graph = p.hooks.keysIterator.find(k => VulkanGraph.hooks(k) && !p.hooks(k).obj.get("enabled").contains(ujson.Bool(false)))
+    val imgs = (0 until p.imagesPerJob).flatMap { i =>
       job.check()
       val seed = Math.addExact(firstSeed, i.toLong)
-      val image = backend.generate(p.prompt, p.negativePrompt, p.width, p.height, p.steps, p.cfgScale, seed,
-        samplers(p.samplerName), schedulers(gen.scheduler), p.clipSkip, (stage, step, total) =>
-          if job.cancelled then backend.cancel()
-          else emit(Obj("id" -> job.id, "type" -> "event", "event" -> "progress", "step" -> step, "total" -> total,
-            "pass" -> stage, "image" -> i, "images" -> p.imagesPerJob, "batch_size" -> 1)))
-      job.check()
-      val file = Files.createTempFile(dir, "vulkan-", ".png")
-      job.files += file
-      if !ImageIO.write(image, "png", file.toFile) then throw IllegalStateException("PNG writer unavailable")
-      val hardware = Option.when(req.hardwareInfo.enabled)(HardwareInfo.Record(display(device),
-        f"${(System.nanoTime() - start) / 1e9}%.2fs", Option(req.hardwareInfo.remark).filter(_.nonEmpty)))
-      GeneratedImage(file.toString, seed, width = image.getWidth, height = image.getHeight, hardwareInfo = hardware,
-        infotextFields = Seq("Vulkan device" -> display(device)))
+      job.frames.foreach(_.begin(i,seed))
+      val inputs = p.img2img.map(VulkanImageInputs.prepare(_, p.width, p.height, seed, difference, () => job.cancelled))
+      val imageOptions = new VulkanInference.ImageOptions(inputs.map(_.init).orNull,
+        inputs.flatMap(_.mask).orNull, p.img2img.fold(0.75)(_.denoisingStrength), hires.filterNot(_ => separateHires).orNull)
+      def progress(pass: Option[String]): VulkanInference.Progress = (stage, step, total) =>
+        if job.cancelled then backend.cancel()
+        else emit(Obj("id" -> job.id, "type" -> "event", "event" -> "progress", "step" -> step, "total" -> total,
+          "pass" -> pass.getOrElse(stage), "image" -> i, "images" -> p.imagesPerJob, "batch_size" -> 1))
+      val planned = keyword.map(_.images(i))
+      val activePrompt = planned.fold(p.prompt)(_.prompt)
+      val activeConditioning = conditioning.getOrElse {
+        val adapted = req.copy(params = p.copy(prompt = activePrompt, loras = planned.get.loras))
+        prepareConditioning(adapted, job, resources)
+      }
+      val rendered = graph match
+        case Some(hook) => VulkanGraph.render(backend, device.id(), model, loadRequest.get, req, hook,
+          activePrompt, planned.fold(p.loras)(_.loras), seed, gen.scheduler)
+        case None =>
+          val generated = backend.generate(activePrompt, p.negativePrompt, p.width, p.height, p.steps, p.cfgScale, seed,
+            samplers(p.samplerName), schedulers(gen.scheduler), p.clipSkip, imageOptions, activeConditioning, progress(None))
+          val highres = if !separateHires then generated else
+            job.check()
+            val h = p.hires
+            val native = hires.get
+            val w = native.width
+            val ht = native.height
+            val source = VulkanTools.upscaleImage(h.upscaler,req.upscalerPaths,generated,w,ht,modelUpscale)
+            val sampler = h.samplerName.getOrElse(p.samplerName)
+            val method = samplers.getOrElse(sampler,unsupported(s"hires sampler $sampler"))
+            val scheduler = h.scheduler.getOrElse(p.scheduler)
+            val schedule = if scheduler == "Automatic" then defaultSchedule(sampler) else scheduler
+            val steps = if native.steps == 0 then p.steps else native.steps
+            // sd.cpp img2img retains floor(scheduleSteps*strength)+1 steps.
+            val scheduleSteps = math.max(steps,math.floor(steps/native.strength).toInt)
+            if scheduleSteps > 10000 then invalid("Hires schedule exceeds 10000 steps")
+            val strength = (steps - 0.5) / scheduleSteps
+            val pass = p.copy(width = w, height = ht, steps = steps, samplerName = sampler, scheduler = schedule,
+              cfgScale = h.cfgScale.getOrElse(p.cfgScale), prompt = Option(h.prompt).filter(_.nonEmpty).getOrElse(activePrompt),
+              negativePrompt = Option(h.negativePrompt).filter(_.nonEmpty).getOrElse(p.negativePrompt),
+              hires = h.copy(enabled = false), loras = req.hiresLoras.getOrElse(planned.fold(p.loras)(_.loras)))
+            val mask = inputs.flatMap(_.mask).map(VulkanImageInputs.resize(_,w,ht,0)).orNull
+            val condition = prepareConditioning(req.copy(params = pass),job,resources)
+            backend.generate(pass.prompt,pass.negativePrompt,w,ht,scheduleSteps,pass.cfgScale,seed,method,
+              schedulers.getOrElse(schedule,unsupported(s"hires scheduler $schedule")),p.clipSkip,
+              new VulkanInference.ImageOptions(source,mask,strength,null),condition,progress(Some("hires")))
+          val first = inputs.fold(highres)(_.finish(highres))
+          val image = refinement.fold(first) { h =>
+            job.check()
+            val (w, ht) = Img2ImgHiresMetadata.targetSize(h, first.getWidth, first.getHeight)
+            val resized = VulkanTools.upscaleImage(h("upscaler").str, req.upscalerPaths, first, w, ht, modelUpscale)
+            val strength = h("denoise").num
+            if strength == 0 then resized
+            else
+              job.check()
+              def inherit(key: String, fallback: String) = Option(h(key).str).filter(_.nonEmpty).getOrElse(fallback)
+              val sampler = if h("sampler").str == "Use same sampler" then p.samplerName else h("sampler").str
+              val schedule = if h("scheduler").str == "Use same scheduler" then p.scheduler else h("scheduler").str
+              val method = samplers.getOrElse(sampler, unsupported(s"refinement sampler $sampler"))
+              val actualSchedule = if schedule == "Automatic" then defaultSchedule(sampler) else schedule
+              val steps = h("steps").num.toInt
+              val cfg = h("cfg").num
+              val refinementParams = p.copy(width = w, height = ht, steps = if steps == 0 then p.steps else steps, cfgScale = if cfg == 0 then p.cfgScale else cfg, hires = p.hires.copy(enabled = false),
+                loras = req.img2imgHiresLoras.getOrElse(planned.fold(p.loras)(_.loras)))
+              val conditioning2 = prepareConditioning(req.copy(params = refinementParams.copy(prompt = inherit("prompt",activePrompt))), job, resources)
+              backend.generate(inherit("prompt", activePrompt), inherit("negative_prompt", p.negativePrompt), w, ht,
+                if steps == 0 then p.steps else steps, if cfg == 0 then p.cfgScale else cfg, seed, method,
+                schedulers.getOrElse(actualSchedule, unsupported(s"refinement scheduler $actualSchedule")), p.clipSkip,
+                new VulkanInference.ImageOptions(resized, null, strength, null), conditioning2, progress(Some("img2img_hires")))
+          }
+          Seq(image)
+      rendered.map { image =>
+        job.check()
+        job.frames.foreach(_.finalImage(image))
+        val file = Files.createTempFile(dir, "vulkan-", ".png")
+        job.files += file
+        if !ImageIO.write(image, "png", file.toFile) then throw IllegalStateException("PNG writer unavailable")
+        val hardware = Option.when(req.hardwareInfo.enabled)(HardwareInfo.Record(display(device),
+          f"${(System.nanoTime() - start) / 1e9}%.2fs", Option(req.hardwareInfo.remark).filter(_.nonEmpty)))
+        GeneratedImage(file.toString, seed, width = image.getWidth, height = image.getHeight, hardwareInfo = hardware,
+          effectivePrompt = planned.map(_.replay), modelKeywordSourcePrompt = planned.map(_.source),
+          infotextFields = Seq("Vulkan device" -> display(device)))
+      }
     }
     Json.toJs(GenerationResult(imgs, (System.nanoTime() - start) / 1e9, Some(model.name), Some(model.hash),
-      scheduler = Some(gen.scheduler)))
+      intermediateArtifacts = job.frames.toSeq.flatMap(_.finish()),
+      systemInfo = Option.when(req.systemInfoFields.nonEmpty)(VulkanDiagnostics.metadata(status, req.systemInfoFields)),
+      scheduler = Some(gen.scheduler), warnings = resources.toSeq.flatMap(_.warnings),
+      resourceHashes = resources.map(r => r.hashes ++ Map("model" -> model.hash) ++ model.vaeHash.map("vae" -> _)).getOrElse(Map.empty)))

@@ -12,7 +12,11 @@ object Gif:
   private val Format = "javax_imageio_gif_image_1.0"
 
   def write(frames: Seq[BufferedImage], dst: Path, frameMillis: Int, loop: Boolean = true): Path =
-    require(frames.nonEmpty, "a GIF needs at least one frame")
+    writeSequence(frames.iterator, dst, frameMillis, Option.when(loop)(0))
+
+  def writeSequence(frames: Iterator[BufferedImage], dst: Path, frameMillis: Int, loopCount: Option[Int]): Path =
+    require(frames.hasNext, "a GIF needs at least one frame")
+    require(loopCount.forall(n => n >= 0 && n <= 65535), "invalid GIF loop count")
     val writer = ImageIO.getImageWritersByFormatName("gif").next()
     Option(dst.toAbsolutePath.getParent).foreach(Files.createDirectories(_))
     try
@@ -22,7 +26,7 @@ object Gif:
         frames.zipWithIndex.foreach { (f0, i) =>
           val f = toRgb(f0)
           val meta = writer.getDefaultImageMetadata(ImageTypeSpecifier.createFromRenderedImage(f), writer.getDefaultWriteParam)
-          configure(meta, math.max(1, frameMillis / 10), loop && i == 0)
+          configure(meta, math.max(1, frameMillis / 10), loopCount.filter(_ => i == 0))
           writer.writeToSequence(new IIOImage(f, null, meta), writer.getDefaultWriteParam)
         }
         writer.endWriteSequence()
@@ -39,7 +43,7 @@ object Gif:
       g.dispose()
       out
 
-  private def configure(meta: IIOMetadata, delayCs: Int, loop: Boolean): Unit =
+  private def configure(meta: IIOMetadata, delayCs: Int, loop: Option[Int]): Unit =
     val root = meta.getAsTree(Format).asInstanceOf[IIOMetadataNode]
     val gce = child(root, "GraphicControlExtension")
     gce.setAttribute("disposalMethod", "none")
@@ -47,13 +51,14 @@ object Gif:
     gce.setAttribute("transparentColorFlag", "FALSE")
     gce.setAttribute("delayTime", delayCs.toString)
     gce.setAttribute("transparentColorIndex", "0")
-    if loop then
+    loop.foreach { n =>
       val apps = child(root, "ApplicationExtensions")
       val app = new IIOMetadataNode("ApplicationExtension")
       app.setAttribute("applicationID", "NETSCAPE")
       app.setAttribute("authenticationCode", "2.0")
-      app.setUserObject(Array[Byte](1, 0, 0)) // loop forever
+      app.setUserObject(Array[Byte](1, n.toByte, (n >>> 8).toByte))
       apps.appendChild(app)
+    }
     meta.setFromTree(Format, root)
 
   private def child(root: IIOMetadataNode, name: String): IIOMetadataNode =

@@ -2,7 +2,7 @@
 
 ## Windows Vulkan distribution (2026-11-26)
 
-Use the Vulkan build profile for CUDA-free SD1.5/SDXL txt2img. [Build and usage](WINDOWS_VULKAN.md) covers the Java 25 worker, adapter selection and supported operations. [Verification](vulkan-worker-verification.md) records packaged runs on Radeon 780M and RTX 3090.
+The current goal is to port the complete desktop and MCP feature set to the CUDA-free Vulkan worker. See the [feature inventory](vulkan-parity.md) for remaining gaps. [Build and usage](WINDOWS_VULKAN.md) covers the Java 25 worker, adapter selection and supported operations. [Verification](vulkan-worker-verification.md) records packaged runs on Radeon 780M and RTX 3090.
 
 Current checkpoint (2026-11-03): start with [HANDSOFF.md](../HANDSOFF.md). The previous v0.1 release is published; the next batch has 2/10 accepted issues (#26 and #6). Stop work after the next release is published and its downloaded artifact is verified. The older counts and checkpoints below are historical.
 

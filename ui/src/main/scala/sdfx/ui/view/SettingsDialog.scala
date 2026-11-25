@@ -174,6 +174,14 @@ final class SettingsDialog(owner: Stage, initial: Settings, initialTab: Int = 0,
     if availableBackends.contains("vulkan") then
       form.add("Vulkan GPU", vulkanDevice,
         "Choose an adapter or type its name or ID (such as Vulkan0). Auto uses the worker default. Restart the engine to apply.")
+      form.add("Precision", W.combo(FXCollections.observableArrayList("fp16", "bf16", "fp32"), dtype), "Checkpoint weight precision")
+        .add("VRAM mode", W.indexCombo(VramModes.Modes.map(_._2), vramIndex),
+          "GPU keeps weights on the selected adapter. Model offload stages from RAM. Sequential offload streams from disk. Auto chooses placement from available memory.")
+        .full(W.check("Decode the VAE in tiles", vaeTiling))
+        .full(W.check("Retry with VAE tiling when memory runs out", vaeAuto))
+        .full(W.check("Use fp16 VAE weights", vaeFp16))
+        .full(W.check("Store U-Net weights in fp8", fp8Storage))
+        .full(W.check("Offline mode (use installed model resources only)", hfOffline))
     if availableBackends.contains("scala-torch") then
       form
         .full(sectionNote("Native engine (scala-torch)"))
@@ -283,7 +291,10 @@ final class SettingsDialog(owner: Stage, initial: Settings, initialTab: Int = 0,
     })
     val r = d.showAndWait()
     if r.isPresent && r.get == ButtonType.OK then
-      val engine = SettingsDialog.engineSettings(initial, availableBackends, vulkanDevice.getEditor.getText) {
+      val vulkan = initial.copy(dtype = dtype.get,
+        vramMode = if vramIndex.get == VramModes.index(initial.vramMode) then initial.vramMode else VramModes.Modes(vramIndex.get)._1,
+        vaeTiling = vaeTiling.get, vaeAuto = vaeAuto.get, vaeFp16 = vaeFp16.get, fp8Storage = fp8Storage.get, hfOffline = hfOffline.get)
+      val engine = SettingsDialog.engineSettings(vulkan, availableBackends, vulkanDevice.getEditor.getText) {
         initial.copy(
           pythonExe = if availableBackends.contains("python") then Option(pythonExe.get).map(_.trim).filter(_.nonEmpty) else initial.pythonExe,
           engineBackend = engineBackend.get,
@@ -334,7 +345,6 @@ final class SettingsDialog(owner: Stage, initial: Settings, initialTab: Int = 0,
       None
 
 object SettingsDialog:
-  /** Only the adapter setting is editable on the Vulkan engine tab. */
   private[ui] def engineSettings(initial: Settings, backends: Seq[String], device: String)(conventional: => Settings): Settings =
     if backends == Seq("vulkan") then
       initial.copy(vulkanDevice = Option(device).map(_.trim).filter(v => v.nonEmpty && !v.equalsIgnoreCase("auto")))

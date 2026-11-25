@@ -16,6 +16,9 @@ param(
     [string]$VulkanVcRedistDir = $env:VCToolsRedistDir
 )
 $ErrorActionPreference = 'Stop'
+if (-not $PSBoundParameters.ContainsKey('VulkanOnly') -and -not ($NativeOnly -or $PreferScalaTorch -or $ScalaTorchWorkerDistribution)) {
+    $VulkanOnly = $true
+}
 Set-StrictMode -Version Latest
 $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 if (-not $Jar) { $Jar = Join-Path $repo 'target/stable-diffusion-nui.jar' }
@@ -181,7 +184,7 @@ if ($VulkanOnly) {
         Copy-Item -LiteralPath (Join-Path $VulkanVcRedistDir "x64/$component/$name") -Destination $nativeBin
     }
     Copy-Item -LiteralPath $VulkanWorkerJar -Destination (Join-Path $nativeRoot 'vulkan-worker.jar')
-    & (Join-Path $JdkHome 'bin/jlink.exe') --add-modules java.base,java.desktop,jdk.unsupported --strip-debug --no-header-files --no-man-pages --output (Join-Path $nativeRoot 'jre')
+    & (Join-Path $JdkHome 'bin/jlink.exe') --add-modules java.base,java.desktop,jdk.management,jdk.unsupported --strip-debug --no-header-files --no-man-pages --output (Join-Path $nativeRoot 'jre')
     if ($LASTEXITCODE -ne 0) { throw 'Failed to link the Vulkan worker runtime.' }
 }
 if ($workerDistribution) {

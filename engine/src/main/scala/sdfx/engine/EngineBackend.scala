@@ -64,8 +64,8 @@ private[engine] object EngineBackend:
   def loadRequest(path: String, settings: Settings): sdfx.core.protocol.LoadModelRequest =
     import sdfx.core.protocol.LoadModelRequest
     val (dtype, vramMode) = loadModes(settings)
-    if availableProviders == Vector("vulkan") then LoadModelRequest(path, dtype)
-    else LoadModelRequest(path, dtype, vramMode, None, settings.vaeTiling, settings.vaeSlicing,
+    val precision = if availableProviders == Vector("vulkan") then settings.dtype else dtype
+    LoadModelRequest(path, precision, vramMode, None, settings.vaeTiling, settings.vaeSlicing,
       settings.fp8Storage, settings.vaeAuto, settings.vaeFp16)
 
   def launch(home: AppHome,settings: Settings,dryRun: Boolean,environment: Map[String,String]=sys.env): EngineLaunch =

@@ -2,9 +2,11 @@
 
 **日本語** | [English](README.en.md)
 
-Windows 版は `SDV-NUI.exe` で起動する。SD1.5・SDXL の txt2img を Vulkan で実行できる。[起動とビルドの手順](docs/WINDOWS_VULKAN.md)
+Windows では `SDV-NUI.exe` を起動して、設定でチェックポイントのフォルダーと Vulkan GPU を選ぶ。SD1.5・SDXL の txt2img、img2img、マスク付きインペイント、hires、LoRA、ControlNet を利用できる。Java 25 の推論ワーカーが stable-diffusion.cpp を直接呼び出す。配布版の実行に Python、PyTorch、CUDA は不要。
 
-[kmizu/stable-diffusion-vulkan-nui](https://github.com/kmizu/stable-diffusion-vulkan-nui)
+[起動とビルドの手順](docs/WINDOWS_VULKAN.md) · [機能別の移植状況](docs/vulkan-parity.md)
+
+<details><summary>移植元 Stable Diffusion NUI の資料</summary>
 
 **マニュアル: <https://kmizu.github.io/stable-diffusion-nui/>**（English: <https://kmizu.github.io/stable-diffusion-nui/en/>）
 
@@ -367,3 +369,5 @@ Scala ランタイムは fat jar(`ui` の jar)に含まれているので、プ�
 
 AGPL-3.0（`LICENSE`）。AUTOMATIC1111 web UI・Forge・reForge（AGPL-3.0）と ComfyUI・Fooocus（GPL-3.0）の処理を移植しているためです。
 移植元・再実装元・依存ライブラリごとのライセンスは `THIRD_PARTY_NOTICES.md` と `licenses/` にあります（`python scripts/third_party.py` で再生成）。
+
+</details>

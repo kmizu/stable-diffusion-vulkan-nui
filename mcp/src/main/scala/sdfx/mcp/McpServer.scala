@@ -261,10 +261,10 @@ object McpServer:
 
   def distributionInstructions: String =
     if sdfx.engine.EngineSelection.availableBackends == Vector("vulkan") then
-      """Stable Diffusion NUI Vulkan edition supports txt2img on SD1.5 and SDXL checkpoints.
-        |Use list_models and set_model to select a checkpoint. get_status reports the active GPU and worker features.
-        |Use list_samplers to discover samplers. Call txt2img or txt2img_async to generate and list_recent to browse results.
-        |This edition has no img2img, external VAE, LoRA or generation-hook support.""".stripMargin
+      """SDV-NUI runs local Stable Diffusion inference with Vulkan.
+        |Use list_models and set_model to select a checkpoint. Read get_status for the selected GPU and worker capabilities.
+        |Use txt2img with a prompt, or img2img with a prompt and init_image. Supply a mask to inpaint.
+        |Use list_samplers to discover the available sampling methods and schedules. list_recent shows saved images.""".stripMargin
     else DefaultInstructions
 
   val DefaultInstructions: String =

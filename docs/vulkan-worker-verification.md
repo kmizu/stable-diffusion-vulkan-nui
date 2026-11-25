@@ -1,5 +1,15 @@
 # Windows Vulkan inference verification — 2026-11-26
 
+## v0.34 Vulkan port
+
+The extracted `SDV-NUI.exe` completed real img2img jobs over MCP on the Radeon 780M with SD1.5 at 512 × 512 and SDXL at 768 × 768. Each run used the same PNG source, three Euler steps, Karras scheduling and seed 12345. End-to-end times including worker startup, checkpoint loading and output were 28 and 77 seconds. Both runs used a system-only PATH and the bundled Java and inference runtimes. The ZIP tested here had SHA-256 `ddd5b4df7d4244f623a2fc8176a77b36e111a890c1e40017ace7eb763fa1c52d`.
+
+The 780M also produced a three-frame SD1.5 AnimateDiff sequence and a 512 × 512 SDXL PhotoMaker v1 image using one reference. The motion frames were visually distinct. A four-step PhotoMaker run produced a recognizable fox with color artifacts. These short runs exercise the model paths. They do not measure identity retention or image quality. GIF, WebP, MP4 and WebM exports completed. The SD1.5 quick system benchmark completed ten 256 × 256 steps in 12.2 seconds, and the VRAM calibration recorded all four requested cases.
+
+See the [feature inventory](vulkan-parity.md) for tested combinations and outstanding work. Intel hardware has not been tested.
+
+## Earlier txt2img package
+
 The tested Windows x64 ZIP was 370,275,849 bytes. Its SHA-256 was `a5f3d81967b846ec6cbc960bb4fe1597a1a5c799dad5600660d160ac6d538eb1`. The extracted desktop JAR was `4bf4ad5909bf0d6d9b14103ccc73e155a10faec9c1c6e7ecabdbe22465347d79` and the worker JAR was `e32ae68ad604283b46c72f530554e585b7c8a56869c8b893209b61cdd9a8fa76`. Build instructions and supported controls are in [WINDOWS_VULKAN.md](WINDOWS_VULKAN.md).
 
 | Route | Selected device | Checkpoint | Size | Observed result |

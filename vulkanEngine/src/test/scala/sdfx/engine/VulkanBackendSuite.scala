@@ -30,7 +30,8 @@ final class VulkanBackendSuite extends munit.FunSuite:
       val home = AppHome(root)
       assertEquals(EngineSelection.availableBackends, Vector("vulkan"))
       val legacy = Settings(dtype = "fp32", vramMode = "sequential_offload", vaeTiling = true, fp8Storage = true)
-      assertEquals(EngineBackend.loadRequest("checkpoint", legacy), sdfx.core.protocol.LoadModelRequest("checkpoint", "fp32"))
+      assertEquals(EngineBackend.loadRequest("checkpoint", legacy), sdfx.core.protocol.LoadModelRequest("checkpoint", "fp32",
+        "sequential_offload", vaeTiling = true, fp8Storage = true))
       for saved <- Seq("auto", "vulkan", "python", "scala-torch") do
         val settings = Settings(engineBackend = saved, vulkanDevice = Some("Vulkan0"))
         val env = Map("SDFX_VULKAN_DEVICE" -> "1", "Path" -> "inherited")

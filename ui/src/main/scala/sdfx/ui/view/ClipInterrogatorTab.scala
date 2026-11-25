@@ -331,6 +331,15 @@ final class ClipInterrogatorTab(ctx: UiContext):
           }.toMap
           val keepClip = clipModel.getValue
           clipModel.getItems.setAll(v("clip_models").arr.map(_.str).toSeq*)
+          v.obj.get("modes").flatMap(_.arrOpt).foreach { options =>
+            val supported = options.map(_.str).filterNot(_ == "caption").toVector
+            if supported.nonEmpty then
+              val previous = mode.getValue
+              mode.getItems.setAll(supported*)
+              mode.setValue(if supported.contains(previous) then previous else supported.head)
+              if supported == Vector("label") then
+                mode.setTooltip(new Tooltip("Return the closest CLIP label. The first run downloads about 2.8 GB of model resources."))
+          }
           clipModel.setValue(if clipModel.getItems.contains(keepClip) then keepClip else v("default_clip_model").str)
           captionModel.getItems.setAll((v("caption_models").arr.map(_.str).toSeq :+ "none")*)
           captionModel.setValue(v("default_caption_model").str)

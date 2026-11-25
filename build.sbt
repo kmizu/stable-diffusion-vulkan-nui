@@ -50,7 +50,7 @@ lazy val scalaTorchEngine = project.dependsOn(engine).settings(
 
 val nativeOnlyBuild = sys.env.get("SDFX_NATIVE_ONLY").exists(_.trim.equalsIgnoreCase("true"))
 
-val vulkanOnlyBuild = sys.env.get("SDFX_VULKAN_ONLY").exists(_.trim.equalsIgnoreCase("true"))
+val vulkanOnlyBuild = sys.env.get("SDFX_VULKAN_ONLY").fold(!nativeOnlyBuild)(_.trim.equalsIgnoreCase("true"))
 
 lazy val vulkanEngine = project.dependsOn(engine).settings(commonSettings, name := "sdfx-vulkan-engine")
 
@@ -58,6 +58,17 @@ lazy val vulkanEngine = project.dependsOn(engine).settings(commonSettings, name 
 lazy val vulkanWorker = project.dependsOn(core).settings(
   commonSettings,
   name := "sdfx-vulkan-worker",
+  libraryDependencies += "com.fasterxml.jackson.core" % "jackson-core" % "2.20.1",
+  libraryDependencies += "org.apache.commons" % "commons-math3" % "3.6.1",
+  Compile / resourceGenerators += Def.task {
+    val labels = (ThisBuild / baseDirectory).value / "python" / "sdfx" / "data" / "clip_interrogator"
+    val out = (Compile / resourceManaged).value / "clip-interrogator"
+    Seq("artists", "mediums", "movements", "flavors").map { kind =>
+      val name = kind + ".txt"
+      IO.copyFile(labels / name, out / name)
+      out / name
+    }
+  }.taskValue,
   Compile / javacOptions ++= Seq("--release", "25"),
   Compile / mainClass := Some("sdfx.vulkan.VulkanWorker"),
   assembly / mainClass := Some("sdfx.vulkan.VulkanWorker"),

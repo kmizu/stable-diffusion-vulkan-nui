@@ -6,7 +6,9 @@ Install the graphics manufacturer's Vulkan-capable Windows driver. The package i
 
 ## Supported generation
 
-This edition implements txt2img with the checkpoint's built-in VAE. Choose Euler, Euler a or DPM++ 2M and Automatic, Uniform or Karras scheduling. Worker progress, interruption and the selected GPU are available over the existing desktop and MCP protocol. The current worker rejects img2img, inpainting, hires fix, LoRA, ControlNet and engine extension hooks. An existing settings folder with an explicitly enabled generation hook can report an unsupported-feature error. Disable that hook for Vulkan generation or use a separate data folder with `--home`.
+The worker supports SD1.5 and SDXL txt2img, img2img, masked inpainting, hires passes, external VAEs, LoRAs, textual inversion and single-network ControlNet. Sampler and scheduler choices come from the worker. See the [feature inventory](vulkan-parity.md) for individual commands, extension hooks and limits.
+
+Temporal Lab reads and processes image sequences in the JVM. For **Extract frames from video**, install FFmpeg and put both `ffmpeg.exe` and `ffprobe.exe` on `PATH` before starting the app. The worker uses `ffprobe` to read the frame rate and dimensions, then `ffmpeg` to decode the selected video stream.
 
 ## Choose a GPU
 
