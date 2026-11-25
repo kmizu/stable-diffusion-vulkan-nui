@@ -1,10 +1,10 @@
-# Stable Diffusion NUI
+# Stable Diffusion Vulkan NUI (SDV-NUI)
 
 **English** | [日本語](README.md)
 
-Your local models, in a native UI. From image generation to batch preview, the gallery and ZIP export.
+Launch `SDV-NUI.exe` on Windows to generate images with SD1.5 or SDXL using Vulkan. [Setup and build instructions](docs/WINDOWS_VULKAN.md)
 
-Repository: [kmizu/stable-diffusion-nui](https://github.com/kmizu/stable-diffusion-nui). Formerly named Stable Diffusion FX / SDFX.
+[kmizu/stable-diffusion-vulkan-nui](https://github.com/kmizu/stable-diffusion-vulkan-nui)
 
 **Manual: <https://kmizu.github.io/stable-diffusion-nui/en/>** (Japanese: <https://kmizu.github.io/stable-diffusion-nui/>)
 

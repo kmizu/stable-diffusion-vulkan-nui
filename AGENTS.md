@@ -17,7 +17,7 @@ Stable Diffusion NUI (`stable-diffusion-nui`, formerly `stablediffusion-nui` and
 
 The parent directory (reForge) is reference material only. Never import or launch it.
 
-The Windows package uses `SDNUI/SDNUI.exe`; the v0.03 ZIP is `SDNUI-v0.03-windows-x64.zip`.
+The Vulkan package uses `SDV-NUI/SDV-NUI.exe`. The legacy Windows package uses `SDNUI/SDNUI.exe`; the v0.03 ZIP is `SDNUI-v0.03-windows-x64.zip`.
 Keep internal `sdfx` packages, `SDFX_*` environment variables, legacy `stablediffusion-nui` fallbacks and existing settings compatible.
 Historical release names and verification paths retain their original spelling.
 
@@ -42,4 +42,4 @@ Historical release names and verification paths retain their original spelling.
   target done.
 - **Line endings**: write files with LF (`.gitattributes`).
 - **Commits**: one commit per wave, saying what was added and how it was verified. Push to `main` of
-  repo `kmizu/stable-diffusion-nui`.
+  repo `kmizu/stable-diffusion-vulkan-nui`.

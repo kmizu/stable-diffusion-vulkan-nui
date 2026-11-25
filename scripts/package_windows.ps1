@@ -138,15 +138,17 @@ Copy-Item -LiteralPath $jarPath -Destination (Join-Path $inputDir 'stable-diffus
 $iconPath = Join-Path $repo 'ui/src/main/resources/sdfx/ui/icons/sdnui.ico'
 if (-not (Test-Path -LiteralPath $iconPath -PathType Leaf)) { throw "Application icon missing: $iconPath" }
 
-$jpackageArgs = @('--type', 'app-image', '--name', 'SDNUI', '--description', 'Stable Diffusion NUI', '--app-version', $Version,
+$appName = if ($VulkanOnly) { 'SDV-NUI' } else { 'SDNUI' }
+$description = if ($VulkanOnly) { 'Stable Diffusion Vulkan NUI' } else { 'Stable Diffusion NUI' }
+$jpackageArgs = @('--type', 'app-image', '--name', $appName, '--description', $description, '--app-version', $Version,
     '--icon', $iconPath, '--dest', $imageDest, '--input', $inputDir, '--main-jar', 'stable-diffusion-nui.jar', '--main-class', 'sdfx.ui.Launcher',
     '--java-options', '-Dsdfx.home=$APPDIR\..', '--java-options', '-Dprism.allowhidpi=true', '--java-options', '-Xmx2g', '--java-options', '-Dfile.encoding=UTF-8',
     '--java-options', '--enable-native-access=ALL-UNNAMED')
 if ($PreferScalaTorch -or $NativeOnly) { $jpackageArgs += @('--java-options', '-Dsdfx.engine.backend=scala-torch') }
 & $jpackage @jpackageArgs
 if ($LASTEXITCODE -ne 0) { throw "jpackage failed (exit $LASTEXITCODE); staging retained at $run" }
-$image = Join-Path $imageDest 'SDNUI'
-foreach ($required in @('SDNUI.exe', 'app/stable-diffusion-nui.jar', 'runtime/legal')) {
+$image = Join-Path $imageDest $appName
+foreach ($required in @("$appName.exe", 'app/stable-diffusion-nui.jar', 'runtime/legal')) {
     if (-not (Test-Path -LiteralPath (Join-Path $image $required))) { throw "Missing packaged component: $required" }
 }
 if ($VulkanOnly) {
@@ -241,7 +243,10 @@ if (-not $VulkanOnly) {
 }
 $zipName = "SDNUI-v$Version-windows-x64.zip"
 if ($VulkanOnly) {
-    $zipName = "SDNUI-v$Version-windows-vulkan-x64.zip"
+    $mcpExample = Join-Path $image '.mcp.json.example'
+    $example = (Get-Content -LiteralPath $mcpExample -Raw).Replace('C:/apps/SDNUI', 'C:/apps/SDV-NUI').Replace('SDNUI.exe', 'SDV-NUI.exe')
+    [IO.File]::WriteAllText($mcpExample, $example, [Text.UTF8Encoding]::new($false))
+    $zipName = "SDV-NUI-v$Version-windows-vulkan-x64.zip"
     Copy-Item -LiteralPath (Join-Path $repo 'docs/WINDOWS_VULKAN.md') -Destination (Join-Path $image 'WINDOWS_VULKAN.md')
 }
 $zip = Join-Path $run $zipName

@@ -1,6 +1,6 @@
 # Windows x64 Vulkan edition
 
-Extract the entire Vulkan ZIP to a writable directory, then open `SDNUI.exe`. In Settings, add a folder containing an SD1.5 or SDXL checkpoint to the checkpoint directories. Select the checkpoint in the main window and generate a txt2img image. The application includes its Java runtimes, inference DLL and Vulkan compute backend.
+Extract the entire Vulkan ZIP to a writable directory, then open `SDV-NUI.exe`. In Settings, add a folder containing an SD1.5 or SDXL checkpoint to the checkpoint directories. Select the checkpoint in the main window and generate a txt2img image. The application includes its Java runtimes, inference DLL and Vulkan compute backend.
 
 Install the graphics manufacturer's Vulkan-capable Windows driver. The package includes the Microsoft Visual C++ x64 runtime DLLs used by its native libraries. To exercise the desktop or MCP with a simulated image, add `--dry-run`. That mode runs on the JVM without loading a checkpoint or Vulkan DLL.
 
@@ -14,10 +14,10 @@ The Vulkan worker enumerates adapters when it starts. Select **Settings → Engi
 
 ```powershell
 $env:SDFX_VULKAN_DEVICE = 'Vulkan1'
-.\SDNUI.exe
+.\SDV-NUI.exe
 ```
 
-Vulkan device numbering depends on the installed hardware and driver. On an integrated GPU the model and image buffers share system memory. Start with SD1.5 at 512 × 512 to check the setup. For MCP use `SDNUI.exe --mcp --home <settings-directory>`.
+Vulkan device numbering depends on the installed hardware and driver. On an integrated GPU the model and image buffers share system memory. Start with SD1.5 at 512 × 512 to check the setup. For MCP use `SDV-NUI.exe --mcp --home <settings-directory>`.
 
 ## Build
 
