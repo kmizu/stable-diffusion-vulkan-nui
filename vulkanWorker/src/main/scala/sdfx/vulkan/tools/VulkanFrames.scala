@@ -5,12 +5,12 @@ import java.nio.file.Path
 import sdfx.core.protocol.{GenerationRequest, IntermediateArtifact}
 import ujson.Obj
 
-private[vulkan] final class VulkanFrames(req: GenerationRequest, val config: SaveIntermediateConfig, cancelled: () => Boolean, steps: Option[StepsAnimationConfig]):
+private[vulkan] final class VulkanFrames(req: GenerationRequest, val config: SaveIntermediateConfig, cancelled: () => Boolean, steps: Option[StepsAnimationConfig], password: Option[String]):
   private val p = req.params
   private val metadata = Obj("prompt" -> p.prompt,"negative_prompt" -> p.negativePrompt,"steps" -> p.steps,
     "cfg_scale" -> p.cfgScale,"sampler" -> p.samplerName,"mode" -> (if p.isImg2Img then "img2img" else "txt2img"))
   private val session = new NativeIntermediateRecorder.Session(Path.of(req.outputDir),config,
-    NativeJson.parse(metadata.render()).asInstanceOf[NativeJson.Obj].fields,cancelled,steps)
+    NativeJson.parse(metadata.render()).asInstanceOf[NativeJson.Obj].fields,cancelled,steps,password)
   private var seed = 0L
   private var index = 0
   private var pass = -1
@@ -45,9 +45,11 @@ private[vulkan] final class VulkanFrames(req: GenerationRequest, val config: Sav
   def incomplete(secondInterrupt: () => Boolean): Unit = session.closeIncomplete(secondInterrupt)
 
 private[vulkan] object VulkanFrames:
-  def start(req: GenerationRequest,cancelled: () => Boolean): Option[VulkanFrames] =
+  def start(req: GenerationRequest,cancelled: () => Boolean, password: Option[String] = None): Option[VulkanFrames] =
     val hooks = Some(NativeJson.Obj(req.params.hooks.map((k,v) => k -> NativeJson.parse(v.render()))))
     val save = NativeIntermediateRecorder.parseSaveIntermediate(hooks)
     val animation = NativeIntermediateRecorder.parseStepsAnimation(hooks, req.params.batchSize, req.params.nIter, save.isDefined)
     val config = save.orElse(animation.map(s => SaveIntermediateConfig(everyN = 1, startAt = s.skipInitial + 1)))
-    config.map(new VulkanFrames(req,_,cancelled,animation))
+    if password.nonEmpty && (animation.exists(_.createOutput) || save.exists(c => c.mode == "Video")) then
+      sdfx.vulkan.VulkanProtocol.unsupported("video export with protected intermediate frames")
+    config.map(new VulkanFrames(req,_,cancelled,animation,password))

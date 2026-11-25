@@ -28,7 +28,7 @@ private[vulkan] object VulkanClip:
   private val encoder = java.util.HexFormat.of()
   private def digest(bytes: Array[Byte]): String = encoder.formatHex(MessageDigest.getInstance("SHA-256").digest(bytes))
 
-  private def asset(dir: Path, name: String, url: String, sha: String, check: () => Unit, progress: (String,Int,Int) => Unit): Path =
+  private[tools] def asset(dir: Path, name: String, url: String, sha: String, check: () => Unit, progress: (String,Int,Int) => Unit): Path =
     val dest = dir.resolve(name)
     if Files.isRegularFile(dest) then
       require(sdfx.core.imagebrowser.BrowserFiles.sha256(dest) == sha,s"Incorrect SHA-256 for $dest")
@@ -67,7 +67,7 @@ private[vulkan] object VulkanClip:
         "pexels","pinterest","pixabay","pixiv","polycount","reddit","shutterstock","tumblr","unsplash","zbrush central")
       sites ++ sites.map("trending on " + _) ++ sites.map("featured on " + _) ++ sites.map(_ + " contest winner")
     else
-      val values = Using.resource(Source.fromResource(s"clip-interrogator/$kind.txt")(scala.io.Codec.UTF8))(_.getLines().map(_.trim).toVector)
+      val values = Using.resource(Source.fromResource(s"clip-interrogator/$kind.txt")(scala.io.Codec.UTF8))(_.getLines().map(_.strip()).toVector)
       if kind == "artists" then values.map("by " + _) ++ values.map("inspired by " + _) else values
 
   private def rank(path: Path, names: Vector[String], image: Array[Float], check: () => Unit): Vector[(String,Double)] =
@@ -94,11 +94,12 @@ private[vulkan] object VulkanClip:
       best.dequeueAll.reverseIterator.map((score,row) => names(row) -> score).toVector
     }
 
-  def execute(raw: Value, engine: VulkanInference, device: String, check: () => Unit, progress: (String,Int,Int) => Unit): Value =
+  def execute(raw: Value, engine: VulkanInference, device: String, check: () => Unit, progress: (String,Int,Int) => Unit, publish: () => Unit = () => ()): Value =
     val op = raw.obj.get("operation").map(_.str).getOrElse("prompt")
     if op == "models" then return Obj("clip_models" -> Arr(model),"default_clip_model" -> model,
       "caption_models" -> Arr(),"default_caption_model" -> "none","modes" -> Arr("label"),
-      "batch_output_modes" -> Arr(),"openclip_status" -> Obj("state" -> "native_vulkan"))
+      "batch_output_modes" -> Arr.from(VulkanClipBatch.formats.map(ujson.Str(_))),"openclip_status" -> Obj("state" -> "native_vulkan"))
+    if op == "batch" then return VulkanClipBatch.execute(raw,engine,device,check,publish,progress)
     if op == "unload" then return Obj("unloaded" -> engine.unloadClipVision())
     if op != "analyze" && op != "prompt" then VulkanProtocol.unsupported(s"CLIP operation $op")
     if raw.obj.get("clip_model").exists(_.str != model) then VulkanProtocol.unsupported("this CLIP vision architecture")

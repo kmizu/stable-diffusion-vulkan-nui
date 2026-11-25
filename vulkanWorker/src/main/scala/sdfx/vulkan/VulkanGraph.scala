@@ -9,21 +9,30 @@ import ujson.Value
 
 /** Builds the motion/identity model graphs using the pinned library's DGL operations. */
 private[vulkan] object VulkanGraph:
-  val hooks = Set("animatediff", "photomaker", "ip_adapter") ++ VulkanLatentGraph.hooks
+  val hooks = Set("animatediff", "photomaker", "ip_adapter","latent_upscale","soft_inpainting","img2imgalt","postdiff") ++ VulkanLatentGraph.hooks
+  val latentHires = "latent hires refinement"
   private def quoted(s: String): String = ujson.write(ujson.Str(s))
   private def path(s: String): String = quoted(VulkanConditioning.file(s, "DGL model"))
 
   def render(engine: VulkanInference, device: String, model: LoadedModel, settings: LoadModelRequest,
-      req: GenerationRequest, hook: String, prompt: String, loras: Seq[LoraRef], seed: Long, schedule: String): Seq[BufferedImage] =
+      req: GenerationRequest, hook: String, prompt: String, loras: Seq[LoraRef], seed: Long, schedule: String,
+      cancelled: () => Boolean, tweak: Option[VulkanHiresTweaks.Pass] = None): Seq[BufferedImage] =
     import VulkanProtocol.{invalid, unsupported}
     val p = req.params
-    val h = p.hooks(hook)
+    val hiresPass = hook == latentHires
+    val h = if hiresPass then ujson.Obj() else p.hooks(hook)
     val latentHook = VulkanLatentGraph.hooks(hook)
-    val permitted = Set(hook,"model_keyword","pnginfo_injection") ++ (if latentHook then VulkanLatentGraph.hooks else Set.empty[String])
+    val up = Option.when(hook == "latent_upscale")(VulkanLatentUpscale.parse(p,h,schedule))
+    val soft = Option.when(hook == "soft_inpainting")(new VulkanSoftInpaint(h))
+    val postDiff = Option.when(hook == "postdiff")(new VulkanPostDiff(h,p,model.kind == "sdxl"))
+    val inverse = hook == "img2imgalt"
+    if soft.nonEmpty && !p.img2img.exists(_.mask.nonEmpty) then invalid("Soft Inpainting needs an img2img mask")
+    if inverse && p.img2img.isEmpty then invalid("img2img Alternative needs an input image")
+    val permitted = Set(hook,"model_keyword","pnginfo_injection","adetailer","batch_face_swap") ++ Option.when(hiresPass)("hires_fix_tweaks") ++ (if latentHook then VulkanLatentGraph.hooks else Set.empty[String])
     val other = p.hooks.filterNot((_, v) => v.obj.get("enabled").contains(ujson.Bool(false))).keySet -- permitted
-    if other.nonEmpty || p.hires.enabled || p.controlnet.exists(_.enabled) || VulkanConditioning.activeEmbeddings(req).nonEmpty then
+    if other.nonEmpty || p.hires.enabled && !hiresPass || p.controlnet.exists(_.enabled) || VulkanConditioning.activeEmbeddings(req).nonEmpty then
       unsupported(s"$hook with other sampling hooks, hires, embeddings or ControlNet")
-    if p.img2img.exists(_.mask.nonEmpty) then unsupported(s"masked $hook generation")
+    if up.isEmpty && soft.isEmpty && !hiresPass && p.img2img.exists(_.mask.nonEmpty) then unsupported(s"masked $hook generation")
     val isVideo = hook == "animatediff"
     if isVideo && model.kind != "sd15" then unsupported("AnimateDiff motion models outside SD1.x")
     if hook == "photomaker" && (model.kind != "sdxl" || p.isImg2Img) then unsupported("PhotoMaker outside SDXL txt2img")
@@ -60,9 +69,10 @@ private[vulkan] object VulkanGraph:
       lines += s"unet = animatediff::apply($unet, motion)"
       lines += s"pos = predictor(unet, encode_prompt($text, ${quoted(prompt)}, $enc), prediction = \"eps\")"
       n
-    else if latentHook then
+    else if latentHook || up.nonEmpty || hiresPass || soft.nonEmpty || inverse || postDiff.nonEmpty then
       lines += s"unet = $unet"
-      lines += s"pos = predictor(unet, encode_prompt($text, ${quoted(prompt)}, $enc))"
+      lines += s"latent_pos = encode_prompt($text, ${quoted(prompt)}, $enc)"
+      lines += s"pos = predictor(unet, latent_pos)"
       1
     else if hook == "ip_adapter" then
       val rawPath = Path.of(h("model").str).toAbsolutePath.normalize()
@@ -101,25 +111,77 @@ private[vulkan] object VulkanGraph:
       lines += "identity = photomaker::apply(conditions.condition, pm, ids, conditions.mask)"
       lines += s"pos = switch_predictor(predictor(unet, conditions.plain), predictor(unet, identity), after_steps = $merge)"
       1
-    if hook != "ip_adapter" then lines += s"neg = predictor(unet, encode_prompt($text, ${quoted(p.negativePrompt)}, $enc))"
+    if hook != "ip_adapter" then
+      lines += s"latent_neg = encode_prompt($text, ${quoted(p.negativePrompt)}, $enc)"
+      lines += "neg = predictor(unet, latent_neg)"
     lines += s"guided = cfg(pos, neg, scale = ${p.cfgScale})"
     lines += s"rng = make_rng(\"cpu\", seed = $seed)"
-    val shape = s"latent_shape(vae, $size, batch = $frames)"
+    val shape = s"latent_shape(vae, ${postDiff.fold(size)(_.size)}, batch = $frames)"
+    var overlay: Option[VulkanImageInputs.Inputs] = None
+    val tiled = if settings.vaeTiling then ", tiling = tiling(tile_size_w = 32, tile_size_h = 32)" else ""
     p.img2img match
       case None => lines += s"base = tensor::zeros($shape)"
+      case Some(i) if up.nonEmpty =>
+        val original = VulkanImageInputs.read(i.initImage)
+        val source = if i.mask.isEmpty then original else
+          val ip = i.copy(resizeMode = 0)
+          val target = VulkanImageInputs.prepare(ip,p.width,p.height,seed,cancelled = cancelled)
+          overlay = Some(target)
+          inputs("paint_mask") = target.mask.get
+          if i.inpaintFullRes then target.init
+          else VulkanImageInputs.prepare(ip,original.getWidth,original.getHeight,seed,cancelled = cancelled).init
+        val sw = source.getWidth/8
+        val sh = source.getHeight/8
+        require(sw >= 1 && sh >= 1,"Latent Upscale needs at least 8 pixels per side")
+        inputs("init") = VulkanImageInputs.resize(source,sw*8,sh*8,0)
+        lines += s"encoded = vae_to_unet_latents(vae, vae_encode(vae, image::to_f32(init), rng = rng$tiled))"
+        lines ++= VulkanLatentUpscale.resize(up.get.method,sw,sh,p.width/8,p.height/8)
       case Some(i) =>
-        inputs("init") = VulkanImageInputs.resize(VulkanImageInputs.read(i.initImage),p.width,p.height,i.resizeMode)
-        lines += "encoded = vae_to_unet_latents(vae, vae_encode(vae, image::to_f32(init), rng = rng))"
+        val init = VulkanImageInputs.prepare(i,p.width,p.height,seed,cancelled = cancelled)
+        inputs("init") = init.init
+        init.mask.foreach { mask =>
+          inputs("paint_mask") = mask
+          overlay = Some(init)
+        }
+        val posterior = if inverse then ", posterior = \"mode\"" else ""
+        lines += s"encoded = vae_to_unet_latents(vae, vae_encode(vae, image::to_f32(init), rng = rng$posterior$tiled))"
         lines += s"base = tensor::broadcast_to(encoded, $shape)"
-    lines += s"full = make_sigmas(guided, latent = base, scheduler = ${quoted(VulkanProtocol.schedulers(schedule))}, steps = ${p.steps})"
-    val sigmas = p.img2img.fold("full")(i => s"full[${p.steps - math.min(p.steps,(p.steps*i.denoisingStrength).toInt+1)}:]")
-    lines += s"sigmas = $sigmas"
-    lines += "start = add_noise(guided, base, tensor::randn_like(base, rng = rng), sigma = sigmas[0])"
+    if overlay.nonEmpty then
+      lines += "mask = tensor::threshold(image::to_f32(tensor::grayscale(paint_mask, axis = 0)), threshold = 0.5)"
+      lines += "latent_mask = tensor::max_pool2d(mask, kernel = [8,8], stride = [8,8])"
+    val fullSteps = up.fold(p.steps)(_.fullSteps)
+    val scheduleName = up.fold(schedule)(_.scheduler)
+    lines += s"full = make_sigmas(guided, latent = base, scheduler = ${quoted(VulkanProtocol.schedulers(scheduleName))}, steps = $fullSteps)"
+    val sigmas = up.fold(p.img2img.fold("full")(i => s"full[${p.steps - math.min(p.steps,(p.steps*i.denoisingStrength).toInt+1)}:]"))(_ => s"full[${fullSteps-p.steps}:]")
+    val softSteps = soft.fold(0)(_ => (p.steps*p.img2img.get.denoisingStrength).toInt.max(1).min(p.steps))
+    lines += s"sigmas = ${if inverse then "full" else if soft.nonEmpty then s"full[${p.steps-softSteps}:]" else sigmas}"
+    val baseNoise = tweak.filter(_ => p.subseedStrength>0).flatMap { pass =>
+      pass.copy(seed = seed,subseed = pass.baseSubseed,strength = p.subseedStrength,width = 0,height = 0).noise(engine,p.width/8,p.height/8)
+    }
+    if inverse then lines ++= VulkanInverse.start(h,p,prompt,text,enc)
+    else if baseNoise.nonEmpty then lines += "start = add_noise(guided, base, base_noise, sigma = sigmas[0])"
+    else lines += "start = add_noise(guided, base, tensor::randn_like(base, rng = rng), sigma = sigmas[0])"
     val eta = p.eta.fold("")(e => s", eta = $e")
-    if latentHook then lines ++= VulkanLatentGraph.sample(p,VulkanProtocol.samplers(p.samplerName),eta)
-    else lines += s"latent = sample(start, sigmas, predict = guided, method = ${quoted(VulkanProtocol.samplers(p.samplerName))}, rng = rng$eta)"
-    val tiling = if settings.vaeTiling then ", tiling = tiling(tile_size_w = 32, tile_size_h = 32)" else ""
-    lines += s"return {output = vae_decode(vae, unet_to_vae_latents(vae, latent)$tiling)}"
-    val source = s"fn main(${inputs.keys.mkString(",")}) {\n${lines.result().mkString("\n")}\n}"
+    if soft.nonEmpty then lines ++= soft.get.sample(softSteps,p.width,p.height,VulkanProtocol.samplers(p.samplerName),eta,seed,tiled)
+    else if postDiff.nonEmpty then lines ++= postDiff.get.sample
+    else if latentHook then lines ++= VulkanLatentGraph.sample(p,VulkanProtocol.samplers(p.samplerName),eta,family == "sdxl",seed)
+    else
+      val mask = if overlay.nonEmpty then ", base = base, denoise_mask = latent_mask" else ""
+      lines += s"latent = sample(start, sigmas, predict = guided, method = ${quoted(VulkanProtocol.samplers(p.samplerName))}, rng = rng$eta$mask)"
+    val noise = tweak.flatMap { pass =>
+      val (w,h) = p.hires.targetSize(p.width,p.height)
+      pass.noise(engine,w/8,h/8)
+    }
+    if hiresPass then lines ++= VulkanHiresGraph.refinement(req,prompt,loras,tweak.fold(seed)(_.seed),unet,text,eta,device,noise.nonEmpty,tiled)
+    val resultLatent = if hiresPass then "hr_latent" else "latent"
+    lines += s"return {output = vae_decode(vae, unet_to_vae_latents(vae, $resultLatent)$tiled)}"
+    val transforms = Seq("detail_daemon" -> VulkanDetailDaemon.functions, "cads" -> VulkanCads.functions)
+      .collect { case (hook,source) if latentHook && p.hooks.contains(hook) => source }.mkString("\n")
+    val noises = (noise.map("hr_noise" -> _) ++ baseNoise.map("base_noise" -> _)).toMap
+    val names = inputs.keys.toVector ++ noises.keys
+    val source = s"${transforms}fn main(${names.mkString(",")}) {\n${lines.result().mkString("\n")}\n}"
+    if cancelled() then throw new java.util.concurrent.CancellationException()
     if isVideo then engine.dglFrames(source, inputs.asJava, "output").asScala.toVector
-    else Seq(engine.dglImage(source, inputs.asJava, "output"))
+    else
+      val image = engine.dglImage(source, inputs.asJava, "output", noises.asJava)
+      Seq(soft.fold(overlay.fold(image)(_.finish(image)))(_.composite(overlay.get,image,cancelled)))

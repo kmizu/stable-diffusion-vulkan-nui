@@ -554,24 +554,51 @@ public final class VulkanInference implements AutoCloseable {
     }
 
     private <T> T dglWithImages(String source, Map<String,BufferedImage> images, String resultName,
-            Function<MemorySegment,T> copy) {
+            Map<String,Latent> noises, Function<MemorySegment,T> copy) {
         ensureOpen();
         try (var arena = Arena.ofConfined()) {
             var tensors = new java.util.LinkedHashMap<String,MemorySegment>();
             try {
                 for (var entry : images.entrySet())
                     tensors.put(entry.getKey(), createImageTensor(arena, entry.getValue(), 3));
+                for (var entry : noises.entrySet()) {
+                    var noise = entry.getValue();
+                    var shape = arena.allocateFrom(JAVA_LONG,noise.width,noise.height,4,1);
+                    var tensor = ptr("sd_tensor_create",4,4L,shape,arena.allocateFrom(JAVA_FLOAT,noise.values),4L*noise.values.length);
+                    if (tensor.equals(NULL)) throw new IllegalArgumentException(cString(ptr("sd_get_last_error")));
+                    tensors.put(entry.getKey(),tensor);
+                }
                 return dglProgram(arena, source, tensors, resultName, copy);
             } finally { tensors.values().forEach(t -> call("sd_tensor_free", t)); }
         }
     }
 
     public synchronized BufferedImage dglImage(String program, Map<String,BufferedImage> inputs, String resultName) {
-        return dglWithImages(program, inputs, resultName, this::copyImage);
+        return dglWithImages(program, inputs, resultName, Map.of(), this::copyImage);
+    }
+
+    public synchronized BufferedImage dglImage(String program, Map<String,BufferedImage> inputs, String resultName, Map<String,Latent> noises) {
+        return dglWithImages(program, inputs, resultName, noises, this::copyImage);
+    }
+
+    public synchronized float[] detectBoxes(String source, BufferedImage image) {
+        return dglWithImages(source, Map.of("input", image), "boxes", null, tensor -> {
+            long size = (long)call("sd_tensor_byte_size",tensor);
+            if ((int)call("sd_tensor_type",tensor) != 4 || size < 0 || size > 65536 || size % 16 != 0)
+                throw new IllegalStateException("Expected floating YOLO boxes of shape [4,N]");
+            return size == 0 ? new float[0] : ptr("sd_tensor_data",tensor).reinterpret(size).toArray(JAVA_FLOAT);
+        });
     }
 
     public synchronized float[] clipVision(String program, BufferedImage image, boolean keepLoaded) {
+        return clipVision(program, image, keepLoaded, 1024);
+    }
+
+    public synchronized float[] clipVision(String program, BufferedImage image, boolean keepLoaded, int dimensions) {
         ensureOpen();
+        if (dimensions != 768 && dimensions != 1024 && dimensions != 1280)
+            throw new IllegalArgumentException("Unsupported CLIP projection size");
+        long byteSize = 4L * dimensions;
         synchronized (lifetime) {
             if (visionCtx.equals(NULL)) visionCtx = ptr("sd_dgl_ctx_create");
             if (visionCtx.equals(NULL)) throw new IllegalStateException("Cannot create CLIP vision context");
@@ -581,9 +608,9 @@ public final class VulkanInference implements AutoCloseable {
             var input = createImageTensor(a, image, 3);
             try {
                 return dglRun(visionCtx, a, program, Map.of("input",input), "embedding", tensor -> {
-                    if ((int)call("sd_tensor_type",tensor) != 4 || (long)call("sd_tensor_byte_size",tensor) != 4096)
-                        throw new IllegalStateException("Expected a 1024-dimensional ViT-H/14 projection");
-                    return ptr("sd_tensor_data",tensor).reinterpret(4096).toArray(JAVA_FLOAT);
+                    if ((int)call("sd_tensor_type",tensor) != 4 || (long)call("sd_tensor_byte_size",tensor) != byteSize)
+                        throw new IllegalStateException("Unexpected CLIP projection dimension, expected " + dimensions);
+                    return ptr("sd_tensor_data",tensor).reinterpret(byteSize).toArray(JAVA_FLOAT);
                 });
             } finally { call("sd_tensor_free",input); }
         } finally {
@@ -602,7 +629,29 @@ public final class VulkanInference implements AutoCloseable {
     }
 
     public synchronized List<BufferedImage> dglFrames(String program, Map<String,BufferedImage> inputs, String resultName) {
-        return dglWithImages(program, inputs, resultName, tensor -> copyFrames(tensor, true));
+        return dglWithImages(program, inputs, resultName, Map.of(), tensor -> copyFrames(tensor, true));
+    }
+
+    private Latent copyLatent(MemorySegment tensor) {
+        long rank = (long) call("sd_tensor_rank", tensor);
+        if ((int) call("sd_tensor_type", tensor) != 4 || (rank != 3 && rank != 4) ||
+            (long) call("sd_tensor_dim", tensor, 2L) != 4 ||
+            (rank == 4 && (long) call("sd_tensor_dim", tensor, 3L) != 1))
+            throw new IllegalStateException("Expected one F32 four-channel VAE latent");
+        int w = Math.toIntExact((long) call("sd_tensor_dim", tensor, 0L));
+        int h = Math.toIntExact((long) call("sd_tensor_dim", tensor, 1L));
+        long size = (long) call("sd_tensor_byte_size", tensor);
+        if (size != 16L * w * h || size > 67108864) throw new IllegalArgumentException("Invalid VAE output size");
+        return new Latent(w, h, ptr("sd_tensor_data", tensor).reinterpret(size).toArray(JAVA_FLOAT));
+    }
+
+    public synchronized Latent noise(int width, int height, long seed) {
+        ensureOpen();
+        String script = "fn main() { g = make_rng(\"cpu\", seed = " + seed + ")\n"
+            + "return {value = tensor::randn_like(tensor::zeros([" + width + "," + height + ",4,1]), rng = g)} }";
+        try (var arena = Arena.ofConfined()) {
+            return dglProgram(arena, script, Map.of(), "value", this::copyLatent);
+        }
     }
 
     public synchronized Latent vaeEncode(String source, BufferedImage image) {
@@ -610,18 +659,7 @@ public final class VulkanInference implements AutoCloseable {
         try (var arena = Arena.ofConfined()) {
             var input = createImageTensor(arena, image, 3);
             try {
-                return dglProgram(arena, source, Map.of("input",input), "value", tensor -> {
-                    long rank = (long) call("sd_tensor_rank", tensor);
-                    if ((int) call("sd_tensor_type", tensor) != 4 || (rank != 3 && rank != 4) ||
-                        (long) call("sd_tensor_dim", tensor, 2L) != 4 ||
-                        (rank == 4 && (long) call("sd_tensor_dim", tensor, 3L) != 1))
-                        throw new IllegalStateException("Expected one F32 four-channel VAE latent");
-                    int w = Math.toIntExact((long) call("sd_tensor_dim", tensor, 0L));
-                    int h = Math.toIntExact((long) call("sd_tensor_dim", tensor, 1L));
-                    long size = (long) call("sd_tensor_byte_size", tensor);
-                    if (size != 16L * w * h || size > 67108864) throw new IllegalArgumentException("Invalid VAE output size");
-                    return new Latent(w, h, ptr("sd_tensor_data", tensor).reinterpret(size).toArray(JAVA_FLOAT));
-                });
+                return dglProgram(arena, source, Map.of("input",input), "value", this::copyLatent);
             } finally { call("sd_tensor_free", input); }
         }
     }

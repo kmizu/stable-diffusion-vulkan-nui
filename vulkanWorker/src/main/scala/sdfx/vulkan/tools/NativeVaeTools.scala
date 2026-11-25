@@ -67,7 +67,7 @@ private[vulkan] object NativeVaeTools:
     require(Set("encode","decode","encode+decode")(operation),"invalid VAE operation")
     require(Set("L","RGBA","CMYK")(representation),"invalid latent representation")
     val tiled=bool("tiled",false)
-    if !(approximation=="TAESD" && !tiled || Set("Full","Approx cheap","Approx NN")(approximation)) then
+    if !Set("Full","Approx cheap","Approx NN","TAESD")(approximation) then
       throw new NativeBackendError("unsupported","native VAE Tools approximation is not available")
     val cmykFormat=string("cmyk_format","TIFF")
     require(Set("TIFF","JPEG100")(cmykFormat),"invalid CMYK format")

@@ -338,6 +338,8 @@ final class ClipInterrogatorTab(ctx: UiContext):
               mode.getItems.setAll(supported*)
               mode.setValue(if supported.contains(previous) then previous else supported.head)
               if supported == Vector("label") then
+                batchMode.getItems.setAll("label")
+                batchMode.setValue("label")
                 mode.setTooltip(new Tooltip("Return the closest CLIP label. The first run downloads about 2.8 GB of model resources."))
           }
           clipModel.setValue(if clipModel.getItems.contains(keepClip) then keepClip else v("default_clip_model").str)
@@ -361,6 +363,7 @@ object ClipInterrogatorTab:
 /** Describes registry candidates without implying that every model was tested or downloaded. */
 object ClipModelNotice:
   def dependency(state: String): String = state match
+    case "native_vulkan" => "The Vulkan worker runs the CLIP image encoder on the selected adapter."
     case "available" => "OpenCLIP registry is available; its models have not all been tested."
     case "missing" => "Additional OpenCLIP models need an optional install: open_clip_torch 2.32.0."
     case "incompatible-version" => "OpenCLIP needs version 2.32.0; existing models remain available."

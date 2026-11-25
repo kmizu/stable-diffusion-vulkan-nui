@@ -7,7 +7,7 @@ import sdfx.core.protocol.{EngineError, LoadedModel}
 import sdfx.vulkan.{ApproxVaeDecoder, VulkanInference, VulkanProtocol}
 import sdfx.vulkan.VulkanInference.Latent
 
-private[vulkan] final class NativeVaeToolsCodec(engine: VulkanInference, model: LoadedModel, approximation: String,
+private[vulkan] final class NativeVaeToolsCodec(engine: VulkanInference, device: String, model: LoadedModel, approximation: String,
     tiled: Boolean, tiny: Option[Path], approx: Option[ApproxVaeDecoder]):
   private val family = model.kind match
     case "sd15" => "sd1"
@@ -15,8 +15,10 @@ private[vulkan] final class NativeVaeToolsCodec(engine: VulkanInference, model: 
     case other => VulkanProtocol.unsupported(s"VAE tools on $other")
   private val tiling = if tiled then ", tiling = tiling(tile_size_w = 32, tile_size_h = 32)" else ""
   private val vae = tiny match
-    case Some(file) => s"load_tae(${ujson.write(ujson.Str(file.toString))}, family = \"$family\")"
-    case None => s"load_vae(${ujson.write(ujson.Str(model.vaePath.getOrElse(model.path)))}, family = \"$family\")"
+    case Some(file) => s"load_tae(${ujson.write(ujson.Str(file.toString))}, family = \"$family\", backend = ${ujson.write(ujson.Str(device))})"
+    case None =>
+      val scale = if model.kind == "sdxl" && model.vaePath.isEmpty then ", conv_scale = 0.03125" else ""
+      s"load_vae(${ujson.write(ujson.Str(model.vaePath.getOrElse(model.path)))}, family = \"$family\", backend = ${ujson.write(ujson.Str(device))}$scale)"
 
   def encodeSeeded(image: BufferedImage, seed: Long, check: () => Unit): Latent =
     check()
@@ -40,7 +42,7 @@ private[vulkan] final class NativeVaeToolsCodec(engine: VulkanInference, model: 
     engine.vaeDecode(s"fn main(input) { vae = $vae\n return {value = vae_decode(vae, $expression$tiling)} }", latent)
 
 private[vulkan] object VulkanVae:
-  def execute(raw: ujson.Value, engine: VulkanInference, model: LoadedModel, cancelled: () => Boolean,
+  def execute(raw: ujson.Value, engine: VulkanInference, device: String, model: LoadedModel, cancelled: () => Boolean,
       publish: () => Unit, event: (String,ujson.Value) => Unit, password: Option[String]): ujson.Value =
     val context = new NativeWorkContext(cancelled,publish,(kind,fields) => event(kind,ujson.read(NativeJson.render(NativeJson.Obj(fields)))))
     val mode = raw.obj.get("approximation").map(_.str).getOrElse("Full")
@@ -63,7 +65,7 @@ private[vulkan] object VulkanVae:
     }
     if !Set("Full","Approx cheap","Approx NN","TAESD")(mode) then VulkanProtocol.unsupported(s"VAE Tools approximation $mode")
     val tiled = raw.obj.get("tiled").exists(_.bool)
-    val codec = new NativeVaeToolsCodec(engine,model,mode,tiled,tiny,approx)
+    val codec = new NativeVaeToolsCodec(engine,device,model,mode,tiled,tiny,approx)
     val params = NativeJson.parse(ujson.write(raw)).asInstanceOf[NativeJson.Obj].fields
     val provenance = Map("model_name" -> NativeJson.Str(model.name), "model_hash" -> NativeJson.Str(model.hash),
       "model_kind" -> NativeJson.Str(model.kind), "vae" -> NativeJson.Str(model.vaeName.getOrElse("Automatic")))

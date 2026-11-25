@@ -31,6 +31,8 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
   import VulkanProtocol.*
   private var activeResourceFiles = Map.empty[String,VulkanHashes.File]
   private val toolSession = new VulkanTools.Session
+  private val wdBatch = new sdfx.vulkan.tools.VulkanWdBatch
+  private val wdCommands = Set("caption","batch_interrogate_prepare","batch_interrogate_execute")
   private val controlModels = new sdfx.vulkan.tools.VulkanControlModels
   private val adapters = backend.devices().asScala.toVector
   private val device = select(adapters, selection)
@@ -46,6 +48,7 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
   private var activeOptions = Option.empty[VulkanInference.ModelOptions]
 
   private final class Job(val id: String, val kind: String, val owner: Option[String], val imagePassword: Option[String]):
+    @volatile var sensorFailure = Option.empty[Throwable]
     @volatile var cancelled = false
     @volatile var interrupts = 0
     var frames = Option.empty[sdfx.vulkan.tools.VulkanFrames]
@@ -53,7 +56,9 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
     var publishing = false
     var running = false
     val files = mutable.ArrayBuffer.empty[Path]
-    def check(): Unit = if cancelled then throw CancellationException()
+    def check(): Unit =
+      if cancelled then throw CancellationException()
+      sensorFailure.foreach(e => throw e)
 
   private def emit(msg: Value): Unit = writer.synchronized {
     writer.write(ujson.write(msg))
@@ -82,7 +87,7 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
 
   private def hello = Obj("protocol" -> 1, "engine_version" -> "vulkan-sd.cpp-f296cb0", "cuda" -> false,
     "dry_run" -> false, "device" -> display(device), "vulkan_devices" -> Arr.from(adapters.map(display)),
-    "features" -> Arr.from(Vector("txt2img", "lora", "embeddings", "external_vae", "controlnet", "img2img", "animatediff", "animatediff_encode", "photomaker", "inpaint", "hires_fix", "img2img_hires_fix", "temporal_lab", "vae_tools", "list_devices", "system_info", "vram_estimator", "prevent_interrupt") ++ VulkanTools.features))
+    "features" -> Arr.from(Vector("txt2img", "aesthetic_embedding", "lora", "embeddings", "external_vae", "controlnet", "img2img", "animatediff", "animatediff_encode", "photomaker", "inpaint", "hires_fix", "img2img_hires_fix", "temporal_lab", "vae_tools", "list_devices", "system_info", "vram_estimator", "prevent_interrupt") ++ VulkanTools.features ++ sdfx.vulkan.tools.VulkanWdTagger.features))
 
   private def status =
     val data = VulkanDiagnostics.status(device, backend.memory(device.id()), loaded)
@@ -112,7 +117,13 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
             val kind = decode(msg("type").str)
             val params = msg.getOrElse("params", Obj())
             if params.objOpt.isEmpty then invalid("params must be an object")
-            if !Set("vae_tools","temporal_lab")(kind) && msg.contains("image_password") || msg.contains("allow_plaintext_video") then unsupported("protected image transport")
+            val password = decode(msg.get("image_password").map(_.str))
+            if password.exists(_.isEmpty) || password.isDefined && !isGeneration(kind) && !Set("vae_tools","temporal_lab","controlnet_fastload_data","batch_interrogate_execute")(kind) then
+              invalid("Invalid image password transport")
+            if password.isDefined && kind == "controlnet_fastload_data" && params.obj.get("operation").flatMap(_.strOpt).exists(Set("save","encode")) then
+              invalid("Protected sessions cannot publish readable Fastload data")
+            if msg.get("allow_plaintext_video").exists(v => v.boolOpt.isEmpty || !isGeneration(kind) || password.isEmpty) then
+              invalid("Invalid plaintext video permission")
             val owner = decode(msg.get("owner_id").map(_.str))
             kind match
               case "shutdown" =>
@@ -137,7 +148,7 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
                 val expectedOwner = decode(params.obj.get("owner_id").map(_.str))
                 val job = jobs.values.find(j => target.forall(_ == j.id) && expectedOwner.forall(j.owner.contains))
                 val canCancel = kind == "interrupt" && !protection.enabled
-                val tooLate = canCancel && job.exists(j => j.running && (j.publishing || (!isGeneration(j.kind) && !benchmarkCommands(j.kind) && j.kind != "system_info" && j.kind != "clip_interrogator" && j.kind != "vae_tools" && j.kind != "temporal_lab" && !VulkanTools.commands(j.kind))))
+                val tooLate = canCancel && job.exists(j => j.running && (j.publishing || (!isGeneration(j.kind) && !benchmarkCommands(j.kind) && j.kind != "system_info" && j.kind != "aesthetic_embedding" && j.kind != "clip_interrogator" && j.kind != "vae_tools" && j.kind != "temporal_lab" && !wdCommands(j.kind) && !VulkanTools.commands(j.kind))))
                 val affected = canCancel && !tooLate && job.isDefined
                 if affected then job.foreach(cancel)
                 val decision = InterruptionDecision(!protection.enabled && !tooLate, protection.enabled, protection,
@@ -146,8 +157,8 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
                 response("active_id") = job.filter(j => affected && j.running).fold[Value](ujson.Null)(j => Str(j.id))
                 result(key, response)
               }
-              case k if VulkanTools.commands(k) || benchmarkCommands(k) || Set("txt2img", "img2img", "clip_interrogator", "temporal_lab", "vae_tools", "system_info", "load_model", "unload", "set_vae")(k) =>
-                val job = new Job(key, kind, owner, decode(msg.get("image_password").map(_.str)))
+              case k if wdCommands(k) || VulkanTools.commands(k) || benchmarkCommands(k) || Set("txt2img", "img2img", "aesthetic_embedding", "clip_interrogator", "temporal_lab", "vae_tools", "system_info", "load_model", "unload", "set_vae")(k) =>
+                val job = new Job(key, kind, owner, password)
                 lock.synchronized {
                   if jobs.contains(key) then invalid("Duplicate in-flight request id")
                   jobs(key) = job
@@ -167,7 +178,7 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
     if job.publishing then return
     job.interrupts += 1
     job.cancelled = true
-    if job.running && (isGeneration(job.kind) || job.kind == "vae_tools" || job.kind == "clip_interrogator" || benchmarkCommands(job.kind)) then backend.cancel()
+    if job.running && (isGeneration(job.kind) || job.kind == "vae_tools" || job.kind == "clip_interrogator" || job.kind == "aesthetic_embedding" || job.kind == "batch_interrogate_execute" || benchmarkCommands(job.kind)) then backend.cancel()
 
   private def stopJobs(): Unit = lock.synchronized { jobs.values.foreach(cancel) }
 
@@ -185,11 +196,22 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
             job.publishing = true
           }, (step,total,phase) => emit(Obj("id" -> job.id,"type" -> "event","event" -> "progress",
             "step" -> step,"total" -> total,"pass" -> phase)),job.imagePassword)
+        case "caption" => sdfx.vulkan.tools.VulkanWdTagger.caption(raw,device.name(),() => job.check())
+        case k @ ("batch_interrogate_prepare" | "batch_interrogate_execute") =>
+          val owner = job.owner.getOrElse(throw IllegalArgumentException("WD batch owner required"))
+          def publish():Unit = lock.synchronized { job.check(); job.publishing = true }
+          if k == "batch_interrogate_prepare" then wdBatch.prepare(raw,owner,currentModel,()=>job.check(),()=>publish())
+          else wdBatch.execute(raw,owner,currentModel,device.name(),job.imagePassword,()=>job.check(),()=>publish(), r=>generate(job,generation(r)))
+        case "aesthetic_embedding" =>
+          sdfx.vulkan.tools.VulkanAesthetic.execute(raw,backend,device.id(),() => job.check(),() => lock.synchronized {
+            job.check()
+            job.publishing = true
+          },(stage,step,total) => emit(Obj("type" -> "event","id" -> job.id,"event" -> "progress","pass" -> stage,"step" -> step,"total" -> total)))
         case "clip_interrogator" =>
           sdfx.vulkan.tools.VulkanClip.execute(raw,backend,device.id(),() => job.check(),(stage,step,total) =>
-            emit(Obj("type" -> "event","id" -> job.id,"event" -> "progress","pass" -> stage,"step" -> step,"total" -> total)))
+            emit(Obj("type" -> "event","id" -> job.id,"event" -> "progress","pass" -> stage,"step" -> step,"total" -> total)), () => lock.synchronized { job.check(); job.publishing = true })
         case "vae_tools" =>
-          sdfx.vulkan.tools.VulkanVae.execute(raw, backend, currentModel, () => job.cancelled, () => lock.synchronized {
+          sdfx.vulkan.tools.VulkanVae.execute(raw, backend, device.id(), currentModel, () => job.cancelled, () => lock.synchronized {
             job.check()
             job.publishing = true
           }, (name, fields) => {
@@ -245,7 +267,7 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
       job.frames.foreach(_.incomplete(() => job.interrupts > 1))
       job.files.foreach(p => try Files.deleteIfExists(p) catch case NonFatal(ex) => System.err.println(ex.getMessage))
       lock.synchronized {
-        error(Str(job.id), if job.cancelled then CancellationException() else e)
+        error(Str(job.id), if job.cancelled then CancellationException() else job.sensorFailure.getOrElse(e))
         jobs.remove(job.id)
       }
 
@@ -259,7 +281,7 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
       case "taesd" => if sdfx.vulkan.tools.VulkanVae.tinyPath(currentModel,None).isDefined then "tae" else "vae"
       case "vae" => "vae"
       case method => invalid(s"Unknown preview method: $method")
-    job.frames = sdfx.vulkan.tools.VulkanFrames.start(req, () => job.cancelled)
+    job.frames = sdfx.vulkan.tools.VulkanFrames.start(req, () => job.cancelled, job.imagePassword)
     val recording = job.frames.map(_.config)
     val noisy = recording.exists(_.imageType == "Noisy")
     val preview = req.previewEvery > 0 && mode != "none"
@@ -358,6 +380,11 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
     val dir = Files.createDirectories(Path.of(req.outputDir).toAbsolutePath.normalize())
     val start = System.nanoTime()
     val firstSeed = if p.seed >= 0 then p.seed else ThreadLocalRandom.current().nextLong(1L << 32)
+    val tweak = p.hooks.get("hires_fix_tweaks").filterNot(_.obj.get("enabled").contains(ujson.Bool(false))).filter(_ => p.hires.enabled && !p.isImg2Img)
+    val baseSubseed = if p.subseed >= 0 then p.subseed else ThreadLocalRandom.current().nextLong(1L << 32)
+    val order: Seq[(Int,Option[VulkanHiresTweaks.Pass])] = tweak match
+      case Some(config) => VulkanHiresTweaks.plan(config,p,firstSeed,baseSubseed).map((i,pass) => i -> Some(pass))
+      case None => (0 until p.imagesPerJob).map(_ -> None)
     val keyword = sdfx.vulkan.tools.VulkanKeyword.plan(req, model, toolSession, firstSeed, () => job.cancelled)
     keyword.foreach(plan => job.commit = plan.commit)
     val resources = Option.when(p.hooks.get("pnginfo_injection").exists(!_.obj.get("enabled").contains(ujson.Bool(false))))(new VulkanHashes.Run)
@@ -368,17 +395,31 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
       (image, VulkanTools.differenceMask(config, image, () => job.cancelled))
     }
     val graph = p.hooks.keysIterator.find(k => VulkanGraph.hooks(k) && !p.hooks(k).obj.get("enabled").contains(ujson.Bool(false)))
-    val imgs = (0 until p.imagesPerJob).flatMap { i =>
+      .orElse(Option.when(tweak.nonEmpty || separateHires && p.hires.upscaler.startsWith("Latent"))(VulkanGraph.latentHires))
+    val temperature = p.hooks.get("gpu_temperature_guard").filterNot(_.obj.get("enabled").contains(ujson.Bool(false))).map { h =>
+      if graph.nonEmpty then unsupported("GPU temperature guard in custom DGL graphs")
+      val tools = sdfx.vulkan.tools.NativeTemperatureGuard
+      val c = tools.parse(sdfx.vulkan.tools.NativeJson.parse(h.render()))
+      new tools.Guard(c, () => tools.read(c), () => job.check(), (event,reading) =>
+        if event != "reading" || c.printReadings then
+          emit(Obj("id" -> job.id, "type" -> "event", "event" -> "log",
+            "level" -> (if event == "timeout" then "warn" else "info"),
+            "message" -> s"GPU temperature $event: $reading C (provider=${c.provider}, device=${c.device})")))
+    }
+    val imgs = order.zipWithIndex.flatMap { case ((i,pass),index) =>
       job.check()
       val seed = Math.addExact(firstSeed, i.toLong)
-      job.frames.foreach(_.begin(i,seed))
-      val inputs = p.img2img.map(VulkanImageInputs.prepare(_, p.width, p.height, seed, difference, () => job.cancelled))
+      job.frames.foreach(_.begin(index,seed))
+      val inputs = p.img2img.filter(_ => graph.isEmpty).map(VulkanImageInputs.prepare(_, p.width, p.height, seed, difference, () => job.cancelled))
       val imageOptions = new VulkanInference.ImageOptions(inputs.map(_.init).orNull,
         inputs.flatMap(_.mask).orNull, p.img2img.fold(0.75)(_.denoisingStrength), hires.filterNot(_ => separateHires).orNull)
       def progress(pass: Option[String]): VulkanInference.Progress = (stage, step, total) =>
-        if job.cancelled then backend.cancel()
+        if step > 0 && total > 0 && job.sensorFailure.isEmpty && !job.cancelled then
+          try temperature.foreach(_.step())
+          catch case NonFatal(e) => job.sensorFailure = Some(e)
+        if job.cancelled || job.sensorFailure.nonEmpty then backend.cancel()
         else emit(Obj("id" -> job.id, "type" -> "event", "event" -> "progress", "step" -> step, "total" -> total,
-          "pass" -> pass.getOrElse(stage), "image" -> i, "images" -> p.imagesPerJob, "batch_size" -> 1))
+          "pass" -> pass.getOrElse(stage), "image" -> index, "images" -> order.size, "batch_size" -> 1))
       val planned = keyword.map(_.images(i))
       val activePrompt = planned.fold(p.prompt)(_.prompt)
       val activeConditioning = conditioning.getOrElse {
@@ -387,7 +428,7 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
       }
       val rendered = graph match
         case Some(hook) => VulkanGraph.render(backend, device.id(), model, loadRequest.get, req, hook,
-          activePrompt, planned.fold(p.loras)(_.loras), seed, gen.scheduler)
+          activePrompt, planned.fold(p.loras)(_.loras), seed, gen.scheduler, () => job.cancelled, pass)
         case None =>
           val generated = backend.generate(activePrompt, p.negativePrompt, p.width, p.height, p.steps, p.cfgScale, seed,
             samplers(p.samplerName), schedulers(gen.scheduler), p.clipSkip, imageOptions, activeConditioning, progress(None))
@@ -441,21 +482,38 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
                 new VulkanInference.ImageOptions(resized, null, strength, null), conditioning2, progress(Some("img2img_hires")))
           }
           Seq(image)
-      rendered.map { image =>
+      rendered.map { initial =>
         job.check()
+        val facePasses = Seq("adetailer","batch_face_swap").flatMap { key =>
+          p.hooks.get(key).filterNot(_.obj.get("enabled").contains(ujson.Bool(false))).map { cfg =>
+            if key == "adetailer" then cfg else sdfx.vulkan.tools.VulkanADetailer.facePass(cfg,model.path,model.hash)
+          }
+        }
+        val image = facePasses.foldLeft(initial) { (canvas,config) =>
+          val models = Path.of(model.path).toAbsolutePath.getParent
+          sdfx.vulkan.tools.VulkanADetailer(backend,device.id(),Option(models.getParent).getOrElse(models),canvas,config,p,activePrompt,seed,
+            () => job.cancelled, (unit,count) => emit(Obj("id" -> job.id,"type" -> "event","event" -> "log",
+              "level" -> "info","message" -> s"ADetailer unit ${unit+1} detected $count regions")),
+            (pos,neg,w,h,steps,cfg,sampler,regionSeed,opts) =>
+              backend.generate(pos,neg,w,h,steps,cfg,regionSeed,samplers.getOrElse(sampler,unsupported(s"ADetailer sampler $sampler")),
+                schedulers(gen.scheduler),p.clipSkip,opts,activeConditioning,progress(Some("adetailer"))))
+        }
+
         job.frames.foreach(_.finalImage(image))
         val file = Files.createTempFile(dir, "vulkan-", ".png")
         job.files += file
-        if !ImageIO.write(image, "png", file.toFile) then throw IllegalStateException("PNG writer unavailable")
+        sdfx.core.png.ScrambledPng.write(image, file, Seq.empty, job.imagePassword)
         val hardware = Option.when(req.hardwareInfo.enabled)(HardwareInfo.Record(display(device),
           f"${(System.nanoTime() - start) / 1e9}%.2fs", Option(req.hardwareInfo.remark).filter(_.nonEmpty)))
-        GeneratedImage(file.toString, seed, width = image.getWidth, height = image.getHeight, hardwareInfo = hardware,
+        GeneratedImage(file.toString, seed, subseed = pass.fold(-1L)(_.baseSubseed), width = image.getWidth, height = image.getHeight, hardwareInfo = hardware,
           effectivePrompt = planned.map(_.replay), modelKeywordSourcePrompt = planned.map(_.source),
+          hiresSeed = pass.map(_.seed), hiresSubseed = pass.map(_.subseed), hiresRepeat = pass.map(_.repeat),
+          hiresSubseedStrength = pass.map(_.strength), hiresSeedResizeFromW = pass.map(_.width), hiresSeedResizeFromH = pass.map(_.height),
           infotextFields = Seq("Vulkan device" -> display(device)))
       }
     }
     Json.toJs(GenerationResult(imgs, (System.nanoTime() - start) / 1e9, Some(model.name), Some(model.hash),
       intermediateArtifacts = job.frames.toSeq.flatMap(_.finish()),
       systemInfo = Option.when(req.systemInfoFields.nonEmpty)(VulkanDiagnostics.metadata(status, req.systemInfoFields)),
-      scheduler = Some(gen.scheduler), warnings = resources.toSeq.flatMap(_.warnings),
+      scheduler = Some(gen.scheduler), warnings = gen.warnings ++ resources.toSeq.flatMap(_.warnings),
       resourceHashes = resources.map(r => r.hashes ++ Map("model" -> model.hash) ++ model.vaeHash.map("vae" -> _)).getOrElse(Map.empty)))

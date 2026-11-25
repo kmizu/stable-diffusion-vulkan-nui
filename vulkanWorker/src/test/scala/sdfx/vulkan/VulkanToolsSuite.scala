@@ -114,3 +114,12 @@ class VulkanToolsSuite extends munit.FunSuite:
       assertEquals(plan.images.head.prompt,"blue bird")
     }
   }
+
+  test("Steps Animation defaults to video output and preserves capture-only mode") {
+    import sdfx.vulkan.tools.{NativeIntermediateRecorder,NativeJson}
+    def parse(o: Obj) = NativeIntermediateRecorder.parseStepsAnimation(
+      Some(NativeJson.parse(Obj("steps_animation" -> o).render())),1,1,false).get
+    assert(parse(Obj()).createOutput)
+    assert(!parse(Obj("create_output" -> false)).createOutput)
+    intercept[IllegalArgumentException](parse(Obj("frames_dir" -> "../outside")))
+  }

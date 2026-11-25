@@ -30,8 +30,8 @@ private[vulkan] object VulkanTools:
       openedEmbeddings = (embeddingPaths(model) :+ path).distinct
     private[tools] var pendingSubmission = Option.empty[(Long,Map[String,NativeJson])]
     private[tools] var keywordState = ModelKeyword.State()
-  val commands = Set("system_submission_preview", "system_submit", "embedding_inspector", "embedding_editor", "embedding_merge", "animatediff_encode", "model_keyword", "model_keyword_plan", "tokenize", "merge_models", "convert_model", "list_files", "preprocess", "image_tool", "metadata_utils", "inpaint_difference_preview", "upscale")
-  val features = Vector("clip_interrogator","embedding_inspector", "embedding_editor", "embedding_merge", "ip_adapter", "latent_mirroring", "resharpen", "anti_burn", "save_intermediate", "steps_animation", "apg", "cfg_schedule", "tiling", "neveroom", "model_sampling", "model_keyword", "inpaint_difference", "pnginfo_injection", "controlnet_preprocess_extras", "metadata_utils", "loopback_scaler")
+  val commands = Set("controlnet_fastload_data", "system_submission_preview", "system_submit", "embedding_inspector", "embedding_editor", "embedding_merge", "animatediff_encode", "model_keyword", "model_keyword_plan", "tokenize", "merge_models", "convert_model", "list_files", "preprocess", "image_tool", "metadata_utils", "inpaint_difference_preview", "upscale")
+  val features = Vector("controlnet_fastload_data", "clip_interrogator","embedding_inspector", "embedding_editor", "embedding_merge", "ip_adapter", "hires_fix_tweaks", "img2imgalt", "soft_inpainting", "latent_upscale", "latent_mirroring", "resharpen", "anti_burn", "color_grading", "vectorscope_cc", "detail_daemon", "cads", "cfg_cache", "mahiro", "rescale_cfg", "save_intermediate", "steps_animation", "gpu_temperature_guard", "adetailer", "batch_face_swap", "postdiff", "apg", "cfg_schedule", "tiling", "neveroom", "model_sampling", "model_keyword", "inpaint_difference", "pnginfo_injection", "controlnet_preprocess_extras", "metadata_utils", "loopback_scaler")
   val preprocessors = NativePreprocess.valid
   def differenceMask(raw: Value, source: BufferedImage, cancelled: () => Boolean): BufferedImage =
     val options = NativeInpaintDifference.parse(NativeJson.parse(ujson.write(raw)))
@@ -67,6 +67,7 @@ private[vulkan] object VulkanTools:
     import NativeJson.*
     val context = new NativeWorkContext(cancelled, publish,
       (name, fields) => event(name, ujson.read(NativeJson.render(NativeJson.Obj(fields)))))
+    if kind == "controlnet_fastload_data" then return VulkanFastload.execute(raw,context)
     val params = NativeJson.parse(ujson.write(raw)).asInstanceOf[NativeJson.Obj].fields
     try
       val value = kind match

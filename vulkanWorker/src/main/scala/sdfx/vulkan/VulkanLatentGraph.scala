@@ -5,9 +5,9 @@ import ujson.Value
 
 /** A one-step Euler integrator can be split at each supplied sigma without losing solver history. */
 private[vulkan] object VulkanLatentGraph:
-  val hooks = Set("latent_mirroring", "resharpen", "anti_burn")
+  val hooks = Set("latent_mirroring", "resharpen", "anti_burn", "color_grading", "vectorscope_cc", "detail_daemon", "cads", "cfg_cache", "mahiro", "rescale_cfg")
 
-  def sample(p: GenerationParams, method: String, eta: String): Seq[String] =
+  def sample(p: GenerationParams, method: String, eta: String, sdxl: Boolean, seed: Long): Seq[String] =
     if !Set("euler","euler_a")(method) then VulkanProtocol.unsupported("per-step latent hooks require Euler or Euler a")
     val lines = Vector.newBuilder[String]
     def config(k: String) = p.hooks.get(k).filterNot(_.obj.get("enabled").contains(ujson.Bool(false)))
@@ -16,6 +16,12 @@ private[vulkan] object VulkanLatentGraph:
       require(v.isFinite && v >= low && v <= high,s"Invalid $k")
       v
     val total = p.img2img.fold(p.steps)(i => math.min(p.steps,(p.steps*i.denoisingStrength).toInt+1))
+    val detail = config("detail_daemon").map(new VulkanDetailDaemon(_,total))
+    val cads = config("cads").map(new VulkanCads(_,total,sdxl))
+    if cads.nonEmpty then lines += s"cads_rng = make_rng(\"cpu\", seed = ${seed & 0xffffffffL})"
+    if cads.nonEmpty && detail.nonEmpty then VulkanProtocol.unsupported("CADS with Detail Daemon")
+    val guidance = new VulkanGuidance(p,total)
+    if guidance.enabled && method != "euler" then VulkanProtocol.unsupported("CFG rescale and CFG cache require Euler")
     val burn = config("anti_burn")
     val skip = burn.fold(0)(h => num(h,"skip_last",2,0,50).toInt)
     val count = burn.fold(1)(h => num(h,"average",3,1,50).toInt)
@@ -23,6 +29,9 @@ private[vulkan] object VulkanLatentGraph:
     val width = p.width/8
     val height = p.height/8
     def indices(n: Int) = (0 until n).reverse.mkString("[",",","]")
+    val vectorscope = config("vectorscope_cc").map(new VulkanVectorscope(_,sdxl,width,height,total))
+    if vectorscope.nonEmpty then lines += s"color_rng = make_rng(\"cpu\", seed = ${(seed+17) & 0xffffffffL})"
+    val grading = config("color_grading").map(new VulkanColorGrading(_,sdxl,width,height,total))
     val mirroring = config("latent_mirroring").map { h =>
       val mode = h.obj.get("mode").fold("Alternate Steps")(_.str)
       val style = h.obj.get("style").fold("Vertical Mirroring")(_.str)
@@ -39,7 +48,14 @@ private[vulkan] object VulkanLatentGraph:
     val history = Vector.newBuilder[String]
     for n <- 1 to stop do
       var value = s"x$n"
-      lines += s"$value = sample($last, sigmas[${n-1}:${n+1}], predict = guided, method = \"$method\", rng = rng$eta)"
+      val branches = cads.fold(("pos","neg"))(_.branches(n,lines))
+      val (pos,neg) = detail.fold(branches)(_.branches(n,lines,"pos","neg"))
+      val guided = if pos == "pos" && neg == "neg" then "guided" else
+        lines += s"guided$n = cfg($pos, $neg, scale = ${p.cfgScale})"
+        s"guided$n"
+      if guidance.enabled then guidance.step(lines,n,last,value,pos,neg)
+      else lines += s"$value = sample($last, sigmas[${n-1}:${n+1}], predict = $guided, method = \"$method\", rng = rng$eta)"
+      vectorscope.foreach(v => value = v.append(value,n,lines))
       for (mode,style,strength,maxStep) <- mirroring if n <= total*maxStep && (mode == "Blend Average" || n%2 == 1) do
         def flip(axis: Int,input: String) = s"tensor::index_select($input, axis = $axis, indices = ${indices(if axis==0 then width else height)})"
         val mirrored = style match
@@ -60,6 +76,7 @@ private[vulkan] object VulkanLatentGraph:
           case _ => 1.0
         lines += s"sharp$n = tensor::lerp($value, $last, ${-sharpness*0.1*k})"
         value = s"sharp$n"
+      grading.foreach(g => value = g.append(lines,value,n))
       history += value
       last = value
     val used = history.result().takeRight(count)

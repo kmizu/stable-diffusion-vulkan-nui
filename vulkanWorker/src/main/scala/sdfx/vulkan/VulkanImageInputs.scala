@@ -17,7 +17,7 @@ private[vulkan] object VulkanImageInputs:
   def separateHires(req: GenerationRequest): Boolean =
     val p = req.params
     val h = p.hires
-    h.enabled && !h.upscaler.startsWith("Latent") && (
+    h.enabled && (
       (h.prompt.nonEmpty && h.prompt != p.prompt) || (h.negativePrompt.nonEmpty && h.negativePrompt != p.negativePrompt) ||
       h.cfgScale.exists(_ != p.cfgScale) || h.samplerName.exists(_ != p.samplerName) ||
       h.scheduler.exists(_ != p.scheduler) || req.hiresLoras.exists(_ != p.loras))
@@ -31,9 +31,8 @@ private[vulkan] object VulkanImageInputs:
     val effectiveSteps = if h.secondPassSteps == 0 then p.steps else h.secondPassSteps
     val zero = h.denoisingStrength <= 0
     val strength = if zero then 1.0 / effectiveSteps else h.denoisingStrength
-    if !separateHires(req) && ((h.prompt.nonEmpty && h.prompt != p.prompt) || (h.negativePrompt.nonEmpty && h.negativePrompt != p.negativePrompt) ||
-        h.cfgScale.exists(_ != p.cfgScale) || h.samplerName.exists(_ != p.samplerName) ||
-        h.scheduler.exists(_ != p.scheduler)) then unsupported("different hires prompt, CFG, sampler or scheduler")
+    if !h.denoisingStrength.isFinite || h.denoisingStrength < 0 || h.denoisingStrength > 1 ||
+      h.cfgScale.exists(v => !v.isFinite || v < 0) then invalid("Invalid hires denoising strength or CFG scale")
     val (w, ht) = h.targetSize(p.width,p.height)
     if w.toLong * ht > 64L * 1024 * 1024 then invalid("Hires target exceeds the pixel limit")
     val native = upscalers.getOrElse(h.upscaler, if req.upscalerPaths.contains(h.upscaler) then "model" else unsupported(h.upscaler))

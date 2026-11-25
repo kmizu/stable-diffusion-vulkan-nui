@@ -11,6 +11,7 @@ param(
     [switch]$PreferScalaTorch,
     [switch]$NativeOnly,
     [switch]$VulkanOnly,
+    [switch]$IncludeVulkanWd,
     [string]$VulkanArchive = '',
     [string]$VulkanWorkerJar = '',
     [string]$VulkanVcRedistDir = $env:VCToolsRedistDir
@@ -183,6 +184,7 @@ if ($VulkanOnly) {
         $component = if ($name -eq 'vcomp140.dll') { 'Microsoft.VC143.OpenMP' } else { 'Microsoft.VC143.CRT' }
         Copy-Item -LiteralPath (Join-Path $VulkanVcRedistDir "x64/$component/$name") -Destination $nativeBin
     }
+    & (Join-Path $PSScriptRoot 'build_vulkan_ncnn.ps1') -Destination $nativeBin -IncludeWeights:$IncludeVulkanWd
     Copy-Item -LiteralPath $VulkanWorkerJar -Destination (Join-Path $nativeRoot 'vulkan-worker.jar')
     & (Join-Path $JdkHome 'bin/jlink.exe') --add-modules java.base,java.desktop,jdk.management,jdk.unsupported --strip-debug --no-header-files --no-man-pages --output (Join-Path $nativeRoot 'jre')
     if ($LASTEXITCODE -ne 0) { throw 'Failed to link the Vulkan worker runtime.' }

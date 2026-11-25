@@ -906,8 +906,9 @@ final class Generator(
         case None =>
           val target = OutputNaming.nextFile(outputs, kind, img.seed)
           try
-            val pixels = PngMetadata.readImage(src)
-            sdfx.core.png.ScrambledPng.write(pixels, target, texts, listener.imageSecret.map(_.use(identity)))
+            val password = listener.imageSecret.map(_.use(identity))
+            val pixels = sdfx.core.png.ScrambledPng.read(src, password).image
+            sdfx.core.png.ScrambledPng.write(pixels, target, texts, password)
           catch
             case NonFatal(e) =>
               Files.deleteIfExists(target)

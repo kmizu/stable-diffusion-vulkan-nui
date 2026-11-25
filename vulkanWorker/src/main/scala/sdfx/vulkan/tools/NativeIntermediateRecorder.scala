@@ -109,7 +109,7 @@ object NativeIntermediateRecorder:
         debug = boolVal(fields, "debug", false),
         runIncomplete = boolVal(fields, "run_incomplete", false),
         deleteIntermediate = boolVal(fields, "delete_intermediate", false),
-        createOutput = boolVal(fields, "create_output", false),
+        createOutput = boolVal(fields, "create_output", true),
         framesDir = str(fields, "frames_dir", "steps-animation/frames"),
         outputDir = str(fields, "output_dir", "steps-animation/videos")
       )
@@ -121,7 +121,8 @@ object NativeIntermediateRecorder:
       val effectiveSave: SaveIntermediateConfig,
       metadata: Map[String, NativeJson],
       cancelled: () => Boolean,
-      steps: Option[StepsAnimationConfig] = None
+      steps: Option[StepsAnimationConfig] = None,
+      password: Option[String] = None
   ):
     val directory: Path =
       val base = effectiveSave.outputDirOverride.map(Path.of(_).toAbsolutePath.normalize()).getOrElse(outputDir)
@@ -218,11 +219,8 @@ object NativeIntermediateRecorder:
             absStep.map(s => s"Intermediate step: $s"),
             Some(s"Intermediate subject: $imgType")
           ).flatten.mkString(", ")
-      IntermediatePngWriter.writePngWithMetadata(
-        image,
-        path,
-        Vector("sdfx_intermediate" -> sdfxJson, "parameters" -> paramLines)
-      )
+      val texts = Vector("sdfx_intermediate" -> sdfxJson, "parameters" -> paramLines)
+      sdfx.core.png.ScrambledPng.write(image, path, texts, password)
       if steps.exists(_.debug) then System.err.println(s"Steps Animation captured $passName step ${absStep.getOrElse(0)}")
       frames += record
       artifacts += IntermediateArtifact(
