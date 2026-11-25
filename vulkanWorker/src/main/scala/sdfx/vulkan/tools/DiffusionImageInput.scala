@@ -103,7 +103,7 @@ object DiffusionImageInput:
   }
 
   def readRgb(path: Path,maxPixels: Long=16777216L,maxBytes: Long=268435456L,
-      compositeAlpha: Boolean=true,applyOrientation: Boolean=true): BufferedImage =
+      compositeAlpha: Boolean=true,applyOrientation: Boolean=true,preserveAlpha:Boolean=false): BufferedImage =
     require(maxPixels>=0 && maxBytes>=0 && Files.isRegularFile(path),"invalid input image path or limits")
     require(Files.size(path)<=maxBytes,"encoded image exceeds byte limit")
     val turn=if applyOrientation then orientation(path) else 1
@@ -118,7 +118,7 @@ object DiffusionImageInput:
         val width=reader.getWidth(0);val height=reader.getHeight(0)
         require(width>0 && height>0 && width.toLong*height<=math.min(maxPixels,Int.MaxValue.toLong),"decoded image exceeds pixel limit")
         val source=reader.read(0)
-        val output=new BufferedImage(if turn>=5 then height else width,if turn>=5 then width else height,BufferedImage.TYPE_INT_RGB)
+        val output=new BufferedImage(if turn>=5 then height else width,if turn>=5 then width else height,if preserveAlpha then BufferedImage.TYPE_INT_ARGB else BufferedImage.TYPE_INT_RGB)
         val gray=source.getColorModel.getColorSpace.getType==ColorSpace.TYPE_GRAY
         for y <- 0 until height; x <- 0 until width do
           val pixel=if gray then
@@ -140,7 +140,7 @@ object DiffusionImageInput:
             case 7 => (height-1-y,width-1-x)
             case 8 => (y,width-1-x)
             case _ => (x,y)
-          output.setRGB(dx,dy,rgb)
+          output.setRGB(dx,dy,if preserveAlpha then rgb|(alpha<<24) else rgb)
         output
       finally reader.dispose()
     }

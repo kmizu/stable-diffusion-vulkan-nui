@@ -19,7 +19,20 @@ private[vulkan] object VulkanVision:
   private def findWeights(dir: Path): Option[Path] =
     Seq("model.safetensors","pytorch_model.bin","clip_vision_h.safetensors").map(dir.resolve(_)).find(Files.isRegularFile(_))
 
-  def inspect(model: Path, requested: String, family: String): Adapter =
+  private def defaultEncoder(bigG: Boolean, check: () => Unit): Path =
+    val sub = if bigG then "sdxl_models/image_encoder" else "models/image_encoder"
+    cachedRepo("h94/IP-Adapter").flatMap(root => findWeights(root.resolve(sub))).getOrElse {
+      val revision = "018e402774aeeddd60609b4ecdb7e298259dc729"
+      val sha = if bigG then "657723e09f46a7c3957df651601029f66b1748afb12b419816330f16ed45d64d"
+        else "6ca9667da1ca9e0b0f75e46bb030f7e011f44f86cbfb8d5a36590fcd7507b030"
+      val dir = Files.createDirectories(Path.of(sys.props("user.home"),".cache","sdv-nui","vision"))
+      val name = if bigG then "clip-vision-bigG.safetensors" else "clip-vision-H.safetensors"
+      VulkanClip.asset(dir,name,s"https://huggingface.co/h94/IP-Adapter/resolve/$revision/$sub/model.safetensors",sha,check,(_,_,_) => ())
+    }
+
+  def revisionEncoder(check: () => Unit): Path = defaultEncoder(true,check)
+
+  def inspect(model: Path, requested: String, family: String, check: () => Unit): Adapter =
     if !model.toString.toLowerCase(java.util.Locale.ROOT).endsWith(".safetensors") then
       unsupported("IP-Adapter checkpoint format (a .safetensors adapter is required)")
     val header = Using.resource(Files.newInputStream(model))(in => NativeMetadataUtils.parseHeader(in,Files.size(model))._1)
@@ -29,7 +42,6 @@ private[vulkan] object VulkanVision:
         fields.get("shape").collect { case NativeJson.Arr(xs) if xs.size == 2 => xs(1).asInstanceOf[NativeJson.Number].value.toInt }
     }.flatten
     val bigG = proj.fold(family == "sdxl" && !model.getFileName.toString.contains("vit-h"))(n => if plus then n >= 1664 else n >= 1280)
-    if bigG then unsupported("CLIP ViT-bigG IP-Adapter (native vision loader requires ViT-H)")
     val selected = Option(requested.trim).filter(_.nonEmpty)
     val explicit = selected.map(Path.of(_)).filter(Files.isRegularFile(_))
     val directory = selected.map(Path.of(_)).filter(Files.isDirectory(_)).flatMap(findWeights)
@@ -37,6 +49,6 @@ private[vulkan] object VulkanVision:
     val cached = cachedRepo(selected.getOrElse("h94/IP-Adapter")).flatMap { root =>
       if selected.nonEmpty then findWeights(root) else findWeights(root.resolve(if bigG then "sdxl_models/image_encoder" else "models/image_encoder"))
     }
-    val encoder = explicit.orElse(directory).orElse(adjacent).orElse(cached).getOrElse(
+    val encoder = explicit.orElse(directory).orElse(adjacent).orElse(cached).orElse(Option.when(selected.isEmpty)(defaultEncoder(bigG,check))).getOrElse(
       invalid("IP-Adapter needs a CLIP vision encoder. Set image_encoder to its weights, local directory, or cached Hugging Face repository."))
     Adapter(plus,encoder.toAbsolutePath.normalize())

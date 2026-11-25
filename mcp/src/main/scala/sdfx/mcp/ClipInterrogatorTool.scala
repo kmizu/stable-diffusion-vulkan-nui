@@ -12,7 +12,7 @@ final class ClipInterrogatorTool(services: AppServices, policy: PathPolicy, base
   def name = "clip_interrogate"
   override def title = "CLIP Interrogator"
   def description = "Work out a prompt for an existing image with CLIP (after pharmapsychotic's CLIP Interrogator). " +
-    "operation=prompt returns a prompt for `image` (an allowed local path, base64 or data URI) in mode best (slowest, highest similarity), fast, classic, negative (a negative prompt) or caption; " +
+    "operation=prompt returns a prompt for `image` (an allowed local path, base64 or data URI). Use models to discover the backend's modes, including closest-label retrieval on Vulkan. " +
     "analyze returns the top 5 medium / artist / movement / trending / flavor labels with scores; batch writes .txt files (or batch.txt / batch.csv) for every .png/.jpg/.jpeg in an allowed `folder` and never overwrites unless overwrite=true; " +
     "models lists choices, optional OpenCLIP dependency status and model-card source/verification metadata; model-card licence labels are dated snapshots, so check current terms. " +
     "unload frees the models (they are also freed after each call unless keep_loaded=true). " +
@@ -22,10 +22,10 @@ final class ClipInterrogatorTool(services: AppServices, policy: PathPolicy, base
     "operation" -> Schema.str("What to do", Seq("prompt", "analyze", "batch", "models", "unload"), Some("prompt")),
     "image" -> Schema.str("prompt / analyze: image path inside an allowed folder, base64 or data URI"),
     "folder" -> Schema.str("batch: folder inside an allowed folder; output files are written there"),
-    "mode" -> Schema.str("prompt / batch mode", Modes, Some("best")),
-    "clip_model" -> Schema.str("CLIP model (see operation=models)", default = Some("ViT-L-14/openai")),
-    "caption_model" -> Schema.str("Caption model; blip-large by default (blip-base on GPUs with 12 GB or less)",
-      Seq("blip-base", "blip-large", "blip2-2.7b", "blip2-flan-t5-xl", "git-large-coco")),
+    "mode" -> Schema.str("Prompt or batch mode from the backend's model catalog", Modes),
+    "clip_model" -> Schema.str("CLIP model from operation=models"),
+    "caption_model" -> Schema.str("Caption model from operation=models",
+      Seq("none", "blip-base", "blip-large", "blip2-2.7b", "blip2-flan-t5-xl", "git-large-coco")),
     "output_mode" -> Schema.str("batch output", OutputModes, Some(OutputModes.head)),
     "overwrite" -> Schema.bool("batch: replace existing .txt / batch.txt / batch.csv", Some(false)),
     "keep_loaded" -> Schema.bool("Keep the models in memory after the call", Some(false)),
@@ -40,11 +40,12 @@ final class ClipInterrogatorTool(services: AppServices, policy: PathPolicy, base
     if !Set("prompt", "analyze", "batch", "models", "unload")(operation) then throw ToolError("operation must be prompt, analyze, batch, models or unload")
     if services.imageScrambleSession.state.secret.nonEmpty && operation != "models" && operation != "unload" then
       throw ToolError("CLIP Interrogator is unavailable during a protected image session")
-    val mode = args.str("mode").getOrElse("best")
-    if !Modes.contains(mode) then throw ToolError(s"mode must be one of ${Modes.mkString(", ")}")
-    val params = ujson.Obj("operation" -> operation, "mode" -> mode,
+    val mode = args.str("mode")
+    if mode.exists(m => !Modes.contains(m)) then throw ToolError(s"mode must be one of ${Modes.mkString(", ")}")
+    val params = ujson.Obj("operation" -> operation,
       "keep_loaded" -> args.bool("keep_loaded").getOrElse(false),
       "cache_dir" -> services.home.configDir.resolve("clip-interrogator").toString)
+    mode.foreach(m => params("mode") = m)
     args.str("clip_model").foreach(m => params("clip_model") = m)
     args.str("caption_model").foreach(m => params("caption_model") = m)
     args.int("min_flavors", 0, 64).foreach(n => params("min_flavors") = n)
@@ -76,6 +77,6 @@ final class ClipInterrogatorTool(services: AppServices, policy: PathPolicy, base
     finally temporary.foreach(Images.deleteQuietly)
 
 object ClipInterrogatorTool:
-  val Modes = Seq("best", "fast", "classic", "negative", "caption")
+  val Modes = Seq("best", "fast", "classic", "negative", "caption", "label")
   val OutputModes = Seq("Text file for each image", "Single text file with all prompts",
     "csv file with columns for filenames and prompts")

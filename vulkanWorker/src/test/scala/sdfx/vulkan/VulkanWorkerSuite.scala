@@ -70,11 +70,11 @@ class VulkanWorkerSuite extends munit.FunSuite:
     assert(order.forall(x => x._2.width==448 && x._2.height==256))
   }
 
-  test("an enabled engine hook is rejected by name") {
-    val request = GenerationRequest(GenerationParams(hooks = Map("freeu" -> ujson.Obj("enabled" -> true))), "outputs")
+  test("an unknown enabled engine hook is rejected by name") {
+    val request = GenerationRequest(GenerationParams(hooks = Map("unknown_test_hook" -> ujson.Obj("enabled" -> true))), "outputs")
     val error = intercept[EngineError](VulkanWorker.generation(Json.toJs(request)))
     assertEquals(error.code, "unsupported")
-    assert(error.message.contains("freeu"))
+    assert(error.message.contains("unknown_test_hook"))
   }
 
   test("registry uses final extension and preserves names of nested checkpoints") {

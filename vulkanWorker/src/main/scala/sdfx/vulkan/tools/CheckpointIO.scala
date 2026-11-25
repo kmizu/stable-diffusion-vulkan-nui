@@ -7,7 +7,7 @@ import scala.util.Using
 import NativeJson.*
 
 /** Safetensors I/O for checkpoint tools. Only the tensor being transformed is resident. */
-private[tools] object CheckpointIO:
+private[vulkan] object CheckpointIO:
   val floatTypes = Set("F16", "BF16", "F32", "F64")
   val precision = Map("fp16" -> "F16", "bf16" -> "BF16", "fp32" -> "F32")
   private val widths = Map("F16" -> 2, "BF16" -> 2, "F32" -> 4, "F64" -> 8, "I64" -> 8)

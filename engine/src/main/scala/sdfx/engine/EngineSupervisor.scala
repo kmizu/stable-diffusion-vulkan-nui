@@ -78,7 +78,7 @@ final class EngineSupervisor(
     t
 
   private def augmentHello(h: EngineHello): EngineHello =
-    val extra = try extraFeatures().filterNot(h.features.contains) catch case NonFatal(_) => Nil
+    val extra = try extraFeatures().filterNot(f => h.features.contains(f) || f=="nsfw_checker" && h.features.contains("vulkan_nsfw")) catch case NonFatal(_) => Nil
     if extra.isEmpty then h else h.copy(features = h.features ++ extra)
 
   def state: EngineState = _state

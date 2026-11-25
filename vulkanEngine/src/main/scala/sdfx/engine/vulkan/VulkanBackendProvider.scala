@@ -35,6 +35,7 @@ final class VulkanBackendProvider extends EngineBackendProvider:
     require(Files.isDirectory(libraries), s"Vulkan native library directory missing: $libraries")
     val inheritedPath = environment.collectFirst { case (key, value) if key.equalsIgnoreCase("PATH") => value }
     val workerEnv = Map(
+      "SDFX_ALLOW_CODE" -> (if settings.allowCustomCode then "1" else "0"),
       "SDFX_VULKAN_LIBRARY_DIR" -> libraries.toString,
       "SDFX_VULKAN_OFFLINE" -> environment.getOrElse("SDFX_VULKAN_OFFLINE",settings.hfOffline.toString),
       "PATH" -> (libraries.toString +: inheritedPath.toList).mkString(java.io.File.pathSeparator)

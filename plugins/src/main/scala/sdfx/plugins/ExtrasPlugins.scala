@@ -203,7 +203,7 @@ class CustomCodePlugin extends Plugin:
   def name = "Custom code"
   def kind = PluginKind.Script
   override def requiresEngineFeatures: Seq[String] = Seq("custom_code")
-  override def description = "Runs Python in the engine (engine, pipe, torch, Image, params available; set `result` / `images`)."
+  override def description = "Runs a local Python script with engine, pipe and params. Set `result` for text or `images` for image paths."
   override def controls: Seq[Control] = Seq(
     Note("warning", "Only enabled when 'Allow custom code' is on in Settings. Code runs with your user's rights."),
     Note("scrambling_warning", "Image scrambling cannot protect files written by custom Python. Code can save readable images or other data anywhere it can access; these writes cannot be intercepted by the app."),

@@ -1,0 +1,49 @@
+diff --git a/src/api/generation_image.cpp b/src/api/generation_image.cpp
+index 8d2fa41..2118931 100644
+--- a/src/api/generation_image.cpp
++++ b/src/api/generation_image.cpp
+@@ -126,6 +126,7 @@ namespace sd::api {
+     }
+ 
+     static void image_inpaint(GenerationTemplate& request) {
++        request.values["mask_conditioning_weight"] = request.image.mask_conditioning_weight;
+         const bool inpaint = sd_version_is_inpaint(request.definition.version);
+         const auto* mask   = bound_tensor(request.options, "mask_image");
+         if (!mask && !inpaint)
+diff --git a/src/api/options.cpp b/src/api/options.cpp
+index 5ec536a..45ecc0e 100644
+--- a/src/api/options.cpp
++++ b/src/api/options.cpp
+@@ -350,6 +350,7 @@ static void add_generation_specs(std::vector<ParamSpec>& specs) {
+ 
+     img.integer("batch_count", &sd::ImageConfig::batch_count, 1, INT32_MAX);
+     img.image("control_image", &sd::ImageConfig::control_image);
++    img.number("mask_conditioning_weight", &sd::ImageConfig::mask_conditioning_weight, 0, 1);
+     img.number("control_strength", &sd::ImageConfig::control_strength, 0, std::numeric_limits<float>::max());
+     img.choice("control_type", &sd::ImageConfig::control_type, str_to_sd_control_type, SD_CONTROL_TYPE_COUNT);
+     img.image("mask_image", &sd::ImageConfig::mask_image);
+diff --git a/src/api/templates/image_inpaint.dgl b/src/api/templates/image_inpaint.dgl
+index 536e820..234ab1a 100644
+--- a/src/api/templates/image_inpaint.dgl
++++ b/src/api/templates/image_inpaint.dgl
+@@ -57,7 +57,7 @@ fn main({{inputs}}) {
+ {% if flags.flex %}
+     masked_latent = tensor::mul(base, tensor::affine(mask_latent, scale = -1, offset = 1))
+ {% elif flags.has_init %}
+-    masked_pixels = tensor::lerp(image::to_f32(source, channels = {{channels}}), 0.5, mask_pixels)
++    masked_pixels = tensor::lerp(image::to_f32(source, channels = {{channels}}), 0.5, tensor::mul(mask_pixels, {{mask_conditioning_weight}}))
+     masked_latent = {{from_vae}}(vae, vae_encode(vae, masked_pixels, rng = encode_rng{{vae_run_options}}))
+ {% else %}
+     masked_latent = tensor::zeros_like(base)
+diff --git a/src/config.h b/src/config.h
+index 5319863..0d505ef 100644
+--- a/src/config.h
++++ b/src/config.h
+@@ -158,6 +158,7 @@ namespace sd {
+         int batch_count{};
+         sd::Image control_image{};
+         float control_strength{};
++        float mask_conditioning_weight = 1.0f;
+         sd::TilingConfig vae_tiling_params{};
+         sd::CacheConfig cache{};
+         HiresConfig hires{};

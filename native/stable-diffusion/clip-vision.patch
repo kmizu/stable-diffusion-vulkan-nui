@@ -1,0 +1,133 @@
+diff --git a/src/conditioning/conditioner.hpp b/src/conditioning/conditioner.hpp
+index 64f8007..d1b3c39 100644
+--- a/src/conditioning/conditioner.hpp
++++ b/src/conditioning/conditioner.hpp
+@@ -624,16 +624,20 @@ struct FrozenCLIPVisionEmbedder : public GGMLRunner {
+                              std::shared_ptr<RunnerWeightManager> weight_manager = nullptr)
+         : GGMLRunner(backend, weight_manager) {
+         bool proj_in = false;
+-        for (const auto& [name, tensor_storage] : tensor_storage_map) {
+-            if (!starts_with(name, weight_prefix)) {
+-                continue;
++        CLIPVersion architecture = OPEN_CLIP_VIT_H_14;
++        for (const auto& [name, tensor] : tensor_storage_map) {
++            if (!starts_with(name, weight_prefix)) continue;
++            proj_in |= contains(name, "self_attn.in_proj");
++            if (ends_with(name, "vision_model.embeddings.patch_embedding.weight") && tensor.ne[3] == 768) {
++                if (tensor.ne[0] == 16) architecture = OPENAI_CLIP_VIT_B_16;
++                if (tensor.ne[0] == 32) architecture = OPENAI_CLIP_VIT_B_32;
+             }
+-            if (contains(name, "self_attn.in_proj")) {
+-                proj_in = true;
+-                break;
++            if (ends_with(name, "vision_model.pre_layernorm.weight")) {
++                if (tensor.ne[0] == 1024) architecture = OPENAI_CLIP_VIT_L_14;
++                if (tensor.ne[0] == 1664) architecture = OPEN_CLIP_VIT_BIGG_14;
+             }
+         }
+-        vision_model = CLIPVisionModelProjection(OPEN_CLIP_VIT_H_14, false, proj_in);
++        vision_model = CLIPVisionModelProjection(architecture, false, proj_in);
+         vision_model.init(params_ctx, tensor_storage_map, weight_prefix);
+     }
+ 
+diff --git a/src/model/te/clip.hpp b/src/model/te/clip.hpp
+index 113f974..efec745 100644
+--- a/src/model/te/clip.hpp
++++ b/src/model/te/clip.hpp
+@@ -17,11 +17,11 @@ protected:
+     bool use_gelu;
+ 
+ public:
+-    CLIPMLP(int64_t d_model, int64_t intermediate_size) {
++    CLIPMLP(int64_t d_model, int64_t intermediate_size, int gelu_override = -1) {
+         blocks["fc1"] = std::shared_ptr<GGMLBlock>(new Linear(d_model, intermediate_size));
+         blocks["fc2"] = std::shared_ptr<GGMLBlock>(new Linear(intermediate_size, d_model));
+ 
+-        if (d_model == 1024 || d_model == 1280) {  // SD 2.x
++        if (gelu_override >= 0 ? gelu_override != 0 : (d_model == 1024 || d_model == 1280)) {  // SD 2.x
+             use_gelu = true;
+         } else {  // SD 1.x
+             use_gelu = false;
+@@ -54,7 +54,7 @@ public:
+     CLIPLayer(int64_t d_model,
+               int64_t n_head,
+               int64_t intermediate_size,
+-              bool proj_in = false)
++              bool proj_in = false, int gelu_override = -1)
+         : d_model(d_model),
+           n_head(n_head),
+           intermediate_size(intermediate_size) {
+@@ -63,7 +63,7 @@ public:
+         blocks["layer_norm1"] = std::shared_ptr<GGMLBlock>(new LayerNorm(d_model));
+         blocks["layer_norm2"] = std::shared_ptr<GGMLBlock>(new LayerNorm(d_model));
+ 
+-        blocks["mlp"] = std::shared_ptr<GGMLBlock>(new CLIPMLP(d_model, intermediate_size));
++        blocks["mlp"] = std::shared_ptr<GGMLBlock>(new CLIPMLP(d_model, intermediate_size, gelu_override));
+     }
+ 
+     ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* mask = nullptr) {
+@@ -88,11 +88,11 @@ public:
+                 int64_t d_model,
+                 int64_t n_head,
+                 int64_t intermediate_size,
+-                bool proj_in = false)
++                bool proj_in = false, int gelu_override = -1)
+         : n_layer(n_layer) {
+         for (int i = 0; i < n_layer; i++) {
+             std::string name = "layers." + std::to_string(i);
+-            blocks[name]     = std::shared_ptr<GGMLBlock>(new CLIPLayer(d_model, n_head, intermediate_size, proj_in));
++            blocks[name]     = std::shared_ptr<GGMLBlock>(new CLIPLayer(d_model, n_head, intermediate_size, proj_in, gelu_override));
+         }
+     }
+ 
+@@ -259,6 +259,8 @@ public:
+ 
+ enum CLIPVersion {
+     OPENAI_CLIP_VIT_L_14,   // SD 1.x and SDXL
++    OPENAI_CLIP_VIT_B_16,
++    OPENAI_CLIP_VIT_B_32,
+     OPEN_CLIP_VIT_H_14,     // SD 2.x
+     OPEN_CLIP_VIT_BIGG_14,  // SDXL
+ };
+@@ -361,7 +363,14 @@ public:
+ 
+ public:
+     CLIPVisionModel(CLIPVersion version = OPENAI_CLIP_VIT_L_14, bool proj_in = false) {
+-        if (version == OPEN_CLIP_VIT_H_14) {
++        if (version == OPENAI_CLIP_VIT_B_16 || version == OPENAI_CLIP_VIT_B_32) {
++            patch_size = version == OPENAI_CLIP_VIT_B_16 ? 16 : 32;
++            num_positions = (image_size / patch_size) * (image_size / patch_size) + 1;
++            hidden_size = 768;
++            intermediate_size = 3072;
++            n_head = 12;
++            n_layer = 12;
++        } else if (version == OPEN_CLIP_VIT_H_14) {
+             hidden_size       = 1280;
+             intermediate_size = 5120;
+             n_head            = 16;
+@@ -375,7 +384,7 @@ public:
+ 
+         blocks["embeddings"]     = std::shared_ptr<GGMLBlock>(new CLIPVisionEmbeddings(hidden_size, num_channels, patch_size, image_size));
+         blocks["pre_layernorm"]  = std::shared_ptr<GGMLBlock>(new LayerNorm(hidden_size));
+-        blocks["encoder"]        = std::shared_ptr<GGMLBlock>(new CLIPEncoder(n_layer, hidden_size, n_head, intermediate_size, proj_in));
++        blocks["encoder"]        = std::shared_ptr<GGMLBlock>(new CLIPEncoder(n_layer, hidden_size, n_head, intermediate_size, proj_in, version == OPEN_CLIP_VIT_H_14 || version == OPEN_CLIP_VIT_BIGG_14));
+         blocks["post_layernorm"] = std::shared_ptr<GGMLBlock>(new LayerNorm(hidden_size));
+     }
+ 
+@@ -451,11 +460,15 @@ public:
+     CLIPVisionModelProjection(CLIPVersion version   = OPENAI_CLIP_VIT_L_14,
+                               bool transpose_proj_w = false,
+                               bool proj_in          = false) {
+-        if (version == OPEN_CLIP_VIT_H_14) {
++        if (version == OPENAI_CLIP_VIT_B_16 || version == OPENAI_CLIP_VIT_B_32) {
++            hidden_size = 768;
++            projection_dim = 512;
++        } else if (version == OPEN_CLIP_VIT_H_14) {
+             hidden_size    = 1280;
+             projection_dim = 1024;
+         } else if (version == OPEN_CLIP_VIT_BIGG_14) {
+             hidden_size = 1664;
++            projection_dim = 1280;
+         }
+ 
+         blocks["vision_model"]      = std::shared_ptr<GGMLBlock>(new CLIPVisionModel(version, proj_in));

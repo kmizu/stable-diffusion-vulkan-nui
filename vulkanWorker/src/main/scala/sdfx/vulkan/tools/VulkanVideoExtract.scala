@@ -37,7 +37,7 @@ private[vulkan] object VulkanVideoExtract:
       Option(failure.get()).foreach(throw _)
 
   def run(path: Path, requested: Double, write: BufferedImage => Unit, check: () => Unit,
-      progress: (Int,Int) => Unit): Obj =
+      progress: (Int,Int) => Unit, sourceLimit: Int = Int.MaxValue): Obj =
     require(Files.isRegularFile(path),"Missing video")
     val probe = process(Seq("ffprobe","-v","error","-protocol_whitelist","file,pipe","-select_streams","v:0",
       "-show_entries","stream=width,height,avg_frame_rate,r_frame_rate,nb_frames,duration:format=duration",
@@ -63,12 +63,12 @@ private[vulkan] object VulkanVideoExtract:
       .orElse(probe.obj.get("format").flatMap(_.obj.get("duration")).flatMap(_.strOpt).flatMap(_.toDoubleOption))
     val expected = knownCount.orElse(duration.filter(x=>x.isFinite && x>0).map(x => math.round(x*fps).toInt))
       .getOrElse(throw IllegalArgumentException("Unknown video duration or frame count"))
-    require(expected>0 && expected<=10000 && expected.toLong*w*h<=2000000000L,"Video frame count exceeds limit")
+    require(expected>0 && expected.min(sourceLimit)<=10000 && expected.min(sourceLimit).toLong*w*h<=2000000000L,"Video frame count exceeds limit")
     val rgb = new Array[Byte](w*h*3)
     var count = 0
     var next = 0.0
     process(Seq("ffmpeg","-nostdin","-v","error","-protocol_whitelist","file,pipe","-noautorotate","-i",path.toAbsolutePath.toString,
-      "-map","0:v:0","-an","-sn","-dn","-fps_mode","passthrough","-f","rawvideo","-pix_fmt","rgb24","pipe:1"),check) { child =>
+      "-map","0:v:0","-an","-sn","-dn","-fps_mode","passthrough","-f","rawvideo","-pix_fmt","rgb24") ++ Option.when(sourceLimit < Int.MaxValue)(Seq("-frames:v",sourceLimit.toString)).toSeq.flatten ++ Seq("pipe:1"),check) { child =>
       Using.resource(child.getInputStream) { input =>
         var n = input.readNBytes(rgb,0,rgb.length)
         while n > 0 do
@@ -85,5 +85,5 @@ private[vulkan] object VulkanVideoExtract:
           n = input.readNBytes(rgb,0,rgb.length)
       }
     }
-    require(count > 0 && knownCount.forall(_ == count),"Video decoder returned an incomplete sequence")
-    Obj("dimensions" -> Arr(w,h),"fps" -> outputFps,"source_fps" -> fps,"duration" -> (count/fps))
+    require(count > 0 && knownCount.forall(_.min(sourceLimit) == count),"Video decoder returned an incomplete sequence")
+    Obj("dimensions" -> Arr(w,h),"fps" -> outputFps,"source_fps" -> fps,"duration" -> (count/fps),"decoded" -> count,"source_frames" -> expected)

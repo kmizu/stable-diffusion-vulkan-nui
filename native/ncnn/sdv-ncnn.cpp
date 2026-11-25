@@ -1,3 +1,6 @@
+#include "codebook.hpp"
+#include "blip.hpp"
+#include "cliptext.hpp"
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -36,6 +39,7 @@ static int run(int argc, wchar_t** argv) {
     }
     if (adapter < 0) { std::cerr << "Selected Vulkan adapter unavailable\n"; return 3; }
     ncnn::Net net;
+    net.register_custom_layer("SdvCodebookLookup", CodebookLookup_layer_creator);
     net.set_vulkan_device(adapter);
     net.opt.use_vulkan_compute = true;
     net.opt.use_fp16_storage = false;
@@ -68,7 +72,10 @@ static int run(int argc, wchar_t** argv) {
 
 int wmain(int argc, wchar_t** argv) {
     ncnn::create_gpu_instance();
-    const int status = run(argc, argv);
+    int status;
+    if (argc > 1 && (std::wstring(argv[1]) == L"--blip" || std::wstring(argv[1]) == L"--git")) status = blip_caption(argc, argv);
+    else if (argc > 1 && std::wstring(argv[1]) == L"--clip-text") status = clip_text(argc, argv);
+    else status = run(argc, argv);
     ncnn::destroy_gpu_instance();
     return status;
 }

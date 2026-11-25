@@ -42,7 +42,7 @@ private[vulkan] object VulkanProtocol:
     p.validate.headOption.foreach(invalid)
     if req.outputDir.isBlank then invalid("output_dir is required")
     p.hooks.foreach { (key, config) =>
-      if !VulkanGraph.hooks(key) && !Set("embedding_merge", "save_intermediate", "steps_animation", "gpu_temperature_guard", "adetailer", "batch_face_swap", "apg", "cfg_schedule", "tiling", "neveroom", "model_sampling", "model_keyword", "pnginfo_injection", "inpaint_difference", "img2img_hires_fix","hires_fix_tweaks")(key) then unsupported(s"engine hook $key")
+      if !VulkanGraph.hooks(key) && !Set("nsfw_checker","aesthetic_score", "embedding_merge", "save_intermediate", "steps_animation", "gpu_temperature_guard", "conditioning_highres_fix", "face_restore", "adetailer", "batch_face_swap", "apg", "cfg_schedule", "tiling", "neveroom", "model_sampling", "model_keyword", "pnginfo_injection", "inpaint_difference", "img2img_hires_fix","hires_fix_tweaks")(key) then unsupported(s"engine hook $key")
       if config.objOpt.isEmpty then invalid(s"Invalid configuration for $key")
       if key == "pnginfo_injection" && config.obj.keys.exists(_ != "enabled") then invalid("Invalid PNG resource hash configuration")
       config.obj.get("enabled").foreach(value => decode(value.bool))

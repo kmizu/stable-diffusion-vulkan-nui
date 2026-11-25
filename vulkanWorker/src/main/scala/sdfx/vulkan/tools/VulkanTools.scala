@@ -30,8 +30,8 @@ private[vulkan] object VulkanTools:
       openedEmbeddings = (embeddingPaths(model) :+ path).distinct
     private[tools] var pendingSubmission = Option.empty[(Long,Map[String,NativeJson])]
     private[tools] var keywordState = ModelKeyword.State()
-  val commands = Set("controlnet_fastload_data", "system_submission_preview", "system_submit", "embedding_inspector", "embedding_editor", "embedding_merge", "animatediff_encode", "model_keyword", "model_keyword_plan", "tokenize", "merge_models", "convert_model", "list_files", "preprocess", "image_tool", "metadata_utils", "inpaint_difference_preview", "upscale")
-  val features = Vector("controlnet_fastload_data", "clip_interrogator","embedding_inspector", "embedding_editor", "embedding_merge", "ip_adapter", "hires_fix_tweaks", "img2imgalt", "soft_inpainting", "latent_upscale", "latent_mirroring", "resharpen", "anti_burn", "color_grading", "vectorscope_cc", "detail_daemon", "cads", "cfg_cache", "mahiro", "rescale_cfg", "save_intermediate", "steps_animation", "gpu_temperature_guard", "adetailer", "batch_face_swap", "postdiff", "apg", "cfg_schedule", "tiling", "neveroom", "model_sampling", "model_keyword", "inpaint_difference", "pnginfo_injection", "controlnet_preprocess_extras", "metadata_utils", "loopback_scaler")
+  val commands = Set("cn_animation", "controlnet_fastload_data", "system_submission_preview", "system_submit", "embedding_inspector", "embedding_editor", "embedding_merge", "animatediff_encode", "model_keyword", "model_keyword_plan", "tokenize", "merge_models", "convert_model", "list_files", "preprocess", "image_tool", "metadata_utils", "inpaint_difference_preview", "upscale")
+  val features = Vector("sonar","semantic_guidance","neutral_prompt","cn_animation","revision","controlnet_fastload_data", "conditioning_highres_fix", "clip_interrogator","embedding_inspector", "embedding_editor", "embedding_merge", "ip_adapter", "hires_fix_tweaks", "img2imgalt", "soft_inpainting", "latent_upscale", "latent_mirroring", "resharpen", "anti_burn", "color_grading", "vectorscope_cc", "detail_daemon", "cads", "cfg_cache", "mahiro", "rescale_cfg", "save_intermediate", "steps_animation", "gpu_temperature_guard", "adetailer", "batch_face_swap", "postdiff", "apg", "cfg_schedule", "tiling", "neveroom", "model_sampling", "model_keyword", "inpaint_difference", "pnginfo_injection", "controlnet_preprocess_extras", "metadata_utils", "loopback_scaler")
   val preprocessors = NativePreprocess.valid
   def differenceMask(raw: Value, source: BufferedImage, cancelled: () => Boolean): BufferedImage =
     val options = NativeInpaintDifference.parse(NativeJson.parse(ujson.write(raw)))
@@ -88,6 +88,7 @@ private[vulkan] object VulkanTools:
             val (value, next) = NativeKeywordMappings.planRequest(params, file, directoryHash, session.keywordState, context)
             session.keywordState = next
             value
+        case "cn_animation" => return VulkanCnAnimation.run(raw, device.split(": ",2).last, context)
         case "animatediff_encode" => return VulkanVideo.encode(raw, context)
         case "system_submission_preview" =>
           val preview = VulkanSubmission.submissionPreview(params)

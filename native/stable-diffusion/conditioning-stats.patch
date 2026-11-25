@@ -1,0 +1,82 @@
+--- a/src/dgl/bindings/tensor_ops.h
++++ b/src/dgl/bindings/tensor_ops.h
+@@ -23,6 +23,8 @@
+     Value execute_tensor_full(Values& args, RunState&);
+     Value execute_tensor_zeros_like(Values& args, RunState&);
+     Value execute_tensor_lerp(Values& args, RunState&);
++    Value tensor_f32_stat(Values& args, RunState&);
++    Value tensor_f32_salience(Values& args, RunState&);
+     Value execute_tensor_affine(Values& args, RunState&);
+     Value execute_tensor_clamp(Values& args, RunState&);
+     Value execute_tensor_max_pool2d(Values& args, RunState&);
+--- a/src/dgl/bindings/tensor_ops.cpp
++++ b/src/dgl/bindings/tensor_ops.cpp
+@@ -272,6 +272,56 @@
+         });
+     }
+ 
++    // Statistics of one model branch. DGL inference supplies one image per batch.
++    Value tensor_f32_stat(Values& args, RunState&) {
++        const auto input = object<sd_tensor_t>(args, "input");
++        if (input->type != SD_TENSOR_F32 || input->bytes == 0)
++            throw std::runtime_error("stat_f32 needs a nonempty F32 tensor");
++        const auto* data = input->as<float>().data();
++        const size_t size = input->bytes / sizeof(float);
++        const auto mode = get_string(args, "mode");
++        if (mode == "kth") {
++            const auto rank = get_int(args, "rank");
++            if (rank < 1 || static_cast<size_t>(rank) > size)
++                throw std::runtime_error("stat_f32 rank is out of range");
++            std::vector<float> sorted(data, data + size);
++            std::nth_element(sorted.begin(), sorted.begin() + rank - 1, sorted.end());
++            return Value::literal(static_cast<double>(sorted[rank - 1]));
++        }
++        if (mode != "mean" && mode != "std")
++            throw std::runtime_error("unknown stat_f32 mode");
++        double sum = 0.0;
++        for (size_t i = 0; i < size; ++i)
++            sum += data[i];
++        const double mean = sum / size;
++        if (mode == "mean" || size == 1)
++            return Value::literal(mode == "mean" ? mean : 0.0);
++        double squares = 0.0;
++        for (size_t i = 0; i < size; ++i) {
++            const double delta = data[i] - mean;
++            squares += delta * delta;
++        }
++        return Value::literal(std::sqrt(squares / (size - 1)));
++    }
++
++    Value tensor_f32_salience(Values& args, RunState&) {
++        const auto input = object<sd_tensor_t>(args, "input");
++        if (input->type != SD_TENSOR_F32 || input->bytes == 0)
++            throw std::runtime_error("salience_f32 needs a nonempty F32 tensor");
++        const auto* data = input->as<float>().data();
++        const size_t size = input->bytes / sizeof(float);
++        float maximum = 0;
++        for (size_t i = 0; i < size; ++i)
++            maximum = std::max(maximum, std::abs(data[i]));
++        std::vector<float> output(size);
++        double total = 0;
++        for (size_t i = 0; i < size; ++i)
++            total += output[i] = std::exp(std::abs(data[i]) - maximum);
++        for (float& score : output)
++            score = static_cast<float>(score / total);
++        return tensor_result(input->shape(), std::move(output));
++    }
++
+     Value execute_tensor_affine(Values& args, RunState&) {
+         const auto& input = args.at("input");
+         return numeric_operation({&input}, [&](auto tag) {
+--- a/src/dgl/bindings/registration.cpp
++++ b/src/dgl/bindings/registration.cpp
+@@ -216,6 +216,9 @@
+             {tensor, axis, int_vector_argument("indices"), scalar("value")}, {Kind::Tensor}, execute_tensor_index_fill);
+         registry["tensor::grayscale"] = make_operation(
+             {tensor, integer("axis", 0, 7, 0)}, {Kind::Tensor}, grayscale_tensor);
++        registry["tensor::stat_f32"] = make_operation(
++            {tensor, required("mode", Kind::String), integer("rank", 0, INT_MAX, 0)}, {Kind::Number}, tensor_f32_stat);
++        registry["tensor::salience_f32"] = make_operation({tensor}, {Kind::Tensor}, tensor_f32_salience);
+         registry["tensor::threshold"] = make_operation(
+             {tensor, scalar("threshold"), number("low", -numeric_limit, numeric_limit, 0), number("high", -numeric_limit, numeric_limit, 1)},
+             {Kind::Tensor}, threshold_tensor);

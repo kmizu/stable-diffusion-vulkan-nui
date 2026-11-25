@@ -695,7 +695,7 @@ final class Generator(
     }
 
   private def usesNativeNsfw: Boolean =
-    client.supervisor.hello.forall(_.python.trim.isEmpty)
+    client.supervisor.hello.forall(h => h.python.trim.isEmpty && !h.features.contains("vulkan_nsfw"))
 
   private def nativeNsfwConfig(prep: PreparedGeneration): Option[NativeNsfwCensor.GenerationConfig] =
     if !usesNativeNsfw then None

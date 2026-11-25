@@ -1,5 +1,9 @@
 # AGENTS.md
 
+## Vulkan fork
+
+The active remote is `kmizu/stable-diffusion-vulkan-nui`. Build the Java 25 Vulkan worker and package `SDV-NUI.exe`. Current coverage and verification are in `docs/HANDOFF.md`, `docs/WINDOWS_VULKAN.md` and `docs/vulkan-parity.md`. The following upstream notes describe the original application.
+
 Instructions for coding agents (Codex and others) working in this repository.
 
 **Start with `docs/HANDOFF.md`.** It has the current goal (bundle every A1111 extension-index entry as a built-in

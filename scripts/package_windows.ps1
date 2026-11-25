@@ -12,11 +12,18 @@ param(
     [switch]$NativeOnly,
     [switch]$VulkanOnly,
     [switch]$IncludeVulkanWd,
+    [switch]$IncludeVulkanCustomCode,
+    [switch]$IncludeVulkanCharacterModels,
+    [switch]$IncludeVulkanBlip,
     [string]$VulkanArchive = '',
     [string]$VulkanWorkerJar = '',
     [string]$VulkanVcRedistDir = $env:VCToolsRedistDir
 )
 $ErrorActionPreference = 'Stop'
+if ($NativeOnly -or $PreferScalaTorch -or $ScalaTorchWorkerDistribution -or $ScalaTorchTokenizerDirectory -or $ScalaTorchJdkHome -or
+    ($PSBoundParameters.ContainsKey('VulkanOnly') -and -not $VulkanOnly)) {
+    throw 'This repository packages the Vulkan backend only.'
+}
 if (-not $PSBoundParameters.ContainsKey('VulkanOnly') -and -not ($NativeOnly -or $PreferScalaTorch -or $ScalaTorchWorkerDistribution)) {
     $VulkanOnly = $true
 }
@@ -168,6 +175,7 @@ if ($VulkanOnly) {
     $upstream = Join-Path $run 'upstream'
     Expand-Archive -LiteralPath $VulkanArchive -DestinationPath $upstream
     Get-ChildItem -LiteralPath $upstream -File | Where-Object { $_.Extension -in '.dll','.txt' } | Copy-Item -Destination $nativeBin
+    & (Join-Path $PSScriptRoot 'build_vulkan_native.ps1') -Destination $nativeBin
     if (-not $VulkanVcRedistDir) {
         $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
         if (Test-Path -LiteralPath $vswhere) {
@@ -184,9 +192,13 @@ if ($VulkanOnly) {
         $component = if ($name -eq 'vcomp140.dll') { 'Microsoft.VC143.OpenMP' } else { 'Microsoft.VC143.CRT' }
         Copy-Item -LiteralPath (Join-Path $VulkanVcRedistDir "x64/$component/$name") -Destination $nativeBin
     }
-    & (Join-Path $PSScriptRoot 'build_vulkan_ncnn.ps1') -Destination $nativeBin -IncludeWeights:$IncludeVulkanWd
+    & (Join-Path $PSScriptRoot 'build_vulkan_ncnn.ps1') -Destination $nativeBin -IncludeWeights:$IncludeVulkanWd -IncludeCharacterWeights:$IncludeVulkanCharacterModels -IncludeBlip:$IncludeVulkanBlip
+    if ($IncludeVulkanCustomCode) {
+        & (Join-Path $PSScriptRoot 'build_vulkan_custom_code.ps1') -Destination (Join-Path $nativeRoot 'custom-code') -JdkHome $JdkHome
+    }
+    $workerModules = if ($IncludeVulkanCustomCode) { 'ALL-MODULE-PATH' } else { 'java.base,java.desktop,java.net.http,jdk.management,jdk.unsupported' }
     Copy-Item -LiteralPath $VulkanWorkerJar -Destination (Join-Path $nativeRoot 'vulkan-worker.jar')
-    & (Join-Path $JdkHome 'bin/jlink.exe') --add-modules java.base,java.desktop,jdk.management,jdk.unsupported --strip-debug --no-header-files --no-man-pages --output (Join-Path $nativeRoot 'jre')
+    & (Join-Path $JdkHome 'bin/jlink.exe') --add-modules $workerModules --strip-debug --no-header-files --no-man-pages --output (Join-Path $nativeRoot 'jre')
     if ($LASTEXITCODE -ne 0) { throw 'Failed to link the Vulkan worker runtime.' }
 }
 if ($workerDistribution) {

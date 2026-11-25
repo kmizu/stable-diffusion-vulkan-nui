@@ -87,7 +87,7 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
 
   private def hello = Obj("protocol" -> 1, "engine_version" -> "vulkan-sd.cpp-f296cb0", "cuda" -> false,
     "dry_run" -> false, "device" -> display(device), "vulkan_devices" -> Arr.from(adapters.map(display)),
-    "features" -> Arr.from(Vector("txt2img", "aesthetic_embedding", "lora", "embeddings", "external_vae", "controlnet", "img2img", "animatediff", "animatediff_encode", "photomaker", "inpaint", "hires_fix", "img2img_hires_fix", "temporal_lab", "vae_tools", "list_devices", "system_info", "vram_estimator", "prevent_interrupt") ++ VulkanTools.features ++ sdfx.vulkan.tools.VulkanWdTagger.features))
+    "features" -> Arr.from(Vector("txt2img", "aesthetic_embedding", "aesthetic_score", "lora", "embeddings", "external_vae", "controlnet", "img2img", "animatediff", "animatediff_encode", "photomaker", "inpaint", "hires_fix", "img2img_hires_fix", "temporal_lab", "vae_tools", "list_devices", "system_info", "vram_estimator", "prevent_interrupt") ++ VulkanTools.features ++ (if backend.supportsSvd() then Vector("img2vid","novel_view") else Vector.empty) ++ Option.when(sdfx.vulkan.tools.VulkanCharaImport.available)("chara_searcher") ++ Option.when(sdfx.vulkan.tools.VulkanBlip.available && !sdfx.vulkan.tools.VulkanWdTagger.available)("caption") ++ Option.when(sdfx.vulkan.tools.VulkanCustomCode.enabled)("custom_code") ++ sdfx.vulkan.tools.VulkanWdTagger.features ++ Option.when(sdfx.vulkan.tools.VulkanFaceRestore.available)("face_restore") ++ Vector("vulkan_nsfw") ++ Option.when(sdfx.vulkan.tools.VulkanSafety.available)("nsfw_checker")))
 
   private def status =
     val data = VulkanDiagnostics.status(device, backend.memory(device.id()), loaded)
@@ -148,7 +148,7 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
                 val expectedOwner = decode(params.obj.get("owner_id").map(_.str))
                 val job = jobs.values.find(j => target.forall(_ == j.id) && expectedOwner.forall(j.owner.contains))
                 val canCancel = kind == "interrupt" && !protection.enabled
-                val tooLate = canCancel && job.exists(j => j.running && (j.publishing || (!isGeneration(j.kind) && !benchmarkCommands(j.kind) && j.kind != "system_info" && j.kind != "aesthetic_embedding" && j.kind != "clip_interrogator" && j.kind != "vae_tools" && j.kind != "temporal_lab" && !wdCommands(j.kind) && !VulkanTools.commands(j.kind))))
+                val tooLate = canCancel && job.exists(j => j.running && (j.publishing || (!isGeneration(j.kind) && !benchmarkCommands(j.kind) && j.kind != "system_info" && j.kind != "run_code" && j.kind != "novel_view" && j.kind != "img2vid" && j.kind != "chara_searcher" && j.kind != "aesthetic_embedding" && j.kind != "clip_interrogator" && j.kind != "restore_faces" && j.kind != "vae_tools" && j.kind != "temporal_lab" && !wdCommands(j.kind) && !VulkanTools.commands(j.kind))))
                 val affected = canCancel && !tooLate && job.isDefined
                 if affected then job.foreach(cancel)
                 val decision = InterruptionDecision(!protection.enabled && !tooLate, protection.enabled, protection,
@@ -157,7 +157,7 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
                 response("active_id") = job.filter(j => affected && j.running).fold[Value](ujson.Null)(j => Str(j.id))
                 result(key, response)
               }
-              case k if wdCommands(k) || VulkanTools.commands(k) || benchmarkCommands(k) || Set("txt2img", "img2img", "aesthetic_embedding", "clip_interrogator", "temporal_lab", "vae_tools", "system_info", "load_model", "unload", "set_vae")(k) =>
+              case k if wdCommands(k) || VulkanTools.commands(k) || benchmarkCommands(k) || Set("run_code", "novel_view", "img2vid", "chara_searcher", "restore_faces", "txt2img", "img2img", "aesthetic_embedding", "clip_interrogator", "temporal_lab", "vae_tools", "system_info", "load_model", "unload", "set_vae")(k) =>
                 val job = new Job(key, kind, owner, password)
                 lock.synchronized {
                   if jobs.contains(key) then invalid("Duplicate in-flight request id")
@@ -178,7 +178,7 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
     if job.publishing then return
     job.interrupts += 1
     job.cancelled = true
-    if job.running && (isGeneration(job.kind) || job.kind == "vae_tools" || job.kind == "clip_interrogator" || job.kind == "aesthetic_embedding" || job.kind == "batch_interrogate_execute" || benchmarkCommands(job.kind)) then backend.cancel()
+    if job.running && (isGeneration(job.kind) || job.kind == "run_code" || job.kind == "novel_view" || job.kind == "img2vid" || job.kind == "vae_tools" || job.kind == "clip_interrogator" || job.kind == "aesthetic_embedding" || job.kind == "batch_interrogate_execute" || benchmarkCommands(job.kind)) then backend.cancel()
 
   private def stopJobs(): Unit = lock.synchronized { jobs.values.foreach(cancel) }
 
@@ -190,18 +190,80 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
     try
       lock.synchronized { job.check(); job.running = true }
       val response = job.kind match
+        case "run_code" => sdfx.vulkan.tools.VulkanCustomCode.run(raw,device.name(),loaded.map(_.path),() => job.check(),
+          value => generate(job,generation(value)))
+        case "novel_view" =>
+          val image = sdfx.vulkan.tools.VulkanNovelView.render(raw,backend,device.id(),() => job.check(),
+            (done,total) => emit(Obj("id" -> job.id,"type" -> "event","event" -> "progress","step" -> done,"total" -> total,"pass" -> "base")))
+          val dir = Files.createDirectories(Path.of(raw("output_dir").str).toAbsolutePath)
+          val output = Files.createTempFile(dir,"novel-view-",".png")
+          job.files += output
+          sdfx.core.png.ScrambledPng.write(image,output,Seq.empty,job.imagePassword)
+          lock.synchronized { job.check(); job.publishing = true }
+          Obj("path" -> output.toString)
+        case "img2vid" =>
+          if !backend.supportsSvd() then unsupported("This Vulkan runtime does not include the SVD temporal model")
+          val frames = VulkanSvd.render(raw, backend, device.id(), () => job.check(), (step,total) =>
+            emit(Obj("id" -> job.id, "type" -> "event", "event" -> "progress", "step" -> step, "total" -> total, "pass" -> "base")))
+          val dir = Files.createDirectories(Path.of(raw("output_dir").str).toAbsolutePath)
+          val gif = Files.createTempFile(dir, "svd-", ".gif")
+          job.files += gif
+          val fps = raw.obj.get("fps").fold(6)(_.num.toInt)
+          sdfx.core.image.Gif.writeSequence(frames.iterator.map { frame => job.check(); frame }, gif,
+            math.round(1000.0 / fps).toInt, Some(0))
+          val preview = Files.createTempFile(dir, "svd-frame0-", ".png")
+          job.files += preview
+          sdfx.core.png.ScrambledPng.write(frames.head, preview, Seq.empty, job.imagePassword)
+          lock.synchronized { job.check(); job.publishing = true }
+          Obj("path" -> gif.toString, "frames" -> frames.size, "preview" -> preview.toString)
         case "temporal_lab" =>
           sdfx.vulkan.tools.VulkanTemporal.execute(raw, () => job.check(), () => lock.synchronized {
             job.check()
             job.publishing = true
           }, (step,total,phase) => emit(Obj("id" -> job.id,"type" -> "event","event" -> "progress",
             "step" -> step,"total" -> total,"pass" -> phase)),job.imagePassword)
+        case "restore_faces" =>
+          val source = sdfx.vulkan.tools.DiffusionImageInput.readRgb(Path.of(raw("image_path").str))
+          val restored = sdfx.vulkan.tools.VulkanFaceRestore(source,raw,device.name(),() => job.check())
+          val dir = Files.createDirectories(Path.of(raw("output_dir").str).toAbsolutePath)
+          val output = Files.createTempFile(dir,"faces-",".png")
+          job.files += output
+          sdfx.core.png.ScrambledPng.write(restored,output,Seq.empty,job.imagePassword)
+          lock.synchronized { job.check(); job.publishing = true }
+          Obj("path" -> output.toString)
+        case "image_tool" if raw.obj.get("tool").contains(ujson.Str("nsfw_checker")) =>
+          val dir=Path.of(raw.obj.get("output_dir").fold(".")(_.str)).toAbsolutePath
+          val output=new sdfx.vulkan.tools.VulkanSafety(backend,device.id(),device.name(),()=>job.check()).tool(raw,dir,job.imagePassword)
+          lock.synchronized { job.check(); job.publishing=true }
+          output
+        case "image_tool" if raw.obj.get("tool").contains(ujson.Str("aesthetic_score")) =>
+          val image = sdfx.vulkan.tools.DiffusionImageInput.readRgb(Path.of(raw("image_path").str))
+          val result = scoreImage(image,raw,job)
+          val dir = Files.createDirectories(Path.of(raw.obj.get("output_dir").fold(".")(_.str)).toAbsolutePath)
+          val output = Files.createTempFile(dir,"aesthetic-",".png")
+          job.files += output
+          sdfx.core.png.ScrambledPng.write(image,output,result.chunks,job.imagePassword)
+          lock.synchronized { job.check(); job.publishing = true }
+          Obj("path"->output.toString,"outputs"->Obj(),"info"->Obj.from(result.fields.map((k,v)=>k->ujson.Str(v))))
+        case "caption" if raw.obj.get("method").fold("blip")(_.str)=="blip" =>
+          val catalog=sdfx.vulkan.tools.VulkanBlip
+          val name=sys.env.get("SDFX_BLIP_MODEL").map {
+            case "Salesforce/blip-image-captioning-base" => "blip-base"
+            case "Salesforce/blip-image-captioning-large" => "blip-large"
+            case other => other
+          }.getOrElse(catalog.known.headOption.getOrElse("blip-base"))
+          Obj("caption"->catalog.caption(Path.of(raw("image_path").str),device.name(),()=>job.check(),60,name))
         case "caption" => sdfx.vulkan.tools.VulkanWdTagger.caption(raw,device.name(),() => job.check())
         case k @ ("batch_interrogate_prepare" | "batch_interrogate_execute") =>
           val owner = job.owner.getOrElse(throw IllegalArgumentException("WD batch owner required"))
           def publish():Unit = lock.synchronized { job.check(); job.publishing = true }
           if k == "batch_interrogate_prepare" then wdBatch.prepare(raw,owner,currentModel,()=>job.check(),()=>publish())
           else wdBatch.execute(raw,owner,currentModel,device.name(),job.imagePassword,()=>job.check(),()=>publish(), r=>generate(job,generation(r)))
+        case "chara_searcher" if raw.obj.get("action").contains(ujson.Str("import")) =>
+          sdfx.vulkan.tools.VulkanCharaImport.execute(raw,backend,device.id(),device.name(),()=>job.check(),()=>lock.synchronized {
+            job.check();job.publishing=true
+          },(step,total)=>emit(Obj("id"->job.id,"type"->"event","event"->"progress","pass"->"chara_searcher","step"->step,"total"->total)))
+        case "chara_searcher" => sdfx.vulkan.tools.VulkanBaseClip.search(raw,backend,device.id(),()=>job.check())
         case "aesthetic_embedding" =>
           sdfx.vulkan.tools.VulkanAesthetic.execute(raw,backend,device.id(),() => job.check(),() => lock.synchronized {
             job.check()
@@ -292,7 +354,10 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
         if isNoisy == noisy then job.frames.foreach(_.frame(step,pass,passSteps,frame))
         if !job.cancelled && preview && !isNoisy && step % req.previewEvery == 0 then
           val bytes = new java.io.ByteArrayOutputStream()
-          if ImageIO.write(frame, "jpeg", bytes) then
+          val visible = req.params.hooks.get("nsfw_checker").filterNot(_.obj.get("enabled").contains(ujson.Bool(false))).fold(frame){ cfg =>
+            new sdfx.vulkan.tools.VulkanSafety(backend,device.id(),device.name(),()=>job.check()).filter(frame,cfg,true).image
+          }
+          if ImageIO.write(visible, "jpeg", bytes) then
             emit(Obj("id" -> job.id, "type" -> "event", "event" -> "preview", "step" -> step,
               "jpeg_b64" -> java.util.Base64.getEncoder.encodeToString(bytes.toByteArray))))) { _ =>
       generate(job, gen)
@@ -369,9 +434,30 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
     }
     conditioning
 
+  private def scoreImage(image:java.awt.image.BufferedImage,raw:Value,job:Job):sdfx.vulkan.tools.VulkanAestheticScore.Result =
+    def score()=sdfx.vulkan.tools.VulkanAestheticScore(image,raw,backend,device.id(),()=>job.check())
+    try score()
+    catch case failure:VulkanInference.NativeFailure if failure.status==6 && loaded.nonEmpty && activeOptions.nonEmpty =>
+      val model=currentModel
+      val options=activeOptions.get
+      backend.unload()
+      activeOptions=None
+      try score()
+      finally
+        backend.load(Path.of(model.path),device.id(),options)
+        activeOptions=Some(options)
+
   private def generate(job: Job, gen: Generation): Value =
     val model = currentModel
-    val req = gen.request
+    val requested = gen.request.params
+    val sag = requested.hooks.get("sag").filterNot(_.obj.get("enabled").contains(ujson.Bool(false)))
+    val pag = requested.hooks.get("pag").exists(v => !v.obj.get("enabled").contains(ujson.Bool(false)))
+    val skipSag = sag.nonEmpty && (model.kind=="sdxl" || requested.isImg2Img || requested.controlnet.exists(_.enabled) || pag)
+    val sagWarnings =
+      if skipSag then Seq("SAG applies to SD1.x txt2img without ControlNet or PAG; ignored")
+      else if sag.exists(_.obj.get("blur_sigma").exists(_.num != 2)) then Seq("The SAG reference uses a fixed Gaussian blur; blur sigma ignored")
+      else Nil
+    val req = if skipSag then gen.request.copy(params=requested.copy(hooks=requested.hooks-"sag")) else gen.request
     val p = req.params
     if isGeneration(job.kind) && ((job.kind == "img2img") != p.isImg2Img) then invalid("img2img requests require an init image and the img2img operation")
     val hires = VulkanImageInputs.hires(req)
@@ -406,13 +492,26 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
             "level" -> (if event == "timeout" then "warn" else "info"),
             "message" -> s"GPU temperature $event: $reading C (provider=${c.provider}, device=${c.device})")))
     }
+    val auxiliary = scala.collection.mutable.ArrayBuffer.empty[GeneratedImage]
+    var outputIndex = 0
     val imgs = order.zipWithIndex.flatMap { case ((i,pass),index) =>
       job.check()
       val seed = Math.addExact(firstSeed, i.toLong)
       job.frames.foreach(_.begin(index,seed))
       val inputs = p.img2img.filter(_ => graph.isEmpty).map(VulkanImageInputs.prepare(_, p.width, p.height, seed, difference, () => job.cancelled))
+      def maskConditioning(strength: Double): Double =
+        val mode = p.hooks.get("conditioning_highres_fix").flatMap(_.obj.get("mode")).fold("disabled")(_.str)
+        mode match
+          case "disabled" | "empty" => 1.0
+          case "lowest" => 1 - strength / 4
+          case "low" => 1 - strength / 2
+          case "medium" => .5
+          case "high" => strength / 2
+          case "highest" => strength / 4
+          case "full" => 0.0
+          case other => invalid(s"Unknown mask conditioning mode $other")
       val imageOptions = new VulkanInference.ImageOptions(inputs.map(_.init).orNull,
-        inputs.flatMap(_.mask).orNull, p.img2img.fold(0.75)(_.denoisingStrength), hires.filterNot(_ => separateHires).orNull)
+        inputs.flatMap(_.mask).orNull, p.img2img.fold(0.75)(_.denoisingStrength), hires.filterNot(_ => separateHires).orNull, maskConditioning(p.img2img.fold(0.75)(_.denoisingStrength)))
       def progress(pass: Option[String]): VulkanInference.Progress = (stage, step, total) =>
         if step > 0 && total > 0 && job.sensorFailure.isEmpty && !job.cancelled then
           try temperature.foreach(_.step())
@@ -456,7 +555,7 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
             val condition = prepareConditioning(req.copy(params = pass),job,resources)
             backend.generate(pass.prompt,pass.negativePrompt,w,ht,scheduleSteps,pass.cfgScale,seed,method,
               schedulers.getOrElse(schedule,unsupported(s"hires scheduler $schedule")),p.clipSkip,
-              new VulkanInference.ImageOptions(source,mask,strength,null),condition,progress(Some("hires")))
+              new VulkanInference.ImageOptions(source,mask,strength,null,maskConditioning(strength)),condition,progress(Some("hires")))
           val first = inputs.fold(highres)(_.finish(highres))
           val image = refinement.fold(first) { h =>
             job.check()
@@ -484,12 +583,15 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
           Seq(image)
       rendered.map { initial =>
         job.check()
+        val scaled = p.hooks.get("sonar").filterNot(_.obj.get("enabled").contains(ujson.Bool(false))).fold(initial){ h =>
+          new VulkanSonar(h,p,seed).upscale(initial,req.upscalerPaths,modelUpscale)
+        }
         val facePasses = Seq("adetailer","batch_face_swap").flatMap { key =>
           p.hooks.get(key).filterNot(_.obj.get("enabled").contains(ujson.Bool(false))).map { cfg =>
             if key == "adetailer" then cfg else sdfx.vulkan.tools.VulkanADetailer.facePass(cfg,model.path,model.hash)
           }
         }
-        val image = facePasses.foldLeft(initial) { (canvas,config) =>
+        val detailed = facePasses.foldLeft(scaled) { (canvas,config) =>
           val models = Path.of(model.path).toAbsolutePath.getParent
           sdfx.vulkan.tools.VulkanADetailer(backend,device.id(),Option(models.getParent).getOrElse(models),canvas,config,p,activePrompt,seed,
             () => job.cancelled, (unit,count) => emit(Obj("id" -> job.id,"type" -> "event","event" -> "log",
@@ -499,21 +601,39 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
                 schedulers(gen.scheduler),p.clipSkip,opts,activeConditioning,progress(Some("adetailer"))))
         }
 
+        val restored = p.hooks.get("face_restore").filterNot(_.obj.get("enabled").contains(ujson.Bool(false))).fold(detailed) { options =>
+          sdfx.vulkan.tools.VulkanFaceRestore(detailed,options,device.name(),() => job.check())
+        }
+        val image = p.hooks.get("nsfw_checker").filterNot(_.obj.get("enabled").contains(ujson.Bool(false))).fold(restored){ cfg =>
+          val censor=new sdfx.vulkan.tools.VulkanSafety(backend,device.id(),device.name(),()=>job.check())
+          val screened=censor.filter(restored,cfg,false)
+          for (item,suffix)<-Seq(screened.beforeCensor->"-before-censor",screened.mask->"-censor-mask"); im<-item do
+            val f=Files.createTempFile(dir,"vulkan-nsfw-",".png")
+            job.files+=f
+            sdfx.core.png.ScrambledPng.write(im,f,Seq.empty,job.imagePassword)
+            auxiliary+=GeneratedImage(f.toString,seed,width=im.getWidth,height=im.getHeight,outputSuffix=Some(suffix),auxiliaryOf=Some(outputIndex))
+          screened.image
+        }
+        outputIndex+=1
+        val score = p.hooks.get("aesthetic_score").filterNot(_.obj.get("enabled").contains(ujson.Bool(false))).map { config =>
+          val result=scoreImage(image,config,job)
+          sdfx.vulkan.tools.VulkanAestheticScore.metadata(result,config,p,activePrompt,seed,model.hash)
+        }
         job.frames.foreach(_.finalImage(image))
         val file = Files.createTempFile(dir, "vulkan-", ".png")
         job.files += file
-        sdfx.core.png.ScrambledPng.write(image, file, Seq.empty, job.imagePassword)
+        sdfx.core.png.ScrambledPng.write(image, file, score.toSeq.flatMap(_.chunks), job.imagePassword)
         val hardware = Option.when(req.hardwareInfo.enabled)(HardwareInfo.Record(display(device),
           f"${(System.nanoTime() - start) / 1e9}%.2fs", Option(req.hardwareInfo.remark).filter(_.nonEmpty)))
         GeneratedImage(file.toString, seed, subseed = pass.fold(-1L)(_.baseSubseed), width = image.getWidth, height = image.getHeight, hardwareInfo = hardware,
           effectivePrompt = planned.map(_.replay), modelKeywordSourcePrompt = planned.map(_.source),
           hiresSeed = pass.map(_.seed), hiresSubseed = pass.map(_.subseed), hiresRepeat = pass.map(_.repeat),
           hiresSubseedStrength = pass.map(_.strength), hiresSeedResizeFromW = pass.map(_.width), hiresSeedResizeFromH = pass.map(_.height),
-          infotextFields = Seq("Vulkan device" -> display(device)))
+          infotextFields = Seq("Vulkan device" -> display(device)) ++ score.toSeq.flatMap(_.fields), pngChunks = score.toSeq.flatMap(_.chunks))
       }
     }
     Json.toJs(GenerationResult(imgs, (System.nanoTime() - start) / 1e9, Some(model.name), Some(model.hash),
-      intermediateArtifacts = job.frames.toSeq.flatMap(_.finish()),
+      auxiliaryImages = auxiliary.toSeq, intermediateArtifacts = job.frames.toSeq.flatMap(_.finish()),
       systemInfo = Option.when(req.systemInfoFields.nonEmpty)(VulkanDiagnostics.metadata(status, req.systemInfoFields)),
-      scheduler = Some(gen.scheduler), warnings = gen.warnings ++ resources.toSeq.flatMap(_.warnings),
+      scheduler = Some(gen.scheduler), warnings = gen.warnings ++ sagWarnings ++ resources.toSeq.flatMap(_.warnings),
       resourceHashes = resources.map(r => r.hashes ++ Map("model" -> model.hash) ++ model.vaeHash.map("vae" -> _)).getOrElse(Map.empty)))

@@ -51,7 +51,11 @@ public final class VulkanInference implements AutoCloseable {
         }
     }
     public record Hires(String upscaler, String modelPath, int width, int height, int steps, double strength) {}
-    public record ImageOptions(BufferedImage init, BufferedImage mask, double strength, Hires hires) {}
+    public record ImageOptions(BufferedImage init, BufferedImage mask, double strength, Hires hires, double maskConditioningWeight) {
+        public ImageOptions(BufferedImage init, BufferedImage mask, double strength, Hires hires) {
+            this(init, mask, strength, hires, 1.0);
+        }
+    }
     public record Latent(int width, int height, float[] values) {
         public Latent {
             if (width <= 0 || height <= 0 || (long) width * height * 4 != values.length || values.length > 16777216)
@@ -162,6 +166,7 @@ public final class VulkanInference implements AutoCloseable {
             bind("sd_dgl_ctx_free", null, ADDRESS);
             bind("sd_dgl_run", JAVA_INT, ADDRESS, ADDRESS, ADDRESS, JAVA_LONG, ADDRESS);
             bind("sd_dgl_ctx_cancel", JAVA_INT, ADDRESS);
+            bind("sd_dgl_ctx_set_progress_callback", JAVA_INT, ADDRESS, ADDRESS, ADDRESS);
             bind("sd_dgl_result_free", null, ADDRESS);
             bind("sd_dgl_result_tensor", ADDRESS, ADDRESS, ADDRESS);
             bind("sd_dgl_error", ADDRESS);
@@ -425,7 +430,11 @@ public final class VulkanInference implements AutoCloseable {
                         imageTensor(a, opt, "init_image", image.init, 3);
                         check(call("sd_opt_set_float", opt, a.allocateFrom("strength"), image.strength));
                     }
-                    if (image.mask != null) imageTensor(a, opt, "mask_image", image.mask, 1);
+                    if (image.mask != null) {
+                        imageTensor(a, opt, "mask_image", image.mask, 1);
+                        if (image.maskConditioningWeight != 1.0)
+                            check(call("sd_opt_set_float", opt, a.allocateFrom("mask_conditioning_weight"), image.maskConditioningWeight));
+                    }
                     if (image.hires != null) {
                         Hires hires = image.hires;
                         check(call("sd_opt_set_bool", opt, a.allocateFrom("hires.enabled"), true));
@@ -523,6 +532,7 @@ public final class VulkanInference implements AutoCloseable {
 
     private <T> T dglProgram(Arena arena, String source, Map<String, MemorySegment> inputs,
             String resultName, Function<MemorySegment,T> copy) {
+        if (!standaloneDgl.equals(NULL)) return dglRun(standaloneDgl, arena, source, inputs, resultName, copy);
         if (ctx.equals(NULL)) throw new IllegalStateException("Load a checkpoint before using DGL");
         var dgl = ptr("sd_ctx_get_dgl_ctx", ctx);
         return dglRun(dgl, arena, source, inputs, resultName, copy);
@@ -538,11 +548,18 @@ public final class VulkanInference implements AutoCloseable {
             offset += 16;
         }
         var output = arena.allocate(ADDRESS);
+        if (dglProgress != null) {
+            var callback = LINKER.upcallStub(EVENT_HANDLER.bindTo(dglProgress), PROGRESS, arena);
+            check(call("sd_dgl_ctx_set_progress_callback", dgl, callback, NULL));
+        }
         runningDgl = true;
         int status;
         try {
             status = (int) call("sd_dgl_run", dgl, arena.allocateFrom(source), args, (long) inputs.size(), output);
-        } finally { runningDgl = false; }
+        } finally {
+            runningDgl = false;
+            if (dglProgress != null) call("sd_dgl_ctx_set_progress_callback", dgl, NULL, NULL);
+        }
         if (status == 10) throw new CancellationException("DGL operation interrupted");
         if (status != 0) throw new NativeFailure(status, cString(ptr("sd_dgl_error")));
         var result = output.get(ADDRESS, 0);
@@ -582,7 +599,7 @@ public final class VulkanInference implements AutoCloseable {
     }
 
     public synchronized float[] detectBoxes(String source, BufferedImage image) {
-        return dglWithImages(source, Map.of("input", image), "boxes", null, tensor -> {
+        return dglWithImages(source, Map.of("input", image), "boxes", Map.of(), tensor -> {
             long size = (long)call("sd_tensor_byte_size",tensor);
             if ((int)call("sd_tensor_type",tensor) != 4 || size < 0 || size > 65536 || size % 16 != 0)
                 throw new IllegalStateException("Expected floating YOLO boxes of shape [4,N]");
@@ -596,7 +613,7 @@ public final class VulkanInference implements AutoCloseable {
 
     public synchronized float[] clipVision(String program, BufferedImage image, boolean keepLoaded, int dimensions) {
         ensureOpen();
-        if (dimensions != 768 && dimensions != 1024 && dimensions != 1280)
+        if (dimensions != 512 && dimensions != 768 && dimensions != 1024 && dimensions != 1280)
             throw new IllegalArgumentException("Unsupported CLIP projection size");
         long byteSize = 4L * dimensions;
         synchronized (lifetime) {
@@ -625,6 +642,35 @@ public final class VulkanInference implements AutoCloseable {
             call("sd_dgl_ctx_free",visionCtx);
             visionCtx = NULL;
             return true;
+        }
+    }
+
+    public boolean supportsUnetHooks() {
+        return symbols.find("sd_nui_unet_hooks_supported").isPresent();
+    }
+
+    public boolean supportsSvd() {
+        return symbols.find("sd_nui_svd_supported").isPresent();
+    }
+
+    private Progress dglProgress;
+    private MemorySegment standaloneDgl = NULL;
+
+    public synchronized List<BufferedImage> dglFrames(String program, Map<String,BufferedImage> inputs, String resultName, Progress progress) {
+        ensureOpen();
+        synchronized (lifetime) {
+            standaloneDgl = ptr("sd_dgl_ctx_create");
+            if (standaloneDgl.equals(NULL)) throw new IllegalStateException("Cannot create SVD context");
+        }
+        dglProgress = progress;
+        try {
+            return dglFrames(program, inputs, resultName);
+        } finally {
+            dglProgress = null;
+            synchronized (lifetime) {
+                call("sd_dgl_ctx_free", standaloneDgl);
+                standaloneDgl = NULL;
+            }
         }
     }
 
@@ -711,6 +757,7 @@ public final class VulkanInference implements AutoCloseable {
 
     public void cancel() {
         synchronized (lifetime) {
+            if (!standaloneDgl.equals(NULL)) { call("sd_dgl_ctx_cancel", standaloneDgl); return; }
             if (visionRunning) { call("sd_dgl_ctx_cancel", visionCtx); return; }
             if (!ctx.equals(NULL)) {
                 if (runningDgl) call("sd_dgl_ctx_cancel", ptr("sd_ctx_get_dgl_ctx", ctx));

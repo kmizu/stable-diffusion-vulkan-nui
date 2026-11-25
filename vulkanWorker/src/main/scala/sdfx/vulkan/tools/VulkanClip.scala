@@ -8,6 +8,7 @@ import java.security.MessageDigest
 import java.time.Duration
 import scala.collection.mutable
 import scala.io.Source
+import scala.jdk.CollectionConverters.*
 import scala.util.Using
 import sdfx.vulkan.{VulkanInference,VulkanProtocol}
 import ujson.{Arr,Obj,Str,Value}
@@ -70,7 +71,7 @@ private[vulkan] object VulkanClip:
       val values = Using.resource(Source.fromResource(s"clip-interrogator/$kind.txt")(scala.io.Codec.UTF8))(_.getLines().map(_.strip()).toVector)
       if kind == "artists" then values.map("by " + _) ++ values.map("inspired by " + _) else values
 
-  private def rank(path: Path, names: Vector[String], image: Array[Float], check: () => Unit): Vector[(String,Double)] =
+  private def rank(path: Path, names: Vector[String], image: Array[Float], check: () => Unit, count:Int=5, reverse:Boolean=false): Vector[(String,Double)] =
     Using.resource(CheckpointIO.open(path)) { file =>
       require(new String(file.raw(file.tensors("hash")),UTF_8) == digest(names.mkString(",").getBytes(UTF_8)),"CLIP label ordering does not match the cache")
       val tensor = file.tensors("embeds")
@@ -87,24 +88,47 @@ private[vulkan] object VulkanClip:
           dot += values(i)*image(i)
           norm += values(i).toDouble*values(i)
           i += 1
-        val score = dot / math.sqrt(norm)
-        if score.isFinite && (best.size < 5 || score > best.head._1) then
+        val score = (if reverse then -dot else dot) / math.sqrt(norm)
+        if score.isFinite && (best.size < count || score > best.head._1) then
           best.enqueue((score,row))
-          if best.size > 5 then best.dequeue()
+          if best.size > count then best.dequeue()
       best.dequeueAll.reverseIterator.map((score,row) => names(row) -> score).toVector
     }
+
+  private lazy val tokenizer=ClipFastTokenizer.loadBundled()
+  def modes:Vector[String]=
+    val base=if VulkanBlip.available then Vector("classic","fast","caption","label") else Vector("label")
+    base++Option.when(VulkanClipText.available && VulkanBlip.available)("best")++Option.when(VulkanClipText.available)("negative")
+  private def truncate(prompt:String):String =
+    val parts=prompt.split(", ",-1)
+    var result=parts.head
+    var i=1
+    while i<parts.length && tokenizer.encode(result+parts(i)).length<77 do
+      result+=", "+parts(i);i+=1
+    result
 
   def execute(raw: Value, engine: VulkanInference, device: String, check: () => Unit, progress: (String,Int,Int) => Unit, publish: () => Unit = () => ()): Value =
     val op = raw.obj.get("operation").map(_.str).getOrElse("prompt")
     if op == "models" then return Obj("clip_models" -> Arr(model),"default_clip_model" -> model,
-      "caption_models" -> Arr(),"default_caption_model" -> "none","modes" -> Arr("label"),
+      "caption_models" -> Arr.from(VulkanBlip.known.map(ujson.Str(_))),"default_caption_model" -> VulkanBlip.known.headOption.getOrElse("none"),"modes" -> Arr.from(modes.map(ujson.Str(_))),
       "batch_output_modes" -> Arr.from(VulkanClipBatch.formats.map(ujson.Str(_))),"openclip_status" -> Obj("state" -> "native_vulkan"))
     if op == "batch" then return VulkanClipBatch.execute(raw,engine,device,check,publish,progress)
     if op == "unload" then return Obj("unloaded" -> engine.unloadClipVision())
     if op != "analyze" && op != "prompt" then VulkanProtocol.unsupported(s"CLIP operation $op")
     if raw.obj.get("clip_model").exists(_.str != model) then VulkanProtocol.unsupported("this CLIP vision architecture")
-    if op == "prompt" && raw.obj.get("mode").exists(_.str != "label") then VulkanProtocol.unsupported("this CLIP prompt mode")
-    if op == "prompt" && raw.obj.get("caption_model").exists(_.str != "none") then VulkanProtocol.unsupported("caption generation")
+    val mode=raw.obj.get("mode").fold(modes.head)(_.str)
+    if op=="prompt" && !modes.contains(mode) then VulkanProtocol.unsupported(s"CLIP mode $mode")
+    val useCaption=op=="prompt" && mode!="label" && mode!="negative"
+    val captionModel=raw.obj.get("caption_model").fold(if useCaption then VulkanBlip.known.headOption.getOrElse("none") else "none")(_.str)
+    if useCaption && !VulkanBlip.known.contains(captionModel) then VulkanProtocol.unsupported(s"caption model $captionModel")
+    val path=Path.of(raw("image_path").str)
+    val caption=if useCaption then
+      val adapter=engine.devices().asScala.find(_.id()==device).getOrElse(throw IllegalArgumentException("Unknown Vulkan adapter"))
+      VulkanBlip.caption(path,adapter.name(),check,raw.obj.get("caption_max_length").fold(32)(_.num.toInt),captionModel)
+    else ""
+    if op=="prompt" && mode=="caption" then return Obj("prompt"->caption,"clip_model"->model,"caption_model"->captionModel,"mode"->mode)
+    val count=if op=="prompt" && Set("fast","classic","best","negative")(mode) then raw.obj.get("max_flavors").fold(if mode=="classic" then 3 else 32)(_.num.toInt) else 5
+    require(count>=1 && count<=64,"max_flavors must be between 1 and 64")
     val image = DiffusionImageInput.readRgb(Path.of(raw("image_path").str))
     val cache = Files.createDirectories(Path.of(sys.env.get("SDFX_VULKAN_CLIP_DIR")
       .orElse(raw.obj.get("cache_dir").map(_.str)).getOrElse("config/clip-interrogator")).toAbsolutePath.normalize())
@@ -119,13 +143,62 @@ private[vulkan] object VulkanClip:
     val norm = math.sqrt(embedding.iterator.map(x => x.toDouble*x).sum)
     require(norm > 0 && norm.isFinite,"Invalid CLIP vision projection")
     val unit = embedding.map(x => (x/norm).toFloat)
-    val results = categories.zipWithIndex.map { case ((key,kind,sha),i) =>
+    val chained=op=="prompt" && Set("best","negative")(mode)
+    val intermediate=if chained && engine.memory(device).total()<=12L*1024*1024*1024 then 1024 else 2048
+    val tables=if op=="prompt" && mode=="negative" then categories.filter(_._1=="flavor") else categories
+    val results = tables.zipWithIndex.map { case ((key,kind,sha),i) =>
       progress("clip_interrogator_rank",i,categories.size)
       val name = tablePrefix + kind + ".safetensors"
-      key -> rank(asset(cache,name,tableRepo+name,sha,check,progress),labels(kind),unit,check)
+      key -> rank(asset(cache,name,tableRepo+name,sha,check,progress),labels(kind),unit,check,if chained then intermediate else count,op=="prompt" && mode=="negative")
     }
     progress("clip_interrogator_rank",categories.size,categories.size)
     if op == "analyze" then Obj.from(results.map((k,rows) => k -> Obj.from(rows.map((label,score) => label -> ujson.Num(score)))))
+    else if Set("classic","fast","best","negative")(mode) then
+      val top=results.toMap
+      val all=results.flatMap(_._2).sortBy(-_._2)
+      def fast=truncate(caption+", "+all.take(count).map(_._1).mkString(", "))
+      def classic=
+        val medium=top("medium").head._1
+        val prefix=if caption.startsWith(medium) then caption else caption+", "+medium
+        truncate(prefix+" "+top("artist").head._1+", "+top("trending").head._1+", "+top("movement").head._1+", "+top("flavor").take(count).map(_._1).mkString(", "))
+      val prompt=mode match
+        case "fast"=>fast
+        case "classic"=>classic
+        case _=>
+          val negative=mode=="negative"
+          val phrases=if negative then top("flavor").map(_._1)++labels("negative") else all.take(intermediate).map(_._1)
+          val adapter=engine.devices().asScala.find(_.id()==device).getOrElse(throw IllegalArgumentException("Unknown Vulkan adapter"))
+          VulkanClipText.withEncoder(cache,adapter.name(),check,progress) { encoder =>
+            val minimum=raw.obj.get("min_flavors").fold(8)(_.num.toInt)
+            require(minimum>=0 && minimum<=64,"min_flavors must be between 0 and 64")
+            def sim(text:String)=encoder.score(text,unit)
+            val candidates=mutable.TreeSet.from(phrases)
+            def pick(prefix:String,reverse:Boolean):(String,Double) =
+              var selected="";var score=Double.NegativeInfinity
+              for term<-candidates do
+                val text=if prefix.isEmpty then term else prefix+", "+term
+                val value=sim(text)*(if reverse then -1 else 1)
+                if value>score then {selected=term;score=value}
+              selected->score
+            val (initial,startScore)=if negative then
+              val (chosen,negated)=pick("",true)
+              candidates-=chosen
+              chosen -> -negated
+            else caption->sim(caption)
+            var best=initial;var bestScore=startScore
+            var current=initial;var currentScore=startScore
+            var i=0;var more=true
+            while i<count && more && candidates.nonEmpty do
+              check();progress("clip_interrogator_chain",i,count)
+              val (term,score)=pick(current,negative)
+              val next=current+", "+term
+              if score>bestScore then {best=next;bestScore=score}
+              if score>currentScore || i<minimum then {current=next;currentScore=score} else more=false
+              if tokenizer.encode(current).length>=77 then more=false
+              candidates-=term;i+=1
+            if negative then best else Vector(caption,classic,fast,best).maxBy(sim)
+          }
+      Obj("prompt"->prompt,"clip_model"->model,"caption_model"->(if useCaption then captionModel else "none"),"mode"->mode)
     else
       val (label,score) = results.flatMap(_._2).maxBy(_._2)
       Obj("prompt" -> label,"similarity" -> score,"clip_model" -> model,"caption_model" -> "none","mode" -> "label")

@@ -14,8 +14,8 @@ private[tools] object VulkanClipBatch:
   def execute(raw:Value,engine:VulkanInference,device:String,check:()=>Unit,publish:()=>Unit,progress:(String,Int,Int)=>Unit):Value =
     val dir=Path.of(raw("folder").str)
     require(Files.isDirectory(dir),"CLIP batch folder does not exist")
-    val mode=raw.obj.get("mode").fold("label")(_.str)
-    require(mode=="label","Vulkan CLIP batch supports label mode")
+    val mode=raw.obj.get("mode").fold(VulkanClip.modes.head)(_.str)
+    require(VulkanClip.modes.contains(mode),s"Unsupported Vulkan CLIP batch mode $mode")
     val format=raw.obj.get("output_mode").fold(formats.head)(_.str)
     require(formats.contains(format),"Unknown CLIP batch output mode")
     val overwrite=raw.obj.get("overwrite").exists(_.bool)

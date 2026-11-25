@@ -1,0 +1,451 @@
+diff --git a/src/model/common/block.hpp b/src/model/common/block.hpp
+--- a/src/model/common/block.hpp
++++ b/src/model/common/block.hpp
+@@ -1,6 +1,7 @@
+ #ifndef __SD_MODEL_COMMON_BLOCK_HPP__
+ #define __SD_MODEL_COMMON_BLOCK_HPP__
+ 
++#include "model/common/nui_unet_hooks.hpp"
+ #include "core/ggml_extend.h"
+ #include "core/ggml_runner.h"
+ #include "core/util.h"
+@@ -363,6 +364,36 @@
+         // to_out_1 is nn.Dropout(), skip for inference
+     }
+ 
++    ggml_tensor* self_attention(GGMLRunnerContext* ctx, ggml_tensor* x) {
++        const auto& pass = sd::nui::active;
++        if (pass.options && pass.options->sag_capture && pass.region == 256) {
++            // Per-key incoming self-attention mass, averaged over heads.
++            auto projection = [&](const char* name) {
++                auto t = std::dynamic_pointer_cast<Linear>(blocks[name])->forward(ctx,x);
++                t = ggml_reshape_4d(ctx->ggml_ctx,t,d_head,n_head,x->ne[1],x->ne[2]);
++                return ggml_cont(ctx->ggml_ctx,ggml_permute(ctx->ggml_ctx,t,0,2,1,3));
++            };
++            auto scores = ggml_mul_mat(ctx->ggml_ctx,projection("to_k"),projection("to_q"));
++            auto probabilities = ggml_soft_max(ctx->ggml_ctx,ggml_scale(ctx->ggml_ctx,scores,1.f/std::sqrt(float(d_head))));
++            const auto tokens = x->ne[1];
++            auto folded = ggml_reshape_3d(ctx->ggml_ctx,probabilities,tokens,tokens*n_head,x->ne[2]);
++            folded = ggml_cont(ctx->ggml_ctx,ggml_permute(ctx->ggml_ctx,folded,1,0,2,3));
++            auto mass = ggml_sum_rows(ctx->ggml_ctx,folded);
++            auto mask = ggml_step(ctx->ggml_ctx,ggml_scale_bias(ctx->ggml_ctx,mass,1.f/n_head,-1.f));
++            sd::nui::active.attention_mask = ggml_reshape_4d(ctx->ggml_ctx,mask,pass.spatial_w,pass.spatial_h,1,x->ne[2]);
++            return x;
++        }
++        if (pass.options && (pass.options->pag_regions & pass.region)) {
++            auto value = std::dynamic_pointer_cast<Linear>(blocks["to_v"])->forward(ctx,x);
++            return std::dynamic_pointer_cast<Linear>(blocks["to_out.0"])->forward(ctx,value);
++        }
++        const auto [tw,th] = sd::nui::tile_shape();
++        if (!tw || x->ne[1] != pass.spatial_w * pass.spatial_h) return forward(ctx,x,x);
++        x = sd::nui::split_tiles(ctx->ggml_ctx,x,tw,th,false);
++        x = forward(ctx,x,x);
++        return sd::nui::split_tiles(ctx->ggml_ctx,x,tw,th,true);
++    }
++
+     ggml_tensor* forward(GGMLRunnerContext* ctx,
+                          ggml_tensor* x,
+                          ggml_tensor* context) {
+@@ -466,7 +497,7 @@
+ 
+         auto r = x;
+         x      = norm1->forward(ctx, x);
+-        x      = attn1->forward(ctx, x, x);  // self-attention
++        x      = attn1->self_attention(ctx, x);  // self-attention
+         x      = ggml_add(ctx->ggml_ctx, x, r);
+         r      = x;
+         x      = norm2->forward(ctx, x);
+diff --git a/src/model/diffusion/unet.hpp b/src/model/diffusion/unet.hpp
+--- a/src/model/diffusion/unet.hpp
++++ b/src/model/diffusion/unet.hpp
+@@ -514,7 +514,11 @@
+                                          GGMLRunnerContext* ctx,
+                                          ggml_tensor* x,
+                                          ggml_tensor* context,
+-                                         int timesteps) {
++                                         int timesteps, int region) {
++        sd::nui::active.layer_index = uint32_t(std::hash<std::string>{}(name));
++        sd::nui::active.region = region;
++        sd::nui::active.spatial_w = int(x->ne[0]);
++        sd::nui::active.spatial_h = int(x->ne[1]);
+         if (config.version == VERSION_SVD) {
+             auto block = std::dynamic_pointer_cast<SpatialVideoTransformer>(blocks[name]);
+ 
+@@ -542,6 +546,7 @@
+         // c_concat: [N, in_channels, h, w] or [1, in_channels, h, w]
+         // y: [N, adm_in_channels] or [1, adm_in_channels]
+         // return: [N, out_channels, h, w]
++        sd::nui::active.attention_mask = nullptr;
+         const SDVersion version           = config.version;
+         const int model_channels          = config.model_channels;
+         const int num_res_blocks          = config.num_res_blocks;
+@@ -653,7 +658,7 @@
+                 h                = resblock_forward(name, ctx, h, emb, num_video_frames);  // [N, mult*model_channels, h, w]
+                 if (std::find(attention_resolutions.begin(), attention_resolutions.end(), ds) != attention_resolutions.end()) {
+                     std::string name = "input_blocks." + std::to_string(input_block_idx) + ".1";
+-                    h                = attention_layer_forward(name, ctx, h, context, num_video_frames);  // [N, mult*model_channels, h, w]
++                    h                = attention_layer_forward(name, ctx, h, context, num_video_frames, 1 << i);  // [N, mult*model_channels, h, w]
+                 }
+                 h = apply_motion_input(input_block_idx, h);
+                 if (block_processor && num_video_frames > 1)
+@@ -682,7 +687,12 @@
+         if (!tiny_unet) {
+             h = resblock_forward("middle_block.0", ctx, h, emb, num_video_frames);  // [N, 4*model_channels, h/8, w/8]
+             if (version != VERSION_SDXL_SSD1B && version != VERSION_SDXL_VEGA) {
+-                h = attention_layer_forward("middle_block.1", ctx, h, context, num_video_frames);  // [N, 4*model_channels, h/8, w/8]
++                h = attention_layer_forward("middle_block.1", ctx, h, context, num_video_frames, 256);  // [N, 4*model_channels, h/8, w/8]
++                if (auto mask = sd::nui::active.attention_mask) {
++                    const auto& pass = sd::nui::active;
++                    auto expanded = ggml_interpolate(ctx->ggml_ctx,mask,pass.width,pass.height,1,mask->ne[3],GGML_SCALE_MODE_NEAREST);
++                    return ggml_repeat_4d(ctx->ggml_ctx,expanded,pass.width,pass.height,4,mask->ne[3]);
++                }
+                 h = resblock_forward("middle_block.2", ctx, h, emb, num_video_frames);             // [N, 4*model_channels, h/8, w/8]
+             }
+             h = apply_motion_mid(h);
+@@ -711,6 +721,7 @@
+                     control_offset--;
+                 }
+ 
++                sd::nui::apply_freeu(ctx->ggml_ctx, h, h_skip, int(len_mults) - 1 - i);
+                 h = ggml_concat(ctx->ggml_ctx, h, h_skip, 2);
+ 
+                 std::string name = "output_blocks." + std::to_string(output_block_idx) + ".0";
+@@ -721,7 +732,7 @@
+                 if (std::find(attention_resolutions.begin(), attention_resolutions.end(), ds) != attention_resolutions.end()) {
+                     std::string name = "output_blocks." + std::to_string(output_block_idx) + ".1";
+ 
+-                    h = attention_layer_forward(name, ctx, h, context, num_video_frames);
++                    h = attention_layer_forward(name, ctx, h, context, num_video_frames, 1 << (4 + int(len_mults) - 1 - i));
+ 
+                     up_sample_idx++;
+                 }
+diff --git a/src/dgl/models/diffusion_prediction.h b/src/dgl/models/diffusion_prediction.h
+--- a/src/dgl/models/diffusion_prediction.h
++++ b/src/dgl/models/diffusion_prediction.h
+@@ -6,6 +6,7 @@
+ #include <limits>
+ 
+ #include "core/tensor.hpp"
++#include "model/common/nui_unet_hooks.hpp"
+ #include "model/common/rope_circular.hpp"
+ 
+ struct AttentionProcessor;
+@@ -33,6 +34,7 @@
+     };
+ 
+     struct DiffusionPredictionOptions {
++        sd::nui::UNetOptions unet_hooks;
+         sd::Tensor<float> vace_context, audio_embedding, video_positions;
+         std::vector<int> skip_layers;
+         float guidance                      = 3.5f;
+diff --git a/src/dgl/models/dit.cpp b/src/dgl/models/dit.cpp
+--- a/src/dgl/models/dit.cpp
++++ b/src/dgl/models/dit.cpp
+@@ -301,6 +301,7 @@
+                                                const DiffusionPredictionOptions& options,
+                                                const DiffusionPredictionStep& step) {
+         const auto& shape       = x.shape();
++        sd::nui::UNetPassScope unet_hooks(options.unet_hooks, int(shape[0]), int(shape[1]), uint32_t(step.index));
+         const auto channel_axis = shape.size() == 5 ? 3 : 2;
+         const auto down_factor  = get_diffusion_model_down_factor();
+         const bool packed       = sd_version_is_ltxav(version()) || sd_version_is_minimax_h3(version());
+diff --git a/src/dgl/ops/predictor.cpp b/src/dgl/ops/predictor.cpp
+--- a/src/dgl/ops/predictor.cpp
++++ b/src/dgl/ops/predictor.cpp
+@@ -203,7 +203,7 @@
+             }
+         }
+ 
+-        models::DiffusionPrediction predict_model(const ModelPredictor& leaf, const Tensor<float>& x, float sigma, models::DiffusionPredictionStep step, EvaluationState& state);
++        models::DiffusionPrediction predict_model(const ModelPredictor& leaf, const Tensor<float>& x, float sigma, models::DiffusionPredictionStep step, EvaluationState& state, bool sag_mask = false);
+         models::DiffusionPrediction predict_batch(const ModelPredictor& leaf, const SDCondition& condition, const Tensor<float>& x, float sigma, const models::DiffusionPredictionStep& step);
+     };
+ 
+@@ -400,7 +400,7 @@
+         return check(check, predictor);
+     }
+ 
+-    models::DiffusionPrediction PredictionExecution::Resources::predict_model(const ModelPredictor& leaf, const Tensor<float>& x, float sigma, models::DiffusionPredictionStep step, EvaluationState& state) {
++    models::DiffusionPrediction PredictionExecution::Resources::predict_model(const ModelPredictor& leaf, const Tensor<float>& x, float sigma, models::DiffusionPredictionStep step, EvaluationState& state, bool sag_mask) {
+         auto& engine = leaf.dit();
+         prepare_predictor(leaf);
+         models::CircularAxesScope circular_axes(engine, leaf.circular_x, leaf.circular_y);
+@@ -456,8 +456,11 @@
+         const auto prefix   = qwen_prefix_ids.find(&leaf);
+         step.qwen_prefix_id = prefix == qwen_prefix_ids.end() ? 0 : prefix->second;
+         sd::ParallelScope tensor_scope(engine.tensor_executor.get());
++        auto options = leaf.options;
++        options.unet_hooks.sag_capture = sag_mask;
++        if (sag_mask) step.cache = nullptr;
+         auto prediction = engine.predict_diffusion(x, leaf.resolved_parameterization(), sigma, leaf.condition, leaf.references,
+-                                                   leaf.options, step);
++                                                   options, step);
+         if (prediction.output.empty())
+             throw std::runtime_error("diffusion prediction failed");
+         return prediction;
+@@ -509,6 +512,7 @@
+                 pos->model->motion || neg->model->motion || pos->controls || neg->controls ||
+                 pos->ip_adapters || neg->ip_adapters || pos->pulid || neg->pulid ||
+                 pos->options.transform || neg->options.transform ||
++                pos->options.unet_hooks.pag_regions != neg->options.unet_hooks.pag_regions ||
+                 !pos->references.empty() || !neg->references.empty() ||
+                 !pos->condition.c_ref_images.empty() || !neg->condition.c_ref_images.empty())
+                 return;
+@@ -571,8 +575,45 @@
+             return prediction.output;
+         }
+ 
++        Tensor<float> sag_correction(const Predictor& predictor) {
++            const auto& leaf = std::get<ModelPredictor>(active_branch(predictor).node);
++            const auto& clean = denoised(predictor);
++            auto mask = execution_.resources_->predict_model(leaf,x_,sigma_,step_,state_,true).output;
++            const auto w = clean.shape()[0], h = clean.shape()[1];
++            Tensor<float> intermediate(clean.shape()), blurred(clean.shape());
++            float kernel[9], norm = 0.f;
++            for (int k = -4; k <= 4; ++k) norm += kernel[k+4] = std::exp(-0.5f*k*k);
++            for (auto& v : kernel) v /= norm;
++            auto reflect = [](int64_t v, int64_t size) {
++                return v < 0 ? -v : v >= size ? 2*size-v-2 : v;
++            };
++            for (int axis = 0; axis < 2; ++axis) {
++                const auto* src = axis ? intermediate.data() : clean.data();
++                auto* dst = axis ? blurred.data() : intermediate.data();
++                for (int64_t i = 0; i < clean.numel(); ++i) {
++                    const auto plane = i / (w*h) * (w*h), yy = i/w % h, xx = i % w;
++                    float sum = 0.f;
++                    for (int k = -4; k <= 4; ++k) {
++                        const auto sy = axis ? reflect(yy+k,h) : yy;
++                        const auto sx = axis ? xx : reflect(xx+k,w);
++                        sum += kernel[k+4] * src[plane + sy*w + sx];
++                    }
++                    dst[i] = sum;
++                }
++            }
++            // Preserve the original epsilon when re-noising the degraded x0.
++            auto shifted = x_ + (blurred-clean)*mask;
++            auto degraded = execution_.resources_->predict_model(leaf,shifted,sigma_,step_,state_);
++            const auto& original = evaluate(predictor).prediction;
++            return (original.output-degraded.output)*original.output_scale;
++        }
++
+         Result cfg(const GuidanceBranches& branches) {
+-            const auto scale = branches.scale_at(step_.index);
++            auto scale = branches.scale_at(step_.index);
++            if (branches.pag_adaptive_decay > 0.f) {
++                const auto& parameterization = primary_predictor(*branches.positive).resolved_parameterization();
++                scale = std::max(1.f, scale - branches.pag_adaptive_decay * (1000.f - parameterization.timestep(sigma_)));
++            }
+             if (scale != 1.f || branches.negative.get() == unconditional_)
+                 batch_cfg(branches);
+             const auto& pos = denoised(*branches.positive);
+@@ -580,6 +621,13 @@
+                 const auto& neg = denoised(*branches.negative);
+                 const auto& img = denoised(*branches.image_only);
+                 return {{}, neg + (img - neg) * branches.image_scale + (pos - img) * scale};
++            }
++            if (branches.sag_scale > 0.f) {
++                const auto& branch = scale <= 1.f ? *branches.positive : *branches.negative;
++                auto correction = sag_correction(branch) * branches.sag_scale;
++                if (scale <= 1.f) return {{}, pos + correction};
++                const auto& neg = denoised(*branches.negative);
++                return {{}, neg + (pos - neg)*scale + correction};
+             }
+             if (scale == 1.f)
+                 return {{}, pos};
+diff --git a/src/dgl/ops/predictor.h b/src/dgl/ops/predictor.h
+--- a/src/dgl/ops/predictor.h
++++ b/src/dgl/ops/predictor.h
+@@ -47,6 +47,8 @@
+         std::shared_ptr<Predictor> positive, negative, image_only;
+         float scale       = 1.f;
+         float image_scale = 1.f;
++        float pag_adaptive_decay = 0.f;
++        float sag_scale = 0.f;
+         std::vector<float> scale_schedule;
+ 
+         float scale_at(int step) const;
+diff --git a/src/dgl/bindings/predictor.cpp b/src/dgl/bindings/predictor.cpp
+--- a/src/dgl/bindings/predictor.cpp
++++ b/src/dgl/bindings/predictor.cpp
+@@ -30,6 +30,17 @@
+         predictor.circular_x = get_bool(args, "circular_x");
+         predictor.circular_y = get_bool(args, "circular_y");
+         auto& options        = predictor.options;
++        auto& hooks = options.unet_hooks;
++        hooks.backbone[0] = float(get_number(args,"freeu_b1"));
++        hooks.backbone[1] = float(get_number(args,"freeu_b2"));
++        hooks.skip[0] = float(get_number(args,"freeu_s1"));
++        hooks.skip[1] = float(get_number(args,"freeu_s2"));
++        hooks.tile_size = int(get_int(args,"hypertile_size"));
++        hooks.swap_size = int(get_int(args,"hypertile_swap"));
++        hooks.max_depth = int(get_int(args,"hypertile_depth"));
++        hooks.scale_depth = get_bool(args,"hypertile_scale_depth");
++        hooks.tile_seed = uint32_t(get_int(args,"hypertile_seed"));
++        hooks.pag_regions = int(get_int(args,"pag_regions"));
+         for (const auto& [name, field] : {std::pair{"vace_context", &options.vace_context}, {"audio_embedding", &options.audio_embedding}, {"video_positions", &options.video_positions}}) {
+             if (args.count(name)) {
+                 *field = float_tensor(args, name);
+@@ -182,6 +193,8 @@
+         output.negative    = object<Predictor>(args, "negative");
+         output.scale       = float(get_number(args, "scale"));
+         output.image_scale = float(get_number(args, "image_scale"));
++        output.pag_adaptive_decay = float(get_number(args,"pag_adaptive_decay"));
++        output.sag_scale = float(get_number(args,"sag_scale"));
+         if (args.count("image_only"))
+             output.image_only = object<Predictor>(args, "image_only");
+         if (args.count("schedule")) {
+diff --git a/src/dgl/bindings/registration.cpp b/src/dgl/bindings/registration.cpp
+--- a/src/dgl/bindings/registration.cpp
++++ b/src/dgl/bindings/registration.cpp
+@@ -588,11 +588,14 @@
+              integer("audio_length", 0, INT_MAX, 0),
+              number("fps", 0.01, 100000, 24), number("video_sigma_shift", 0.001, 1000, 12), number("audio_sigma_shift", 0.001, 1000, 3),
+              optional("circular_x", Kind::Boolean, false), optional("circular_y", Kind::Boolean, false),
+-             std::move(transform), optional("transform_args", Kind::Dict)},
++             number("freeu_b1",0,2,1), number("freeu_b2",0,2,1), number("freeu_s1",0,4,1), number("freeu_s2",0,4,1),
++             integer("hypertile_size",0,65536,0), integer("hypertile_swap",1,256,1), integer("hypertile_depth",0,10,0),
++             optional("hypertile_scale_depth", Kind::Boolean, false), integer("hypertile_seed",0,INT_MAX,0),
++             integer("pag_regions",0,511,0), std::move(transform), optional("transform_args", Kind::Dict)},
+             {Kind::Predictor}, make_predictor);
+         const std::vector<Argument> guidance_branches{
+             required("positive", Kind::Predictor), required("negative", Kind::Predictor), number("scale", 0, 1000),
+-            optional("image_only", Kind::Predictor), number("image_scale", 0, 1000, 1), optional_list("schedule", Kind::Number)};
++            optional("image_only", Kind::Predictor), number("image_scale", 0, 1000, 1), optional_list("schedule", Kind::Number), number("pag_adaptive_decay",0,1,0), number("sag_scale",0,30,0)};
+         registry["cfg"] = make_operation(guidance_branches, {Kind::Predictor}, make_cfg);
+         auto apg        = guidance_branches;
+         apg.insert(apg.end(),
+diff --git a/src/version.cpp b/src/version.cpp
+--- a/src/version.cpp
++++ b/src/version.cpp
+@@ -23,3 +23,5 @@
+ extern "C" SD_API bool sd_nui_svd_supported(void) {
+     return true;
+ }
++
++extern "C" SD_API bool sd_nui_unet_hooks_supported(void) { return true; }
+diff --git a/src/model/common/nui_unet_hooks.cpp b/src/model/common/nui_unet_hooks.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/model/common/nui_unet_hooks.cpp
+@@ -0,0 +1,81 @@
++#include "model/common/nui_unet_hooks.hpp"
++#include "ggml.h"
++#include <algorithm>
++#include <cmath>
++#include <random>
++#include <vector>
++
++namespace sd::nui {
++    static int tile_divisor(int side, int minimum, int options, std::mt19937& rng) {
++        std::vector<int> sizes;
++        for (int i = std::min(side, minimum); i <= side && int(sizes.size()) < options; ++i)
++            if (side % i == 0) sizes.push_back(i);
++        return sizes[std::uniform_int_distribution<int>(0, int(sizes.size()) - 1)(rng)];
++    }
++
++    std::pair<int,int> tile_shape() {
++        const auto& pass = active;
++        const auto* opt = pass.options;
++        if (!opt || !opt->tile_size) return {0,0};
++        // Model construction and execution both build the graph. Drawing from the
++        // step and model-layer index gives them the same layout on each branch.
++        std::seed_seq seed{opt->tile_seed, pass.step, active.layer_index++};
++        std::mt19937 rng(seed);
++        for (int depth = 0; depth <= opt->max_depth; ++depth) {
++            const int scale = 1 << depth;
++            if (pass.width != pass.spatial_w * scale || pass.height != pass.spatial_h * scale) continue;
++            const int minimum = std::max(32, opt->tile_size) / 8 * (opt->scale_depth ? scale : 1);
++            const int th = tile_divisor(pass.spatial_h, minimum, opt->swap_size, rng);
++            const int tw = tile_divisor(pass.spatial_w, minimum, opt->swap_size, rng);
++            if (tw < pass.spatial_w || th < pass.spatial_h) return {tw,th};
++            break;
++        }
++        return {0,0};
++    }
++
++    ggml_tensor* split_tiles(ggml_context* ctx, ggml_tensor* x, int tw, int th, bool restore) {
++        const int nw = active.spatial_w / tw, nh = active.spatial_h / th;
++        const auto c = x->ne[0], batch = restore ? x->ne[2] / (nw * nh) : x->ne[2];
++        x = ggml_reshape_4d(ctx, x, c*tw, restore ? th : nw, restore ? nw : th, nh*batch);
++        x = ggml_cont(ctx, ggml_permute(ctx, x, 0, 2, 1, 3));
++        return ggml_reshape_3d(ctx, x, c, restore ? active.spatial_w*active.spatial_h : tw*th,
++                               restore ? batch : batch*nw*nh);
++    }
++
++    // FreeU scales the center 2x2 fftshift window. Reconstruct just those four
++    // real Fourier terms instead of transforming every frequency and discarding it.
++    static ggml_tensor* fourier_filter(ggml_context* ctx, ggml_tensor* skip, float scale) {
++        const auto w = skip->ne[0], h = skip->ne[1], n = w*h;
++        const float tau = 6.283185307179586f;
++        auto x = ggml_scale(ctx, ggml_arange(ctx, 0, float(w), 1), tau / w);
++        auto y = ggml_scale(ctx, ggml_arange(ctx, 0, float(h), 1), tau / h);
++        y = ggml_reshape_2d(ctx, y, 1, h);
++        x = ggml_repeat_4d(ctx, x, w, h, 1, 1);
++        y = ggml_repeat_4d(ctx, y, w, h, 1, 1);
++        auto basis = ggml_reshape_2d(ctx, ggml_fill(ctx, x, 1.f), n, 1);
++        auto append = [&](ggml_tensor* phase) {
++            basis = ggml_concat(ctx, basis, ggml_reshape_2d(ctx, ggml_cos(ctx,phase), n, 1), 1);
++            basis = ggml_concat(ctx, basis, ggml_reshape_2d(ctx, ggml_sin(ctx,phase), n, 1), 1);
++        };
++        if (w > 1) append(x);
++        if (h > 1) append(y);
++        if (w > 1 && h > 1) append(ggml_add(ctx,x,y));
++        auto original = ggml_reshape_2d(ctx, skip, n, skip->ne[2]*skip->ne[3]);
++        auto coeff = ggml_mul_mat(ctx, basis, original);
++        auto low = ggml_mul_mat(ctx, ggml_cont(ctx,ggml_transpose(ctx,basis)), coeff);
++        return ggml_add(ctx, skip, ggml_reshape(ctx,ggml_scale(ctx,low,(scale-1.f)/n),skip));
++    }
++
++    void apply_freeu(ggml_context* ctx, ggml_tensor*& h, ggml_tensor*& skip, int stage) {
++        if (!active.options || stage > 1) return;
++        const float b = active.options->backbone[stage], s = active.options->skip[stage];
++        if (b != 1.f) {
++            const auto half = h->ne[2] / 2;
++            auto half_view = [&](int64_t start, int64_t count) {
++                return ggml_view_4d(ctx,h,h->ne[0],h->ne[1],count,h->ne[3],h->nb[1],h->nb[2],h->nb[3],start*h->nb[2]);
++            };
++            h = ggml_concat(ctx,ggml_scale(ctx,half_view(0,half),b),half_view(half,h->ne[2]-half),2);
++        }
++        if (s != 1.f) skip = fourier_filter(ctx,skip,s);
++    }
++}
+diff --git a/src/model/common/nui_unet_hooks.hpp b/src/model/common/nui_unet_hooks.hpp
+new file mode 100644
+--- /dev/null
++++ b/src/model/common/nui_unet_hooks.hpp
+@@ -0,0 +1,35 @@
++#pragma once
++#include <cstdint>
++#include <utility>
++struct ggml_tensor;
++struct ggml_context;
++
++namespace sd::nui {
++    struct UNetOptions {
++        float backbone[2] = {1.f, 1.f};
++        float skip[2] = {1.f, 1.f};
++        int tile_size = 0, swap_size = 1, max_depth = 0;
++        bool scale_depth = false;
++        int pag_regions = 0;
++        bool sag_capture = false;
++        uint32_t tile_seed = 0;
++    };
++
++    struct UNetPass {
++        const UNetOptions* options = nullptr;
++        int width = 0, height = 0, region = 0, spatial_w = 0, spatial_h = 0;
++        uint32_t step = 0, layer_index = 0;
++        ggml_tensor* attention_mask = nullptr;
++    };
++    inline thread_local UNetPass active;
++    struct UNetPassScope {
++        UNetPass previous = active;
++        UNetPassScope(const UNetOptions& options, int w, int h, uint32_t step) {
++            active = {&options, w, h, 0, 0, 0, step, 0};
++        }
++        ~UNetPassScope() { active = previous; }
++    };
++    std::pair<int,int> tile_shape();
++    ggml_tensor* split_tiles(ggml_context*, ggml_tensor*, int tw, int th, bool restore);
++    void apply_freeu(ggml_context*, ggml_tensor*& backbone, ggml_tensor*& skip, int stage);
++}

@@ -35,7 +35,7 @@ private[vulkan] object VulkanWdTagger:
     for pixel<-resized.getRGB(0,0,448,448,null,0,448) do
       bytes.putFloat(pixel&255);bytes.putFloat((pixel>>>8)&255);bytes.putFloat((pixel>>>16)&255)
     bytes.array()
-  def tags(path:Path,device:String,threshold:Double,batch:Boolean,check:()=>Unit):String =
+  def tags(path:Path,device:String,threshold:Double,batch:Boolean,check:()=>Unit,character:Boolean=false,exclude:Set[String]=Set.empty):String =
     require(threshold.isFinite && threshold>=0 && threshold<=1,"Tag threshold must be in [0,1]")
     if !available then throw sdfx.core.protocol.EngineError("unsupported","WD tagger requires the Vulkan ncnn runtime and converted WD v3 weights")
     required.foreach { (n,h) =>
@@ -64,8 +64,9 @@ private[vulkan] object VulkanWdTagger:
         val name=line.substring(start+1,category).stripPrefix("\"").stripSuffix("\"").replace("\"\"","\"")
         val cat=line.substring(category+1,last).toInt;val score=scores.get()
         require(score.isFinite && score>=0 && score<=1,"Invalid WD tag score")
-        Option.when(if batch then (cat==0 || cat==4) && score>threshold else cat==0 && score>=threshold)(
-          (if batch && emoticons(name) then name else name.replace('_',' '),score))
+        val included=if character then (cat==0 || cat==4) && score>=threshold && !exclude(name.replace('_',' ').toLowerCase(java.util.Locale.ROOT)) else if batch then (cat==0 || cat==4) && score>threshold else cat==0 && score>=threshold
+        Option.when(included)(
+          (if character then name.replace('_',' ').flatMap(c=>if "\\()".contains(c) then "\\"+c else c.toString) else if batch && emoticons(name) then name else name.replace('_',' '),score))
       }
       (if batch then selected else selected.sortBy(-_._2)).map(_._1).distinct.mkString(", ")
     finally if process.isAlive then {process.destroyForcibly();process.waitFor()}

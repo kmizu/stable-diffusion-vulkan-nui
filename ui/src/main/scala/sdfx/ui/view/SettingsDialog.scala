@@ -212,7 +212,7 @@ final class SettingsDialog(owner: Stage, initial: Settings, initialTab: Int = 0,
         .full(W.check("fp16 VAE decode for SDXL (saves ~2.5 GB at 832x1216; falls back to fp32 on bad output)", vaeFp16))
         .full(W.check("fp8 U-Net weights (half the U-Net VRAM, upcast per layer; GPU VRAM mode only)", fp8Storage))
         .full(W.check("Offline mode (never download from Hugging Face)", hfOffline))
-    if availableBackends.contains("python") then
+    if availableBackends.exists(Set("python","vulkan")) then
       form.full(W.check("Allow custom code (the Custom code script runs Python in the engine; like A1111 --allow-code)", allowCode))
     val backendHint = if availableBackends.contains("python") then "Python, precision and VRAM changes apply after an engine restart."
       else "Precision and VRAM changes apply after an engine restart."
@@ -335,7 +335,7 @@ final class SettingsDialog(owner: Stage, initial: Settings, initialTab: Int = 0,
           mcpToken = Option(mcpToken.get).map(_.trim).filter(_.nonEmpty),
           theme = theme.get,
           nsfwCardBlurDefault = cardDefault.get,
-          allowCustomCode = if availableBackends.contains("python") then allowCode.get else initial.allowCustomCode,
+          allowCustomCode = if availableBackends.exists(Set("python","vulkan")) then allowCode.get else initial.allowCustomCode,
           wdV3Model = Option(wdModel.get).map(_.trim).filter(_.nonEmpty),
           wdV3Tags = Option(wdTags.get).map(_.trim).filter(_.nonEmpty)
         )

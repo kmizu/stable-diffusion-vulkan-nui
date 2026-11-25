@@ -51,6 +51,28 @@ private[vulkan] object VulkanAesthetic:
       entry("data.pkl",buf.toByteArray);entry("data/0",bytes.array());entry("version","3\n".getBytes(UTF_8));entry("byteorder","little".getBytes(UTF_8))
     }
 
+  def visionProgram(root:Path,device:String,check:()=>Unit,progress:(String,Int,Int)=>Unit):String =
+    val cacheDir=Files.createDirectories(root.resolve("openai__clip-vit-large-patch14").resolve(revision))
+    val weights=VulkanClip.asset(cacheDir,"model.safetensors",s"https://huggingface.co/$repo/resolve/$revision/model.safetensors",sha,check,progress)
+    val file=ujson.write(ujson.Str(weights.toAbsolutePath.toString));val adapter=ujson.write(ujson.Str(device))
+    s"""fn main(input) {
+      vision = load_vision_encoder($file, backend=$adapter, params_backend=$adapter)
+      return {embedding = encode_vision(vision,input,pooled=true)}
+    }"""
+
+  def projection(source:java.awt.image.BufferedImage,engine:VulkanInference,program:String,lanczos:Boolean,roundCrop:Boolean,dimensions:Int=768,roundSize:Boolean=false,normalize:Boolean=true):Array[Float] =
+    val short=source.getWidth.min(source.getHeight)
+    def side(x:Int)=if roundSize then Math.rint(224.0*x/short).toInt else (x.toLong*224/short).toInt
+    val w=side(source.getWidth)
+    val h=side(source.getHeight)
+    val resized=if lanczos then DiffusionImageResize.lanczos(source,w,h) else DiffusionImageResize.bicubic(source,w,h)
+    def offset(x:Int)=if roundCrop then Math.rint((x-224)/2.0).toInt else (x-224)/2
+    val crop=resized.getSubimage(offset(w),offset(h),224,224)
+    val row=engine.clipVision(program,crop,true,dimensions)
+    val n=math.sqrt(row.iterator.map(v=>v.toDouble*v).sum)
+    require(n.isFinite && n>0,"Invalid CLIP image projection")
+    if normalize then row.map(v=>(v/n).toFloat) else row
+
   def execute(raw:Value,engine:VulkanInference,device:String,check:()=>Unit,publish:()=>Unit,progress:(String,Int,Int)=>Unit):Value =
     val op=raw.obj.get("op").fold("create")(_.str)
     if op=="list" then return list()
@@ -68,27 +90,14 @@ private[vulkan] object VulkanAesthetic:
       else {require(Files.isRegularFile(path),s"Image not found: $path");Vector(path)}
     }
     require(images.nonEmpty,"No images to embed")
-    val cacheDir=Files.createDirectories(cache.resolve("openai__clip-vit-large-patch14").resolve(revision))
-    val weights=VulkanClip.asset(cacheDir,"model.safetensors",s"https://huggingface.co/$repo/resolve/$revision/model.safetensors",sha,check,progress)
-    val file=ujson.write(ujson.Str(weights.toAbsolutePath.toString));val adapter=ujson.write(ujson.Str(device))
-    val program=s"""fn main(input) {
-      vision = load_vision_encoder($file, backend=$adapter, params_backend=$adapter)
-      return {embedding = encode_vision(vision,input,pooled=true)}
-    }"""
+    val program=visionProgram(cache,device,check,progress)
     val sum=Array.fill[Double](768)(0)
     try
       for (path,i)<-images.zipWithIndex do
         check()
         val source=DiffusionImageInput.readRgb(path)
-        val short=source.getWidth.min(source.getHeight)
-        val w=(source.getWidth.toLong*224/short).toInt
-        val h=(source.getHeight.toLong*224/short).toInt
-        val resized=DiffusionImageResize.bicubic(source,w,h)
-        val crop=resized.getSubimage((w-224)/2,(h-224)/2,224,224)
-        val row=engine.clipVision(program,crop,true,768)
-        val n=math.sqrt(row.iterator.map(v=>v.toDouble*v).sum)
-        require(n.isFinite && n>0,"Invalid CLIP image projection")
-        row.indices.foreach(j=>sum(j)+=(row(j)/n).toFloat)
+        val row=projection(source,engine,program,false,false)
+        row.indices.foreach(j=>sum(j)+=row(j))
         progress("aesthetic_embedding",i+1,images.size)
     finally engine.unloadClipVision()
     val norm=math.sqrt(sum.iterator.map(v=>v*v).sum)/images.size

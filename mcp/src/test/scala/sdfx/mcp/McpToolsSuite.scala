@@ -618,7 +618,7 @@ class McpToolsSuite extends munit.FunSuite:
     val ts = server.handle(request("tools/list"), _ => ()).get("result")("tools").arr
     val tool = ts.find(_("name").str == "clip_interrogate").getOrElse(fail("CLIP Interrogator tool missing"))
     val props = tool("inputSchema")("properties").obj
-    assertEquals(props("mode")("enum").arr.map(_.str).toSeq, Seq("best", "fast", "classic", "negative", "caption"))
+    assertEquals(props("mode")("enum").arr.map(_.str).toSeq, Seq("best", "fast", "classic", "negative", "caption", "label"))
     assertEquals(props("operation")("enum").arr.map(_.str).toSeq, Seq("prompt", "analyze", "batch", "models", "unload"))
     assert(call("clip_interrogate", ujson.Obj("operation" -> "bogus"))("isError").bool)
     assert(call("clip_interrogate", ujson.Obj("operation" -> "prompt", "mode" -> "bogus", "image" -> "x"))("isError").bool)
