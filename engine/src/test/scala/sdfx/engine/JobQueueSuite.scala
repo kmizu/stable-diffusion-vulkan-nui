@@ -1,0 +1,545 @@
+package sdfx.engine
+
+import sdfx.core.config.Settings
+import sdfx.core.infotext.Infotext
+import sdfx.core.model.GenerationParams
+import sdfx.core.plugins.api.*
+import sdfx.engine.testplugins.{MarkerAlwaysOn, PartialGridScript, RepeatScript, ThrowingScript}
+
+import java.util.concurrent.{ConcurrentLinkedQueue, CountDownLatch, TimeUnit}
+import scala.concurrent.duration.*
+import scala.jdk.CollectionConverters.*
+
+class JobQueueSuite extends munit.FunSuite:
+  import FakeEngine.*
+
+  override val munitTimeout: Duration = 120.seconds
+
+  test("service shutdown clears the live image session but leaves existing snapshots stable") {
+    val localHome = tempHome()
+    val local = new AppServices(localHome, Settings(), dryRun = true, builtins = Nil,
+      launchOverride = Some(() => launch()), persistSettings = false, installShutdownHook = false)
+    try
+      local.imageScrambleSession.unlock("shutdown-secret")
+      val submitted = local.imageScrambleSession.snapshot.get
+      local.shutdown()
+      assertEquals(local.imageScrambleSession.snapshot, None)
+      assertEquals(submitted.use(identity), "shutdown-secret")
+    finally deleteTree(localHome.root)
+  }
+
+  private lazy val home = tempHome()
+  private lazy val services =
+    val s = new AppServices(home, Settings(lastModel = Some("foo")), dryRun = true, builtins = Seq(new RepeatScript, new MarkerAlwaysOn),
+      launchOverride = Some(() => launch()), persistSettings = false)
+    s.start()
+    s
+
+  override def afterAll(): Unit =
+    services.shutdown()
+    deleteTree(home.root)
+
+  private def queue = services.queue
+  private def base = GenerationParams(prompt = "q", seed = 5, steps = 2, width = 64, height = 64)
+  private def slow(stepDelay: String) = base.copy(steps = 10, extra = Map("step_delay" -> stepDelay))
+
+  private def recording(): (ConcurrentLinkedQueue[JobEvent], () => Unit) =
+    val evs = new ConcurrentLinkedQueue[JobEvent]()
+    (evs, queue.addListener(evs.add(_)))
+
+  test("jobs run in FIFO order and report events") {
+    val (evs, remove) = recording()
+    try
+      val jobs = (1 to 3).map(i => Job(Job.newId(), base.copy(seed = i.toLong)))
+      val fs = jobs.map(queue.submit)
+      fs.foreach(f => assertEquals(await(f).images.size, 1))
+      val started = evs.asScala.collect { case JobEvent.JobStarted(j) => j.id }.toList
+      assertEquals(started, jobs.map(_.id).toList)
+      val finished = evs.asScala.collect { case JobEvent.JobFinished(id, _) => id }.toList
+      assertEquals(finished, jobs.map(_.id).toList)
+      assert(evs.asScala.exists(_.isInstanceOf[JobEvent.Progress]))
+      assert(evs.asScala.exists(_.isInstanceOf[JobEvent.Preview]))
+      assertEquals(evs.asScala.collect { case e: JobEvent.ImageSaved => e }.size, 3)
+      assert(evs.asScala.collect { case e: JobEvent.JobQueued => e }.size == 3)
+    finally remove()
+  }
+
+  test("numbered ordinary batch grids preserve final images, filename mapping and replay; disabled creates none") {
+    val p = base.copy(width = 128, height = 128, batchSize = 2, nIter = 2)
+    val ordinary = await(queue.submit(Job(p)))
+    assertEquals(ordinary.images.size, 4)
+    assertEquals(ordinary.grids.size, 0)
+    val options = Map("Grid image numbers" -> "True", "Grid XYZ info" -> "False")
+    val numbered = await(queue.submit(Job(p.copy(extra = options))))
+    assertEquals(numbered.images.size, 4)
+    assertEquals(numbered.grids.size, 1)
+    ordinary.images.zip(numbered.images).foreach { (a, b) =>
+      val x = sdfx.core.png.PngMetadata.readImage(a.path)
+      val y = sdfx.core.png.PngMetadata.readImage(b.path)
+      assert(x.getRGB(0, 0, 128, 128, null, 0, 128).sameElements(y.getRGB(0, 0, 128, 128, null, 0, 128)))
+    }
+    val grid = numbered.grids.head
+    val text = sdfx.core.png.PngMetadata.readParameters(grid.path).get
+    val parsed = Infotext.parse(text)
+    val sourceNames = ujson.read(parsed.get("Grid source images").get).arr.map(_("filename").str).toSeq
+    assertEquals(sourceNames, numbered.images.map(_.path.getFileName.toString))
+    assertEquals(parsed.get("Grid image numbers"), Some("True"))
+    val replay = await(queue.submit(Job(Infotext.toParams(parsed).copy(batchSize = 2, nIter = 2))))
+    assertEquals(replay.grids.size, 1)
+    assertEquals(await(queue.submit(Job(p.copy(extra = Map("Grid image numbers" -> "False"))))).grids.size, 0)
+    assertEquals(await(queue.submit(Job(p.copy(batchSize = 1, nIter = 1, extra = options)))).grids.size, 0)
+  }
+
+  test("job snapshots scramble generated outputs and numbered grids without leaking password") {
+    val password = "image secret 猫"
+    val session = new sdfx.core.png.ImageScrambleSession
+    session.unlock(password)
+    val p = base.copy(batchSize = 2, extra = Map("Grid image numbers" -> "True"))
+    val plain = await(queue.submit(Job(p)))
+    val job = Job(p).copy(imageSecret = session.snapshot)
+    session.lock()
+    assert(!job.toString.contains(password))
+    val output = await(queue.submit(job))
+    assertEquals(output.images.size, 2)
+    assertEquals(output.grids.size, 1)
+    output.all.foreach { image =>
+      val texts = sdfx.core.png.PngMetadata.readTexts(image.path)
+      assertEquals(texts.get("Encrypt"), Some("pixel_shuffle_3"))
+      assert(!texts.toString.contains(password))
+    }
+    plain.images.zip(output.images).foreach { (expected, actual) =>
+      val a = sdfx.core.png.PngMetadata.readImage(expected.path)
+      val b = sdfx.core.png.ScrambledPng.read(actual.path, Some(password)).image
+      assert(a.getRGB(0, 0, a.getWidth, a.getHeight, null, 0, a.getWidth).sameElements(
+        b.getRGB(0, 0, b.getWidth, b.getHeight, null, 0, b.getWidth)))
+    }
+    assertEquals(sdfx.core.png.ScrambledPng.read(output.grids.head.path, Some(password)).passwordVerified, Some(true))
+  }
+
+  test("folder job preserves the captured secret and refuses protected input without it") {
+    val folder = java.nio.file.Files.createTempDirectory(home.root, "protected-folder-")
+    val input = folder.resolve("protected.png")
+    val pixels = new java.awt.image.BufferedImage(64, 64, java.awt.image.BufferedImage.TYPE_INT_RGB)
+    sdfx.core.png.ScrambledPng.write(pixels, input, Nil, Some("folder-password"))
+    val session = new sdfx.core.png.ImageScrambleSession
+    session.unlock("folder-password")
+    val params = base.copy(img2img = Some(sdfx.core.model.Img2ImgParams("")))
+    val job = Job(params).copy(img2imgFolder = Some(Img2ImgFolderSpec(folder.toString)), imageSecret = session.snapshot)
+    session.lock()
+    val result = await(queue.submit(job))
+    assertEquals(result.images.size, 1)
+    assertEquals(result.images.head.params.img2img.get.initImage, input.toRealPath().toString)
+    assertEquals(sdfx.core.png.PngMetadata.readTexts(result.images.head.path).get("Encrypt"), Some("pixel_shuffle_3"))
+    intercept[Exception] { await(queue.submit(job.copy(id = Job.newId(), imageSecret = None))) }
+    assertEquals(sdfx.core.png.PngMetadata.readTexts(input).get("Encrypt"), Some("pixel_shuffle_3"))
+  }
+
+  test("folder script and AlwaysOn share limits and record each grid source") {
+    val folder = java.nio.file.Files.createTempDirectory(home.root, "script-folder-")
+    val image = new java.awt.image.BufferedImage(64, 64, java.awt.image.BufferedImage.TYPE_INT_RGB)
+    val paths = Seq("a.png", "b.png").map { name =>
+      val path = folder.resolve(name)
+      sdfx.core.png.PngMetadata.write(image, path, Nil)
+      path.toRealPath().toString
+    }
+    val params = base.copy(img2img = Some(sdfx.core.model.Img2ImgParams("")))
+    val job = Job(Job.newId(), params,
+      Some(new RepeatScript -> Values(Map("n" -> "2", "grid" -> "true"))),
+      Seq(new MarkerAlwaysOn -> Values(Map("enabled" -> "true", "value" -> "folder-marker"))),
+      img2imgFolder = Some(Img2ImgFolderSpec(folder.toString)))
+    val output = await(queue.submit(job))
+    assertEquals(output.images.size, 4)
+    assertEquals(output.grids.size, 2)
+    assertEquals(output.images.map(_.params.img2img.get.initImage), paths.flatMap(p => Seq(p, p)))
+    assertEquals(output.grids.map(_.params.img2img.get.initImage), paths)
+    assert(output.images.forall(i => Infotext.parse(i.infotext).get("Marker").contains("folder-marker")))
+    output.grids.zip(paths).foreach { (grid, source) =>
+      assertEquals(Infotext.parse(sdfx.core.png.PngMetadata.readParameters(grid.path).get).get("NUI img2img source"), Some(source))
+      assertEquals(sdfx.core.png.PngMetadata.readTexts(grid.path).get("NUI img2img source"), Some(source))
+    }
+    intercept[JobLimitExceeded] { await(queue.submit(job.copy(id = Job.newId(), limits = JobLimits(maxGenerations = 3)))) }
+  }
+
+  test("folder numbered automatic grid keeps source in a standalone PNG text chunk") {
+    val folder = java.nio.file.Files.createTempDirectory(home.root, "grid-folder-")
+    val input = folder.resolve("input.png")
+    val pixels = new java.awt.image.BufferedImage(64, 64, java.awt.image.BufferedImage.TYPE_INT_RGB)
+    sdfx.core.png.PngMetadata.write(pixels, input, Nil)
+    val params = base.copy(batchSize = 2, img2img = Some(sdfx.core.model.Img2ImgParams("")),
+      extra = Map("Grid image numbers" -> "True"))
+    val result = await(queue.submit(Job(params).copy(img2imgFolder = Some(Img2ImgFolderSpec(folder.toString)))))
+    assertEquals(result.grids.size, 1)
+    val grid = result.grids.head
+    assertEquals(grid.params.img2img.get.initImage, input.toRealPath().toString)
+    assertEquals(sdfx.core.png.PngMetadata.readTexts(grid.path).get("NUI img2img source"), Some(input.toRealPath().toString))
+  }
+
+  test("script context reads scrambled generated output before saving a derived image") {
+    val session = new sdfx.core.png.ImageScrambleSession
+    session.unlock("script secret")
+    val plugin = new Plugin:
+      def id = "test_scramble_read"
+      def name = "Test scramble read"
+      def kind = PluginKind.Script
+      override def tabs = Set(Tab.Txt2Img)
+      override def run(p: GenerationParams, values: Values, ctx: PluginContext): JobOutput =
+        val source = ctx.generate(p).head
+        val pixels = ctx.readImage(source.path)
+        val copy = ctx.saveImage(pixels, "derived", source.params, source.infotext)
+        JobOutput(Seq(source, copy))
+    val result = await(queue.submit(Job(base).copy(script = Some(plugin -> Values.empty), imageSecret = session.snapshot)))
+    val images = result.images.map(o => sdfx.core.png.ScrambledPng.read(o.path, Some("script secret")).image)
+    val a = images(0); val b = images(1)
+    assert(a.getRGB(0, 0, a.getWidth, a.getHeight, null, 0, a.getWidth).sameElements(
+      b.getRGB(0, 0, b.getWidth, b.getHeight, null, 0, b.getWidth)))
+  }
+
+  test("script input snapshots retain original path in generation provenance") {
+    val source = java.nio.file.Files.createTempFile("workflow-source-", ".png")
+    val image = new java.awt.image.BufferedImage(64, 64, java.awt.image.BufferedImage.TYPE_INT_RGB)
+    sdfx.core.png.PngMetadata.write(image, source, Nil)
+    val plugin = new Plugin:
+      def id = "test_snapshot_source"
+      def name = "test snapshot source"
+      def kind = PluginKind.Script
+      override def run(p: GenerationParams, values: Values, ctx: PluginContext): JobOutput =
+        val staged = ctx.tempFile(".png")
+        try
+          ctx.writeTempImage(ctx.readImage(source), staged)
+          val request = p.copy(img2img = Some(sdfx.core.model.Img2ImgParams(staged.toString)))
+          val first = ctx.generateWithInputSnapshot(request, source.toString)
+          try
+            ctx.generateWithInputSnapshot(request.copy(width = 0), source.toString)
+            throw new AssertionError("invalid request unexpectedly succeeded")
+          catch case _: sdfx.core.protocol.EngineError => ()
+          JobOutput(first ++ ctx.generate(p))
+        finally java.nio.file.Files.deleteIfExists(staged)
+    try
+      val result = await(queue.submit(Job(base).copy(script = Some(plugin -> Values.empty))))
+      val output = result.images.head
+      assertEquals(output.params.img2img.get.initImage, source.toString)
+      assertEquals(sdfx.core.png.PngMetadata.readTexts(output.path).get("NUI img2img source"), Some(source.toString))
+      val ordinary = result.images.last
+      assertEquals(ordinary.params.img2img, None)
+      assertEquals(sdfx.core.png.PngMetadata.readTexts(ordinary.path).get("NUI img2img source"), None)
+    finally java.nio.file.Files.deleteIfExists(source)
+  }
+
+  test("script snapshots in a folder retain each original path") {
+    val folder = java.nio.file.Files.createTempDirectory(home.root, "snapshot-folder-")
+    val sourceA = folder.resolve("a.png"); val sourceB = folder.resolve("b.png")
+    val image = new java.awt.image.BufferedImage(64, 64, java.awt.image.BufferedImage.TYPE_INT_RGB)
+    sdfx.core.png.PngMetadata.write(image, sourceA, Nil)
+    sdfx.core.png.PngMetadata.write(image, sourceB, Nil)
+    val plugin = new Plugin:
+      def id = "test_folder_snapshot"
+      def name = "test folder snapshot"
+      def kind = PluginKind.Script
+      override def run(p: GenerationParams, values: Values, ctx: PluginContext): JobOutput =
+        val staged = ctx.tempFile(".png")
+        try
+          ctx.writeTempImage(ctx.readImage(java.nio.file.Path.of(p.img2img.get.initImage)), staged)
+          val request = p.copy(img2img = p.img2img.map(_.copy(initImage = staged.toString)))
+          JobOutput(ctx.generateWithInputSnapshot(request, p.img2img.get.initImage))
+        finally java.nio.file.Files.deleteIfExists(staged)
+    val params = base.copy(img2img = Some(sdfx.core.model.Img2ImgParams("")))
+    val result = await(queue.submit(Job(params).copy(script = Some(plugin -> Values.empty),
+      img2imgFolder = Some(Img2ImgFolderSpec(folder.toString)))))
+    assertEquals(result.images.map(_.params.img2img.get.initImage), Seq(sourceA.toRealPath().toString, sourceB.toRealPath().toString))
+    result.images.zip(Seq(sourceA, sourceB)).foreach { (output, source) =>
+      assertEquals(sdfx.core.png.PngMetadata.readTexts(output.path).get("NUI img2img source"), Some(source.toRealPath().toString))
+    }
+  }
+
+  test("script context writes protected temporary images that round trip and clean up") {
+    val session = new sdfx.core.png.ImageScrambleSession
+    session.unlock("mask secret")
+    var path: java.nio.file.Path = null
+    val plugin = new Plugin:
+      def id = "test_temp_mask"
+      def name = "test temp mask"
+      def kind = PluginKind.Script
+      override def run(p: GenerationParams, values: Values, ctx: PluginContext): JobOutput =
+        val mask = new java.awt.image.BufferedImage(8, 8, java.awt.image.BufferedImage.TYPE_INT_RGB)
+        mask.setRGB(2, 3, 0xffffff)
+        path = ctx.tempFile(".png")
+        try
+          ctx.writeTempImage(mask, path)
+          assertEquals(sdfx.core.png.PngMetadata.readTexts(path).get("Encrypt"), Some("pixel_shuffle_3"))
+          assertEquals(ctx.readImage(path).getRGB(2, 3) & 0xffffff, 0xffffff)
+          assertEquals(ctx.readImage(path).getRGB(0, 0) & 0xffffff, 0)
+          JobOutput(Nil)
+        finally java.nio.file.Files.deleteIfExists(path)
+    await(queue.submit(Job(base).copy(script = Some(plugin -> Values.empty), imageSecret = session.snapshot)))
+    assert(path != null && !java.nio.file.Files.exists(path))
+  }
+
+  test("script worker tools receive decoded images and remove temporary inputs") {
+    val src = java.nio.file.Files.createTempFile("scrambled-tool-test", ".png")
+    val image = new java.awt.image.BufferedImage(8, 8, java.awt.image.BufferedImage.TYPE_INT_RGB)
+    sdfx.core.png.ScrambledPng.write(image, src, Nil, Some("tool secret"))
+    val session = new sdfx.core.png.ImageScrambleSession; session.unlock("tool secret")
+    val plugin = new Plugin:
+      def id = "test_tool_input"
+      def name = "Test tool input"
+      def kind = PluginKind.Script
+      override def run(p: GenerationParams, values: Values, ctx: PluginContext): JobOutput =
+        ctx.engineCall("caption", ujson.Obj("image_path" -> src.toString, "method" -> "fake"))
+        JobOutput(Nil)
+    try
+      await(queue.submit(Job(base).copy(script = Some(plugin -> Values.empty), imageSecret = session.snapshot)))
+      val path = java.nio.file.Paths.get(await(services.client.raw("get_state"))("last_extra")("params")("image_path").str)
+      assertNotEquals(path, src)
+      assert(!java.nio.file.Files.exists(path))
+      assertEquals(sdfx.core.png.PngMetadata.readTexts(src).get("Encrypt"), Some("pixel_shuffle_3"))
+    finally java.nio.file.Files.deleteIfExists(src)
+  }
+
+  test("script upscaler receives decoded input and cleanup removes its temporary") {
+    val src = java.nio.file.Files.createTempFile("scrambled-upscale-test", ".png")
+    sdfx.core.png.ScrambledPng.write(new java.awt.image.BufferedImage(8, 8, java.awt.image.BufferedImage.TYPE_INT_RGB), src, Nil, Some("tool secret"))
+    val session = new sdfx.core.png.ImageScrambleSession; session.unlock("tool secret")
+    val plugin = new Plugin:
+      def id = "test_upscale_input"
+      def name = "Test upscale input"
+      def kind = PluginKind.Script
+      override def run(p: GenerationParams, values: Values, ctx: PluginContext): JobOutput =
+        ctx.upscale(src, "Lanczos", 2.0)
+        JobOutput(Nil)
+    try
+      await(queue.submit(Job(base).copy(script = Some(plugin -> Values.empty), imageSecret = session.snapshot)))
+      val state = await(services.client.raw("get_state"))("last_extra")
+      assertEquals(state("type").str, "upscale")
+      val path = java.nio.file.Paths.get(state("params")("image_path").str)
+      assertNotEquals(path, src)
+      assert(!java.nio.file.Files.exists(path))
+    finally java.nio.file.Files.deleteIfExists(src)
+  }
+
+  test("cancel a pending job and clear the queue") {
+    val (evs, remove) = recording()
+    val first = Job(Job.newId(), base)
+    val started = new CountDownLatch(1)
+    val release = new CountDownLatch(1)
+    val removeGate = queue.addListener {
+      case JobEvent.JobStarted(j) if j.id == first.id =>
+        started.countDown()
+        release.await(20, TimeUnit.SECONDS)
+        ()
+      case _ => ()
+    }
+    try
+      val a = queue.submit(first)
+      assert(started.await(20, TimeUnit.SECONDS), "first job did not start")
+      val b = Job(Job.newId(), base)
+      val c = Job(Job.newId(), base)
+      val d = Job(Job.newId(), base)
+      val fb = queue.submit(b)
+      val fc = queue.submit(c)
+      val fd = queue.submit(d)
+      assertEquals(queue.pending.map(_.id), Seq(b.id, c.id, d.id))
+      assert(queue.cancel(b.id))
+      val eb = intercept[JobCancelledException](await(fb))
+      assertEquals(eb.jobId, b.id)
+      assertEquals(queue.clear(), 2)
+      intercept[JobCancelledException](await(fc))
+      intercept[JobCancelledException](await(fd))
+      release.countDown()
+      assertEquals(await(a).images.size, 1)
+      assert(evs.asScala.exists { case JobEvent.JobCancelled(id, _) => id == b.id; case _ => false })
+    finally
+      release.countDown()
+      removeGate()
+      remove()
+  }
+
+  test("script job: every sub-generation gets AlwaysOn processing, grids are separate") {
+    val (evs, remove) = recording()
+    try
+      val script = new RepeatScript
+      val marker = new MarkerAlwaysOn
+      val disabledMarker = new MarkerAlwaysOn
+      val job = Job(Job.newId(), base, Some(script -> Values(Map("n" -> "3", "grid" -> "true"))),
+        Seq(marker -> Values(Map("enabled" -> "true", "value" -> "hello")), disabledMarker -> Values(Map("enabled" -> "false", "value" -> "nope"))))
+      val out = await(queue.submit(job))
+      assertEquals(out.images.map(_.seed), Seq(1000L, 1001L, 1002L))
+      assertEquals(out.grids.size, 1)
+      assert(out.grids.head.path.toString.replace('\\', '/').contains("/grids/"))
+      out.images.foreach { img =>
+        assertEquals(Infotext.parse(img.infotext).get("Marker"), Some("hello"))
+        assertEquals(img.params.hooks.get("marker"), Some(ujson.Str("hello")))
+      }
+      val st = await(services.client.raw("get_state"))
+      assertEquals(st("last_generation")("request")("params")("hooks")("marker").str, "hello")
+      val statuses = evs.asScala.collect { case JobEvent.Status(_, t, d, n) => (t, d, n) }.toList
+      assertEquals(statuses, List(("repeat 1/3", 0, 3), ("repeat 2/3", 1, 3), ("repeat 3/3", 2, 3)))
+      assert(evs.asScala.exists { case JobEvent.Progress(_, _, t, _, 3) => t.startsWith("repeat"); case _ => false })
+      assert(evs.asScala.exists { case JobEvent.ImageSaved(_, _, true) => true; case _ => false })
+    finally remove()
+  }
+
+  test("plain job applies AlwaysOn once") {
+    val job = Job(Job.newId(), base, None, Seq(new MarkerAlwaysOn -> Values(Map("enabled" -> "true", "value" -> "once"))))
+    val out = await(queue.submit(job))
+    assertEquals(Infotext.parse(out.images.head.infotext).get("Marker"), Some("once"))
+  }
+
+  test("interrupt stops the script loop and keeps partial outputs") {
+    val (evs, remove) = recording()
+    try
+      val job = Job(Job.newId(), slow("0.03"), Some(new RepeatScript -> Values(Map("n" -> "20"))))
+      val f = queue.submit(job)
+      assert(eventually()(evs.asScala.exists(_.isInstanceOf[JobEvent.ImageSaved])))
+      assert(queue.interruptCurrent())
+      val e = intercept[JobCancelledException](await(f))
+      assert(e.partial.images.nonEmpty && e.partial.images.size < 20, e.partial.images.size.toString)
+      assert(evs.asScala.exists { case JobEvent.JobCancelled(id, p) => id == job.id && p.images.nonEmpty; case _ => false })
+      // queue keeps working afterwards
+      assertEquals(await(queue.submit(Job(base))).images.size, 1)
+      assert(eventually()(queue.isIdle), s"queue not idle: current=${queue.current} pending=${queue.pending}")
+    finally remove()
+  }
+
+  test("fatal errors from a job fail that job but keep the worker alive") {
+    val (evs, remove) = recording()
+    try
+      val oom = Job(Job.newId(), base, Some(new ThrowingScript(new OutOfMemoryError("test oom")) -> Values.empty))
+      // scala.concurrent boxes fatal errors in an ExecutionException
+      def root(t: Throwable): Throwable = if t.getCause != null && (t.getCause ne t) then root(t.getCause) else t
+      val e1 = intercept[Throwable](await(queue.submit(oom)))
+      assert(root(e1).isInstanceOf[OutOfMemoryError] && root(e1).getMessage == "test oom", e1.toString)
+      val linkage = Job(Job.newId(), base, Some(new ThrowingScript(new NoClassDefFoundError("missing/Dep")) -> Values.empty))
+      val e2 = intercept[Throwable](await(queue.submit(linkage)))
+      assert(root(e2).isInstanceOf[NoClassDefFoundError], e2.toString)
+      assert(evs.asScala.exists { case JobEvent.JobFailed(id, _) => id == oom.id; case _ => false })
+      assertEquals(await(queue.submit(Job(base))).images.size, 1)
+      assert(eventually()(queue.isIdle))
+    finally remove()
+  }
+
+  test("generateTransient: AlwaysOn applied, events forwarded, files stay in .tmp, no ImageSaved") {
+    val (evs, remove) = recording()
+    try
+      val job = Job(Job.newId(), base, Some(new testplugins.TransientScript -> Values.empty),
+        Seq(new MarkerAlwaysOn -> Values(Map("enabled" -> "true", "value" -> "tr"))))
+      val out = await(queue.submit(job))
+      assertEquals(out.images.map(_.seed), Seq(77L, 78L))
+      val tmp = home.tmpDir(services.settings).toAbsolutePath.normalize()
+      out.images.foreach { img =>
+        assert(java.nio.file.Files.isRegularFile(img.path))
+        assertEquals(img.path.toAbsolutePath.normalize().getParent, tmp)
+        assertEquals(img.params.extra.get("Marker"), Some("tr"))
+        java.nio.file.Files.deleteIfExists(img.path)
+      }
+      assert(!evs.asScala.exists(_.isInstanceOf[JobEvent.ImageSaved]))
+      assert(evs.asScala.exists { case p: JobEvent.Progress => p.jobId == job.id; case _ => false })
+      assertEquals(await(services.client.raw("get_state"))("last_generation")("request")("params")("hooks")("marker").str, "tr")
+    finally remove()
+  }
+
+  test("JobLimits: a script looping past maxGenerations fails the job after the allowed generations") {
+    val (evs, remove) = recording()
+    try
+      val job = Job(Job.newId(), base, Some(new RepeatScript -> Values(Map("n" -> "5"))), limits = JobLimits(maxGenerations = 3))
+      val e = intercept[JobLimitExceeded](await(queue.submit(job)))
+      assert(e.getMessage.contains("3 generations"), e.getMessage)
+      assertEquals(evs.asScala.count { case JobEvent.ImageSaved(id, _, _) => id == job.id; case _ => false }, 3)
+      assert(evs.asScala.exists { case JobEvent.JobFailed(id, _) => id == job.id; case _ => false })
+    finally remove()
+  }
+
+  test("JobLimits: hires target over maxSide is rejected before reaching the engine") {
+    val before = await(services.client.raw("get_state"))("last_generation")
+    val p = base.copy(prompt = "hires-limit", hires = sdfx.core.model.HiresParams(enabled = true, scale = 4.0))
+    val e = intercept[JobLimitExceeded](await(queue.submit(Job(Job.newId(), p, limits = JobLimits(maxSide = 200)))))
+    assert(e.getMessage.contains("hires target 256x256"), e.getMessage)
+    assertEquals(await(services.client.raw("get_state"))("last_generation"), before)
+    // within limits it runs
+    assertEquals(await(queue.submit(Job(Job.newId(), p, limits = JobLimits(maxSide = 256)))).images.size, 1)
+  }
+
+  test("JobLimits.check: images and pixels per generation") {
+    val l = JobLimits(maxImagesPerGeneration = 4, maxPixelsPerGeneration = 64L * 64 * 3)
+    l.check(base.copy(batchSize = 2, nIter = 2), 1)
+    intercept[JobLimitExceeded](l.check(base.copy(batchSize = 1, nIter = 5), 1))
+    intercept[JobLimitExceeded](l.check(base.copy(batchSize = 4), 1))
+    intercept[JobLimitExceeded](JobLimits(maxSide = 32).check(base, 1))
+    l.check(base.copy(batchSize = 3), 1)
+  }
+
+  test("per-job temp files are deleted when the job ends, except files in its output") {
+    import java.nio.file.Files
+    val ok = new testplugins.TempUsingScript(fail = false)
+    val out = await(queue.submit(Job(Job.newId(), base, Some(ok -> Values.empty))))
+    assertEquals(ok.created.size, 4)
+    val kept = ok.kept.get
+    assertEquals(out.images.map(_.path), Seq(kept))
+    assert(Files.exists(kept), "file in the job output must survive")
+    ok.created.filterNot(_ == kept).foreach(p => assert(!Files.exists(p), s"not cleaned: $p"))
+    Files.deleteIfExists(kept)
+
+    val bad = new testplugins.TempUsingScript(fail = true)
+    intercept[IllegalStateException](await(queue.submit(Job(Job.newId(), base, Some(bad -> Values.empty)))))
+    assertEquals(bad.created.size, 4)
+    bad.created.foreach(p => assert(!Files.exists(p), s"not cleaned after failure: $p"))
+  }
+
+  test("engine-side interrupt is visible via ctx.isInterrupted; partial grid is kept") {
+    val script = new PartialGridScript
+    val job = Job(Job.newId(), base, Some(script -> Values.empty))
+    val e = intercept[JobCancelledException](await(queue.submit(job)))
+    assert(script.sawInterrupted)
+    assertEquals(e.partial.images.size, 1)
+    assertEquals(e.partial.grids.size, 1)
+  }
+
+  test("script swallowing backend interruption remains cancelled before admission reply") {
+    val script = new Plugin:
+      def id = "swallow-interruption"
+      def name = id
+      def kind = PluginKind.Script
+      override def run(p: GenerationParams, v: Values, ctx: PluginContext): JobOutput =
+        val saved = ctx.generate(p)
+        try ctx.generate(p.copy(extra = Map("force_error" -> "interrupted")))
+        catch case e: sdfx.core.protocol.EngineError if e.isInterrupted => ()
+        JobOutput(saved)
+    val (events, remove) = recording()
+    try
+      val job = Job(Job.newId(), base, Some(script -> Values.empty))
+      val error = intercept[JobCancelledException](await(queue.submit(job)))
+      assertEquals(error.partial.images.size, 1)
+      assert(!events.asScala.exists { case JobEvent.JobFinished(id, _) => id == job.id; case _ => false })
+      assertEquals(await(queue.submit(Job(base))).images.size, 1)
+    finally remove()
+  }
+
+  test("backend partial result reaches cancelled gallery without a finished event") {
+    val (events, remove) = recording()
+    try
+      val job = Job(base.copy(extra = Map("partial_interrupted" -> "true")))
+      val error = intercept[JobCancelledException](await(queue.submit(job)))
+      assertEquals(error.partial.images.size, 1)
+      assert(java.nio.file.Files.isRegularFile(error.partial.images.head.path))
+      assert(events.asScala.exists { case JobEvent.JobCancelled(id, p) => id == job.id && p.images.size == 1; case _ => false })
+      assert(!events.asScala.exists { case JobEvent.JobFinished(id, _) => id == job.id; case _ => false })
+      assertEquals(await(queue.submit(Job(base))).images.size, 1)
+    finally remove()
+  }
+
+  test("cancel of the running plain job ends as cancelled") {
+    val f = queue.submit(Job(Job.newId(), slow("0.1")))
+    assert(eventually()(queue.current.isDefined))
+    Thread.sleep(200)
+    assert(queue.cancel(queue.current.get.id))
+    intercept[JobCancelledException](await(f))
+  }
+
+  test("failures are reported") {
+    val (evs, remove) = recording()
+    try
+      val job = Job(Job.newId(), base.copy(checkpoint = Some("does-not-exist")))
+      val e = intercept[sdfx.core.protocol.EngineError](await(queue.submit(job)))
+      assert(e.message.contains("does-not-exist"))
+      assert(evs.asScala.exists { case JobEvent.JobFailed(id, _) => id == job.id; case _ => false })
+    finally remove()
+  }

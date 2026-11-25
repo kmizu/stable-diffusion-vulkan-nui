@@ -1,0 +1,2429 @@
+"""Real inference engine on diffusers (SD1.x / SD2 / SDXL single-file checkpoints).
+
+Importing this module imports torch and diffusers; server.build_engine falls back to UnavailableEngine
+when that fails.
+"""
+from __future__ import annotations
+
+import gc
+from dataclasses import replace
+from collections import OrderedDict
+import hashlib
+import inspect
+import logging
+import math
+import os
+import re
+import time
+import traceback
+import uuid
+from typing import Any, Optional
+
+import torch  # noqa: F401  (ImportError here -> degraded engine)
+import diffusers  # noqa: F401
+
+from . import controlnet as cn_mod
+from . import hires as hires_mod
+from . import hooks as hooks_mod
+from . import adapters, animatediff, extras, inpaint, lora_blocks, models, perf, preview, prompt, prompt_schedule, schedulers, sonar, upscalers
+from . import weight_gradient, save_intermediate, latent_upscale, steps_animation
+from . import aesthetic_gradients, clip_io, negpip
+from . import neutral_prompt, neutral_runtime, prompt_fusion
+from .clora import runtime as composable_lora
+from . import extensions as ext_mod
+from .base import LATENT_UPSCALERS, BaseEngine
+from .vae_memory import vae_scope
+from .images import Image, load_mask, load_rgb, next_output_path, resize_image, save_png
+from .params import GenerationParams, GenerationRequest, center_crop_box, hires_steps, img2img_steps, resolve_seed
+from .protocol import (INTERRUPTED, INVALID_PARAMS, MODEL_LOAD_FAILED, NO_MODEL, UNSUPPORTED, EngineError,
+                       JobContext)
+
+log = logging.getLogger("sdfx.engine")
+
+PIPELINE_CLASSES = {
+    "sd15": "StableDiffusionPipeline",
+    "sd2": "StableDiffusionPipeline",
+    "sd15-inpaint": "StableDiffusionInpaintPipeline",
+    "sdxl": "StableDiffusionXLPipeline",
+    "sdxl-inpaint": "StableDiffusionXLInpaintPipeline",
+}
+
+MAX_LORAS = 6        # resident LoRA adapters (LRU)
+MAX_CONTROLNETS = 2  # resident ControlNet models (LRU)
+MAX_DERIVED = 6      # cached from_pipe pipelines (LRU)
+
+DTYPES = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}
+
+
+class ScheduledEmbeds(dict):
+    """Embeddings for step 1, plus `schedule` = [(end_step, embeds), ...] when the prompt changes mid-sampling."""
+    schedule: list = []
+
+
+def slerp(val: float, low, high):
+    """A1111 slerp used for variation seeds (per batch row)."""
+    low_norm = low / torch.norm(low, dim=1, keepdim=True)
+    high_norm = high / torch.norm(high, dim=1, keepdim=True)
+    dot = (low_norm * high_norm).sum(1)
+    if dot.mean() > 0.9995:
+        return low * val + high * (1 - val)
+    omega = torch.acos(dot)
+    so = torch.sin(omega)
+    return (torch.sin((1.0 - val) * omega) / so).unsqueeze(1) * low + (torch.sin(val * omega) / so).unsqueeze(1) * high
+
+
+def _accepts(fn, name: str) -> bool:
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return True
+    return name in sig.parameters or any(p.kind == p.VAR_KEYWORD for p in sig.parameters.values())
+
+
+def _filter_kwargs(fn, kw: dict) -> dict:
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return kw
+    if any(p.kind == p.VAR_KEYWORD for p in params.values()):
+        return kw
+    return {k: v for k, v in kw.items() if k in params}
+
+
+def _hf_hint(e: BaseException) -> str:
+    t = str(e).lower()
+    if "offline" in t or "connect" in t or "huggingface" in t or "hf_hub" in t:
+        return " (diffusers needs base model configs from the Hugging Face cache; run once online, then HF_HUB_OFFLINE=1 works)"
+    return ""
+
+
+PICKLE_REFUSED = "legacy pickle {what} refused for safety; convert to .safetensors"
+
+
+class _InertStub:
+    """Data-only stand-in for harmless training metadata objects pickled into old .ckpt/.pt files."""
+
+    def __setstate__(self, state):
+        self.__dict__["_state"] = state
+
+
+# Globals that old A1111-era checkpoints/VAEs pickle as metadata only (training callbacks). They are mapped to
+# inert stubs under torch's weights_only unpickler: no foreign code is imported or executed.
+INERT_GLOBALS = ["pytorch_lightning.callbacks.model_checkpoint.ModelCheckpoint"]
+
+
+def _inert_stubs() -> list:
+    out = []
+    for full in INERT_GLOBALS:
+        mod, _, name = full.rpartition(".")
+        out.append(type(name, (_InertStub,), {"__module__": mod, "__qualname__": name}))
+    return out
+
+
+def safe_torch_load(path: str, what: str = "checkpoint"):
+    """torch.load restricted to tensors/primitives (weights_only=True). Never falls back to full unpickling."""
+    try:
+        sg = getattr(torch.serialization, "safe_globals", None)
+        if sg is not None:
+            with sg(_inert_stubs()):
+                return torch.load(path, map_location="cpu", weights_only=True)
+        return torch.load(path, map_location="cpu", weights_only=True)
+    except Exception as e:
+        raise EngineError(UNSUPPORTED, f"{PICKLE_REFUSED.format(what=what)}: {os.path.basename(path)} ({type(e).__name__})")
+
+
+def _ckpt_kind_from_torch(path: str) -> str:
+    """Kind detection for .ckpt/.pt checkpoints (weights_only load; refuses pickles that need code execution)."""
+    sd = safe_torch_load(path, "checkpoint")
+    if isinstance(sd, dict) and "state_dict" in sd and isinstance(sd["state_dict"], dict):
+        sd = sd["state_dict"]
+    if not isinstance(sd, dict):
+        return "unknown"
+    hdr = {k: {"shape": list(v.shape)} for k, v in sd.items() if hasattr(v, "shape")}
+    del sd
+    gc.collect()
+    return models.detect_kind_from_header(hdr)
+
+
+class Engine(BaseEngine):
+    dry_run = False
+
+    def __init__(self):
+        super().__init__()
+        self.cuda = torch.cuda.is_available()
+        self.device = torch.device("cuda" if self.cuda else "cpu")
+        self.pipe = None
+        self.kind: Optional[str] = None
+        self.sdxl = False
+        self.flags: dict = {}
+        self.dtype = torch.float16 if self.cuda else torch.float32
+        self.orig_vae = None
+        self.vae_info: Optional[dict] = None
+        self.base_sched_config: dict = {}
+        self.derived: "OrderedDict[tuple, Any]" = OrderedDict()   # LRU of from_pipe pipelines
+        self.loaded_loras: "OrderedDict[str, str]" = OrderedDict()  # adapter -> path, LRU
+        self._photomaker_adapter_owner = None
+        self.dynamic_dora_adapters: set[str] = set()
+        self._dora_weight_handles = []
+        self._dora_step_weights = {}
+        self.hook_owner = None
+        self._pre: Optional[list] = None
+        self._sampler_ok: Optional[dict] = None  # pipeline whose accelerate offload hooks are installed (offload modes)
+        self.loaded_embeddings: set[str] = set()
+        self.loaded_embedding_files: dict[str, str] = {}
+        self.embedding_token_owners: dict[str, dict[str, list[str]]] = {}
+        self.cn_cache: "OrderedDict[str, Any]" = OrderedDict()  # path -> ControlNetModel, LRU
+        self.taesd = preview.TaesdPreviewer()
+        self._extra: dict = {}
+        self._ms_overrides: dict = {}
+        self.ext_cache: dict = {}
+        self.ip_state = adapters.IPAdapterState()
+        self.parked = False
+        self._owns_shared_cache = True
+
+    # -- info ---------------------------------------------------------------
+    def hello(self) -> dict:
+        h = super().hello()
+        h["torch"] = torch.__version__
+        h["diffusers"] = diffusers.__version__
+        h["cuda"] = bool(self.cuda)
+        if self.cuda:
+            props = torch.cuda.get_device_properties(0)
+            h["device"] = f"cuda:0 {props.name}"
+            h["vram_mb"] = int(props.total_memory // (1024 * 1024))
+        else:
+            h["device"] = "cpu"
+        return h
+
+    def features(self) -> list[str]:
+        # Temperature guard uses step callbacks and does not alter model weights.
+        f = ["clip_interrogator", "controlnet_preprocess_extras", "controlnet_fastload_data", "conditioning_highres_fix", "model_keyword", "embedding_merge", "metadata_utils", "img2img_hires_fix", "hires_fix_tweaks", "token_downsampling", "vram_estimator", "steps_animation", "pnginfo_injection", "gpu_temperature_guard", "freeu", "dynamic_thresholding", "hypertile", "system_info", "vae_tools", "prevent_interrupt"]
+        f += self._batch_features()
+        if cn_mod._has("cv2"):
+            f.append("inpaint_difference")
+        from . import nsfw_checker
+        if nsfw_checker.available():
+            f.append("nsfw_checker")
+        from . import aesthetic_score
+        if aesthetic_score.available():
+            f.append("aesthetic_score")
+        from . import chara_searcher
+        if chara_searcher.available():
+            f.append("chara_searcher")
+        if hasattr(diffusers, "StableDiffusionXLPAGPipeline"):
+            f.append("pag")
+        if hasattr(diffusers, "ControlNetModel"):
+            f.append("controlnet")
+        if cn_mod.has_controlnet_aux():
+            f.append("controlnet_aux")
+        if cn_mod._has("cv2"):
+            f.append("temporal_lab")
+            if cn_mod._has("torchvision"):
+                f.append("cn_animation")
+        if upscalers.has_spandrel():
+            f.append("spandrel")
+        if hasattr(diffusers, "AutoencoderTiny"):
+            f.append("taesd")
+        f += ["apg", "mahiro", "rescale_cfg", "model_sampling", "kohya_hrfix", "multidiffusion", "latent_modifier",
+              "soft_inpainting", "neveroom", "reference", "revision", "ip_adapter", "controllllite", "fooocus_inpaint",
+              "img2imgalt", "semantic_guidance", "agent_attention", "cd_tuner", "characteristic_guidance", "incantations", "sonar", "llul", "aesthetic_gradients", "caption", "ldsr", "adetailer", "batch_face_swap", "weight_gradient", "negpip", "neutral_prompt", "tokenizer", "prompt_fusion", "save_intermediate", "latent_upscale", "composable_lora", "loopback_scaler", "animatediff", "clip_io", "compile", "deepcache", "tgate", "cfg_cache", "postdiff"]
+        f += list(ext_mod.sampling_ext.HOOKS)
+        if hasattr(diffusers, "StableDiffusionSAGPipeline"):
+            f.append("sag")
+        if adapters.photomaker_available():
+            f.append("photomaker")
+        if upscalers.has_spandrel() and cn_mod._has("cv2"):
+            f.append("face_restore")
+        if hasattr(diffusers, "StableVideoDiffusionPipeline"):
+            f.append("img2vid")
+        f.append("novel_view")
+        if hasattr(diffusers, "MarigoldDepthPipeline"):
+            f.append("marigold")
+        if extras.code_allowed():
+            f.append("custom_code")
+        return f
+
+    def preprocessors(self) -> list[str]:
+        if self._pre is None:
+            self._pre = cn_mod.available_preprocessors()
+        return self._pre
+
+    def sampler_supported(self, name: str) -> bool:
+        if self._sampler_ok is None:
+            self._sampler_ok = {r["name"]: r["supported"] for r in schedulers.sampler_list(True)}
+        try:
+            return self._sampler_ok.get(schedulers.sampler_spec(name).name, False)
+        except ValueError:
+            return False
+
+    def check_model_upscaler(self, name: str, upscaler_paths: dict) -> None:
+        super().check_model_upscaler(name, upscaler_paths)
+        if not upscalers.has_spandrel():
+            raise EngineError(UNSUPPORTED, f"upscaler '{name}' needs the spandrel package")
+
+    def memory(self, params: dict, ctx: JobContext) -> dict:
+        m = super().memory(params, ctx)
+        if self.cuda:
+            m["allocated_mb"] = round(torch.cuda.memory_allocated() / 2**20, 1)
+            m["reserved_mb"] = round(torch.cuda.memory_reserved() / 2**20, 1)
+            m["total_mb"] = round(torch.cuda.get_device_properties(0).total_memory / 2**20, 1)
+        return m
+
+    def on_oom(self) -> None:
+        gc.collect()
+        if self.cuda:
+            torch.cuda.empty_cache()
+
+    # -- model management --------------------------------------------------
+    def _free(self):
+        self.pipe = None
+        self.ip_state = adapters.IPAdapterState()
+        self.orig_vae = None
+        self._drop_hooks()
+        self.derived.clear()
+        self.cn_cache.clear()
+        self.loaded_loras.clear()
+        self._photomaker_adapter_owner = None
+        for handle in self._dora_weight_handles:
+            handle.remove()
+        self._dora_weight_handles.clear()
+        self._dora_step_weights.clear()
+        self.dynamic_dora_adapters.clear()
+        self.loaded_embeddings.clear()
+        self.loaded_embedding_files.clear()
+        getattr(self, "embedding_token_owners", {}).clear()
+        self._embedding_reload_error = None
+        getattr(self, "embedding_snapshots", {}).clear()
+        getattr(self, "lora_snapshots", {}).clear()
+        self.model = None
+        self.vae_info = None
+        self.taesd = preview.TaesdPreviewer()
+        if getattr(self, "_owns_shared_cache", True):
+            upscalers.unload_models()
+        gc.collect()
+        if self.cuda:
+            torch.cuda.empty_cache()
+
+    def unload(self, params: dict, ctx: JobContext) -> dict:
+        self._free()
+        return {}
+
+    @property
+    def _offload(self) -> bool:
+        return self.cuda and self.load_opts.vram_mode in ("model_offload", "sequential_offload")
+
+    def _drop_hooks(self):
+        if self.hook_owner is not None:
+            try:
+                # Accelerate may rematerialize PEFT parameters created during
+                # inference. Their requires_grad flag cannot be restored outside
+                # inference mode even though the model is never trained here.
+                with torch.inference_mode():
+                    self.hook_owner.remove_all_hooks()
+            except Exception:
+                pass
+            self.hook_owner = None
+
+    def _place(self, pipe):
+        """Put a pipeline on the device per vram_mode. Offload hooks live on exactly one pipeline at a time;
+        derived (from_pipe) pipelines share the modules, so switching pipelines moves the hooks."""
+        mode = self.load_opts.vram_mode
+        if not self.cuda:
+            pipe.to("cpu")
+        elif mode == "model_offload":
+            self._drop_hooks()
+            with torch.inference_mode():
+                pipe.enable_model_cpu_offload()
+            self.hook_owner = pipe
+        elif mode == "sequential_offload":
+            self._drop_hooks()
+            with torch.inference_mode():
+                pipe.enable_sequential_cpu_offload()
+            self.hook_owner = pipe
+        else:
+            pipe.to(self.device)
+
+    def park(self):
+        """Move the SD pipeline off the GPU (gpu mode) so another model (SVD, novel view) can use the VRAM."""
+        if self.pipe is not None and self.cuda and not self._offload and not self.parked:
+            self.pipe.to("cpu")
+            self.parked = True
+            torch.cuda.empty_cache()
+
+    def _activate(self, pipe):
+        """Make `pipe` ready to run (offload modes: move the accelerate hooks to it; gpu mode: move new modules)."""
+        if self.parked and self.cuda and not self._offload:
+            self.pipe.to(self.device)
+            self.parked = False
+        if self._offload:
+            if pipe is not self.hook_owner:
+                self._place(pipe)
+        elif self.cuda:
+            for name in ("controlnet",):
+                m = getattr(pipe, name, None)
+                if m is not None and hasattr(m, "to"):
+                    m.to(self.device)
+
+    def load_model(self, params: dict, ctx: JobContext) -> dict:
+        t0 = time.monotonic()
+        req = self.parse_load(params)
+        if req.fp8_storage and not self.cuda:
+            raise EngineError(UNSUPPORTED, "fp8_storage needs a CUDA device")
+        kind = models.detect_kind(req.path)
+        if kind == "unknown" and not req.path.lower().endswith(".safetensors"):
+            kind = _ckpt_kind_from_torch(req.path)
+        if kind == "unknown":
+            kind = "sd15"
+            ctx.warn("could not detect the model type; assuming SD1.5")
+        if kind not in PIPELINE_CLASSES:
+            raise EngineError(MODEL_LOAD_FAILED, f"unsupported model architecture ({kind}): {os.path.basename(req.path)}")
+        requested_mode = req.vram_mode
+        reason = "requested"
+        if req.vram_mode == "auto" and req.fp8_storage:
+            # Preserve the current pipeline if auto cannot safely choose the only
+            # mode supported by fp8. Its memory may become available after unload,
+            # but cannot be counted reliably while the live pipeline still owns it.
+            mode, reason = self._auto_vram_mode(req, kind)
+            if mode != "gpu":
+                raise EngineError(UNSUPPORTED, "fp8_storage needs the 'gpu' VRAM mode; "
+                                  "auto cannot confirm it with the current free VRAM. "
+                                  "Unload the current model and retry auto, or explicitly request gpu mode.")
+            req.vram_mode = mode
+            ctx.log("info", f"VRAM mode auto -> {mode} ({reason}; before unloading current model)")
+        self._free()
+        self.vram_requested = requested_mode
+        if req.vram_mode == "auto":
+            req.vram_mode, reason = self._auto_vram_mode(req, kind)
+            ctx.log("info", f"VRAM mode auto -> {req.vram_mode} ({reason})")
+        self.load_opts = req
+        self.vram_reason = reason
+        self.dtype = DTYPES[req.dtype] if self.cuda else torch.float32
+        flags = {}
+        if req.path.lower().endswith(".safetensors"):
+            try:
+                flags = models.checkpoint_flags(models.read_safetensors_header(req.path))
+            except Exception:
+                flags = {}
+        cls = getattr(diffusers, PIPELINE_CLASSES[kind])
+        kw: dict = {"torch_dtype": self.dtype}
+        if not kind.startswith("sdxl"):
+            kw.update(safety_checker=None, requires_safety_checker=False)
+        try:
+            pipe = cls.from_single_file(req.path, **kw)
+        except Exception as e:
+            raise EngineError(MODEL_LOAD_FAILED, f"failed to load {os.path.basename(req.path)}: {e}{_hf_hint(e)}",
+                              traceback.format_exc())
+        pipe.set_progress_bar_config(disable=True)
+        self.kind = kind
+        self.sdxl = kind.startswith("sdxl")
+        self.flags = flags
+        self.base_sched_config = dict(pipe.scheduler.config)
+        self.pipe = pipe
+        self.orig_vae = pipe.vae
+        perf.apply_vae(pipe.vae, req)
+        if req.vae_path:
+            self._swap_vae(req.vae_path, ctx)
+        try:
+            self._place(pipe)
+            if self.cuda:
+                perf.apply_unet(pipe, req, self.dtype)
+        except EngineError:
+            self._free()
+            raise
+        except Exception as e:
+            self._free()
+            raise EngineError(MODEL_LOAD_FAILED, f"failed to move model to device: {e}", traceback.format_exc())
+        self.model = {"name": models.model_name(req.path), "path": req.path, "kind": kind,
+                      "hash": models.short_hash(req.path), "model_token": uuid.uuid4().hex}
+        return self._loaded(int((time.monotonic() - t0) * 1000))
+
+    def _auto_vram_mode(self, req, kind: str) -> tuple[str, str]:
+        if not self.cuda:
+            return "gpu", "no CUDA device"
+        from .vae_memory import free_bytes
+        free_mb = free_bytes() / 2**20
+        return perf.resolve_vram_mode("auto", weights_mb=perf.checkpoint_weights_mb(req.path) * (2.0 if req.dtype == "fp32" else 1.0),
+                                      free_mb=free_mb, kind=kind)
+
+    def _loaded(self, ms: int = 0) -> dict:
+        m = dict(self.model)
+        m["loaded_ms"] = ms
+        m["optimizations"] = perf.describe(self.load_opts, getattr(self, "vram_reason", ""))
+        m["vae_name"] = self.vae_info["vae_name"] if self.vae_info else None
+        m["vae_hash"] = self.vae_info["vae_hash"] if self.vae_info else None
+        m["vae_path"] = self.vae_info["path"] if self.vae_info else None
+        return m
+
+    def _load_vae_module(self, path: str):
+        from diffusers import AutoencoderKL  # type: ignore
+        if os.path.isdir(path):
+            return AutoencoderKL.from_pretrained(path, torch_dtype=self.dtype)
+        from diffusers.loaders.single_file_utils import convert_ldm_vae_checkpoint, load_single_file_checkpoint  # type: ignore
+        if path.lower().endswith(".safetensors"):
+            sd = load_single_file_checkpoint(path)
+        else:
+            sd = safe_torch_load(path, "VAE")
+        if isinstance(sd, dict) and "state_dict" in sd and isinstance(sd["state_dict"], dict):
+            sd = sd["state_dict"]
+        cfg = dict(self.orig_vae.config)
+        vae = AutoencoderKL.from_config(cfg)
+        if any(k.startswith("encoder.down.") or k.startswith("first_stage_model.") or k.startswith("decoder.up.") for k in sd):
+            sd = convert_ldm_vae_checkpoint(sd, vae.config)
+        missing, unexpected = vae.load_state_dict(sd, strict=False)
+        if missing:
+            raise ValueError(f"VAE state dict mismatch ({len(missing)} missing keys, e.g. {missing[:3]})")
+        return vae.to(dtype=self.dtype)
+
+    def _swap_vae(self, path: Optional[str], ctx: JobContext):
+        pipe = self.pipe
+        if path:
+            try:
+                vae = self._load_vae_module(path)
+            except EngineError:
+                raise
+            except Exception as e:
+                raise EngineError(MODEL_LOAD_FAILED, f"failed to load VAE {os.path.basename(path)}: {e}", traceback.format_exc())
+            perf.apply_vae(vae, self.load_opts)
+            self.vae_info = {"vae_name": models.model_name(path), "vae_hash": models.path_hash(path), "path": path}
+        else:
+            vae = self.orig_vae
+            self.vae_info = None
+        pipe.vae = vae
+        self._drop_hooks()
+        self.derived.clear()
+
+    def set_vae(self, params: dict, ctx: JobContext) -> dict:
+        if self.pipe is None:
+            raise EngineError(NO_MODEL, "no model loaded")
+        path = params.get("path")
+        if path and not os.path.exists(path):
+            raise EngineError(MODEL_LOAD_FAILED, f"VAE file not found: {path}")
+        self._drop_hooks()
+        self._swap_vae(path or None, ctx)
+        self.load_opts.vae_path = path or None
+        self._place(self.pipe)
+        return self._loaded()
+
+    # -- pipelines -----------------------------------------------------------
+    def _get_pipe(self, task: str, controlnets: Optional[list] = None, pag: Optional[dict] = None):
+        """task: txt2img | img2img | inpaint. Derived pipelines share all components with the base pipe."""
+        base_task = "inpaint" if self.kind.endswith("inpaint") else "txt2img"
+        cn_paths = tuple(p for p, _ in controlnets or [])
+        key = (task, cn_paths, tuple(pag["layers"]) if pag else None)
+        if task == base_task and not controlnets and not pag:
+            return self.pipe
+        if key in self.derived:
+            self.derived.move_to_end(key)
+            return self.derived[key]
+        controlnets = [m for _, m in controlnets or []]
+        from diffusers import AutoPipelineForImage2Image, AutoPipelineForInpainting, AutoPipelineForText2Image  # type: ignore
+        auto = {"txt2img": AutoPipelineForText2Image, "img2img": AutoPipelineForImage2Image,
+                "inpaint": AutoPipelineForInpainting}[task]
+        kw: dict = {}
+        if controlnets:
+            kw["controlnet"] = controlnets[0] if len(controlnets) == 1 else list(controlnets)
+        if pag:
+            kw["enable_pag"] = True
+            kw["pag_applied_layers"] = pag["layers"]
+        p = auto.from_pipe(self.pipe, **kw)
+        p.set_progress_bar_config(disable=True)
+        self.derived[key] = p
+        while len(self.derived) > MAX_DERIVED:
+            _, old = self.derived.popitem(last=False)
+            if old is self.hook_owner:
+                self._drop_hooks()
+        return p
+
+    def _evict_controlnet(self, path: str):
+        self.cn_cache.pop(path, None)
+        for k in [k for k in self.derived if path in k[1]]:
+            if self.derived[k] is self.hook_owner:
+                self._drop_hooks()
+            del self.derived[k]
+        gc.collect()
+        if self.cuda:
+            torch.cuda.empty_cache()
+
+    # -- loras / embeddings ----------------------------------------------------
+    def _set_inference_adapters(self, pipe, names, weights):
+        # Accelerate can move trainable PEFT parameters during sampling while
+        # inference mode is active. On a later job PEFT toggles requires_grad
+        # again; PyTorch permits that for inference tensors only inside the
+        # same mode. This worker is inference-only and does not train adapters.
+        from contextlib import nullcontext
+        with torch.inference_mode() if self._offload else nullcontext():
+            pipe.set_adapters(names, adapter_weights=weights)
+
+    def _set_inference_lora_enabled(self, pipe, enabled):
+        # PEFT's enable operation also reactivates adapters and toggles their
+        # gradient flags, including after an intervening no-LoRA job.
+        from contextlib import nullcontext
+        with torch.inference_mode() if self._offload else nullcontext():
+            (pipe.enable_lora if enabled else pipe.disable_lora)()
+
+    def _apply_loras(self, gp: GenerationParams, req: GenerationRequest, ctx: JobContext) -> dict:
+        hashes: dict = {}
+        pipe = self.pipe
+        for handle in self._dora_weight_handles:
+            handle.remove()
+        self._dora_weight_handles.clear()
+        self._dora_step_weights.clear()
+        if hooks_mod.hook_config(gp.hooks, "composable_lora", {}) is not None:
+            self._lora_windows, self._lora_state = [], ([], [])
+            if self.loaded_loras:
+                self._set_inference_lora_enabled(pipe, False)
+            try:
+                self._composable_job = composable_lora.Job(pipe, gp, req, ctx)
+            except (ValueError, KeyError, OverflowError, RecursionError) as exc:
+                raise EngineError(INVALID_PARAMS, f"Composable LoRA: {exc}") from exc
+            return {adapter.name: models.short_hash(adapter.path) for adapter in self._composable_job.adapters.values()}
+        want = []
+        self._lora_windows = []
+        self._lora_key = None
+        self._lora_state = ([], [])
+        for lr in gp.loras:
+            path = req.lora_paths[lr.name]
+            if not os.path.isfile(path):
+                ctx.warn(f"LoRA file not found: {path}")
+                continue
+            te = float(lr.weight)
+            unet = float(lr.unet) if lr.unet is not None else te
+            if lr.lbw:
+                try:
+                    bw = lora_blocks.parse_weights(lr.lbw, self.sdxl, req.lbw_presets)
+                except ValueError as e:
+                    raise EngineError(INVALID_PARAMS, f"LoRA '{lr.name}': {e}")
+                scale = lora_blocks.diffusers_scales(bw, self.sdxl, unet, te)
+            elif lr.unet is not None or lr.start is not None or lr.stop is not None:
+                scale = lora_blocks.plain_scales(self.sdxl, unet, te)
+            else:
+                scale = te
+            want.append((lr.name, path, scale, lr.start, lr.stop, lr.dyn, bool(lr.lbw), te, unet))
+            hashes[lr.name] = models.short_hash(path)
+        if not want:
+            if self.loaded_loras:
+                try:
+                    self._set_inference_lora_enabled(pipe, False)
+                except Exception:
+                    pass
+            return hashes
+        names, weights, dora_weights, dora_blocks = [], [], {}, {}
+        for name, path, w, start, stop, dyn, has_blocks, te, unet in want:
+            identity = os.path.abspath(path) + (f'\0dynamic-rank={dyn}' if dyn is not None else '')
+            adapter = "l" + hashlib.sha1(identity.encode()).hexdigest()[:12]
+            if adapter in self.loaded_loras:
+                self.loaded_loras.move_to_end(adapter)
+            else:
+                dora_keys = False
+                inspected_state = None
+                try:
+                    from .resource_hashes import FileSnapshot
+                    snapshot = FileSnapshot.capture(path)
+                    if dyn is None and str(path).lower().endswith('.safetensors'):
+                        from safetensors import safe_open
+                        with safe_open(path, framework='pt', device='cpu') as source:
+                            dora_keys = any('lora_magnitude_vector' in key or 'dora_scale' in key for key in source.keys())
+                    elif dyn is None and str(path).lower().endswith(('.pt', '.pth', '.bin', '.ckpt')):
+                        inspected_state = safe_torch_load(path, 'LoRA')
+                        if isinstance(inspected_state, dict) and 'state_dict' in inspected_state:
+                            inspected_state = inspected_state['state_dict']
+                        if not isinstance(inspected_state, dict):
+                            raise EngineError(INVALID_PARAMS, 'LoRA does not contain a state dictionary')
+                        dora_keys = any('lora_magnitude_vector' in key or 'dora_scale' in key for key in inspected_state)
+                    if dyn is None and not dora_keys:
+                        pipe.load_lora_weights(path, adapter_name=adapter)
+                    else:
+                        from .dynamic_lora import truncate_state_dict, load_kohya_dora
+                        if str(path).lower().endswith('.safetensors'):
+                            from safetensors.torch import load_file
+                            state = load_file(path, device='cpu')
+                        elif inspected_state is not None:
+                            state = inspected_state
+                        else:
+                            state = safe_torch_load(path, 'LoRA')
+                            if isinstance(state, dict) and 'state_dict' in state:
+                                state = state['state_dict']
+                        if not isinstance(state, dict):
+                            raise EngineError(INVALID_PARAMS, 'dynamic-rank LoRA does not contain a state dictionary')
+                        dora = any('lora_magnitude_vector' in key or 'dora_scale' in key for key in state)
+                        if FileSnapshot.identity_of(path) != snapshot.identity:
+                            raise EngineError(INVALID_PARAMS, 'LoRA changed while loading dynamic rank')
+                        transformed = truncate_state_dict(state, dyn if dyn is not None else 2 ** 31 - 1,
+                                                          allow_peft_dora=True, allow_kohya_dora=True)
+                        if any('dora_scale' in key for key in state):
+                            try:
+                                load_kohya_dora(pipe, transformed, adapter)
+                            except BaseException:
+                                try:
+                                    pipe.delete_adapters([adapter])
+                                except Exception:
+                                    pass
+                                raise
+                        else:
+                            pipe.load_lora_weights(transformed, adapter_name=adapter)
+                        if dora:
+                            self.dynamic_dora_adapters.add(adapter)
+                    if not hasattr(self, "lora_snapshots"):
+                        self.lora_snapshots = {}
+                    self.lora_snapshots[adapter] = snapshot
+                    self.loaded_loras[adapter] = path
+                except EngineError:
+                    raise
+                except Exception as e:
+                    if dyn is not None or dora_keys:
+                        raise EngineError(UNSUPPORTED, f"LoRA '{name}' dynamic rank/DoRA could not be applied: {e}") from e
+                    ctx.warn(f"LoRA '{name}' could not be loaded: {str(e).splitlines()[0] if str(e) else type(e).__name__}")
+                    hashes.pop(name, None)
+                    continue
+            if hooks_mod.hook_config(gp.hooks, "pnginfo_injection", {}) is not None:
+                try:
+                    hashes[name] = self.lora_snapshots[adapter].digest()
+                except (KeyError, OSError, ValueError) as error:
+                    hashes.pop(name, None)
+                    ctx.warn(f"Resource hash unavailable for LoRA {name}: {error}")
+            names.append(adapter)
+            if adapter in self.dynamic_dora_adapters:
+                weights.append(1.0)
+                dora_weights[adapter] = {'unet': unet, 'text_encoder': te, 'text_encoder_2': te}
+                if has_blocks:
+                    dora_blocks[adapter] = (len(names) - 1, w)
+                else:
+                    self._dora_step_weights[len(names) - 1] = [(dora_weights[adapter], unet)]
+            else:
+                weights.append(w)
+            if start is not None or stop is not None:
+                self._lora_windows.append((len(names) - 1, start, stop))
+        stale = [a for a in self.loaded_loras if a not in names]
+        while len(self.loaded_loras) > MAX_LORAS and stale:
+            a = stale.pop(0)
+            try:
+                pipe.delete_adapters([a])
+            except Exception as e:
+                log.debug("delete_adapters(%s) failed: %s", a, e)
+            self.loaded_loras.pop(a, None)
+            self.dynamic_dora_adapters.discard(a)
+            getattr(self, "lora_snapshots", {}).pop(a, None)
+        if names:
+            try:
+                self._set_inference_lora_enabled(pipe, True)
+            except Exception:
+                pass
+            try:
+                components = [(component, getattr(pipe, component, None)) for component in
+                              ('unet', 'text_encoder', 'text_encoder_2')]
+                if dora_blocks:
+                    from .dynamic_lora import capture_dora_block_weights
+                    probe = list(weights)
+                    for index, scale in dora_blocks.values():
+                        probe[index] = scale
+                    try:
+                        self._set_inference_adapters(pipe, names, probe)
+                        captured = capture_dora_block_weights(components, dora_blocks)
+                    finally:
+                        self._set_inference_adapters(pipe, names, weights)
+                    for adapter, (index, _) in dora_blocks.items():
+                        dora_weights[adapter] = captured[adapter]
+                        self._dora_step_weights[index] = [(values, values['unet'])
+                            for (component, _), values in captured[adapter].items() if component == 'unet']
+                self._set_inference_adapters(pipe, names, weights)
+                if dora_weights:
+                    from .dynamic_lora import install_dora_weight_hooks
+                    self._dora_weight_handles = install_dora_weight_hooks(components, dora_weights)
+            except (ValueError, KeyError, TypeError) as e:
+                raise EngineError(INVALID_PARAMS, f"LoRA block weights could not be applied: {e}")
+            self._lora_state = (names, weights)
+        else:
+            self._lora_state = ([], [])
+            if self.loaded_loras:
+                try:
+                    self._set_inference_lora_enabled(pipe, False)
+                except Exception:
+                    pass
+        return hashes
+
+    def _load_embeddings(self, req: GenerationRequest, texts: list[str], ctx: JobContext):
+        pipe = self.pipe
+        joined = " ".join(texts)
+        paths = [path for path in req.embedding_paths
+                 if os.path.splitext(os.path.basename(path))[0] not in self.loaded_embeddings]
+        if len({os.path.splitext(os.path.basename(path))[0] for path in paths}) < len(paths):
+            from .embedding_merge_files import requested_paths
+            widths = {'clip_l': pipe.text_encoder.get_input_embeddings().weight.shape[1]}
+            if self.sdxl:
+                widths['clip_g'] = pipe.text_encoder_2.get_input_embeddings().weight.shape[1]
+            try:
+                paths = requested_paths(paths, texts, widths)
+            except (ValueError, OSError) as error:
+                raise EngineError(INVALID_PARAMS, f"Embedding file selection: {error}") from error
+        for path in paths:
+            token = os.path.splitext(os.path.basename(path))[0]
+            if token in self.loaded_embeddings or not os.path.isfile(path) \
+                    or not re.search(r"(?<![\w-])" + re.escape(token) + r"(?![\w-])", joined):
+                continue
+            try:
+                from .resource_hashes import FileSnapshot
+                snapshot = FileSnapshot.capture(path)
+                if path.lower().endswith(".safetensors"):
+                    from safetensors.torch import load_file  # type: ignore
+                    sd = load_file(path)
+                else:
+                    try:
+                        sd = safe_torch_load(path, "embedding")
+                    except EngineError as e:
+                        ctx.warn(e.message)
+                        self.loaded_embeddings.add(token)
+                        continue
+                before_l = set(pipe.tokenizer.get_added_vocab())
+                before_g = set(pipe.tokenizer_2.get_added_vocab()) if self.sdxl else set()
+                if self.sdxl and not (isinstance(sd, dict) and "clip_g" in sd and "clip_l" in sd):
+                    ctx.warn(f"embedding '{token}' is not an SDXL embedding; skipped")
+                    self.loaded_embeddings.add(token)
+                    continue
+                if not self.sdxl and isinstance(sd, dict) and "clip_g" in sd:
+                    ctx.warn(f"embedding '{token}' is an SDXL embedding; skipped")
+                    self.loaded_embeddings.add(token)
+                    continue
+                def load_embedding():
+                    if self.sdxl:
+                        pipe.load_textual_inversion(sd["clip_g"], token=token, text_encoder=pipe.text_encoder_2,
+                                                    tokenizer=pipe.tokenizer_2)
+                        pipe.load_textual_inversion(sd["clip_l"], token=token, text_encoder=pipe.text_encoder,
+                                                    tokenizer=pipe.tokenizer)
+                    else:
+                        pipe.load_textual_inversion(sd, token=token)
+                try:
+                    BaseEngine._with_embedding_encoder_access(self, load_embedding)
+                except BaseException as failure:
+                    # A loader may mutate one encoder or tokenizer before it raises.
+                    # Never leave that partially modified model available for inference.
+                    try:
+                        if self.pipe is not None:
+                            self._free()
+                    except BaseException as cleanup_error:
+                        failure.add_note(f"model unload also failed: {cleanup_error}")
+                    self._embedding_reload_error = str(failure)
+                    raise EngineError(NO_MODEL,
+                        f"Embedding '{token}' failed during loading; the checkpoint was unloaded; reload the checkpoint: {failure}") from failure
+                self.embedding_token_owners[token] = {
+                    "clip_l": sorted(set(pipe.tokenizer.get_added_vocab()) - before_l),
+                    **({"clip_g": sorted(set(pipe.tokenizer_2.get_added_vocab()) - before_g)} if self.sdxl else {}),
+                }
+                self.loaded_embedding_files[token] = path
+                if not hasattr(self, "embedding_snapshots"):
+                    self.embedding_snapshots = {}
+                self.embedding_snapshots[token] = snapshot
+                self.loaded_embeddings.add(token)
+            except Exception as e:
+                if getattr(self, "_embedding_reload_error", None):
+                    raise
+                ctx.warn(f"embedding '{token}' could not be loaded: {str(e).splitlines()[0] if str(e) else type(e).__name__}")
+                self.loaded_embeddings.add(token)
+
+    # -- prompts -------------------------------------------------------------
+    def _merge_encoding(self, pos, neg, operation):
+        from .embedding_merge_backend import run_encoded
+        context = getattr(self, '_embedding_merge_ctx', None)
+        check = (lambda: context.check_interrupt()) if context is not None else lambda: None
+        try:
+            return run_encoded(self, (pos, neg), operation, check=check)
+        except (ValueError, KeyError) as error:
+            if "<'" not in pos + neg and "{'" not in pos + neg:
+                raise
+            raise EngineError(INVALID_PARAMS, f"Embedding Merge: {error}") from error
+
+    def _encode(self, pos: str, neg: str, gp: GenerationParams, bs: int) -> dict:
+        return self._merge_encoding(pos, neg, lambda texts: self._encode_unmerged(texts[0], texts[1], gp, bs))
+
+    def _encode_unmerged(self, pos: str, neg: str, gp: GenerationParams, bs: int) -> dict:
+        if hooks_mod.hook_config(gp.hooks, "negpip", {}) is not None:
+            return negpip.encode(self, prompt.strip_extra_networks(pos), prompt.strip_extra_networks(neg), gp, bs)
+        return self._encode_plain(pos, neg, gp, bs)
+
+    def _encode_plain(self, pos: str, neg: str, gp: GenerationParams, bs: int) -> dict:
+        pipe = self.pipe
+        pos = prompt.strip_extra_networks(pos)
+        neg = prompt.strip_extra_networks(neg)
+        aesthetic = hooks_mod.hook_config(gp.hooks, "aesthetic_gradients", aesthetic_gradients.DEFAULTS)
+        if aesthetic is not None:
+            aesthetic = aesthetic_gradients.normalize(aesthetic)
+
+        def aesthetic_encode(text, oc):
+            plain = ((lambda p, t: prompt.encode_sdxl(p, t, gp.clip_skip)) if self.sdxl
+                     else (lambda p, t: prompt.encode_sd15(p, t, gp.clip_skip, oc)))
+            return aesthetic_gradients.encode_prompt(self, pipe, text, gp, aesthetic, plain)
+        with torch.no_grad():
+            if self.sdxl:
+                pe, pp = (aesthetic_encode(pos, False) if aesthetic is not None and not aesthetic["negative"]
+                          else prompt.encode_sdxl(pipe, pos, gp.clip_skip))
+                if neg.strip() == "":
+                    ne, npool = torch.zeros_like(pe), torch.zeros_like(pp)
+                elif aesthetic is not None and aesthetic["negative"]:
+                    ne, npool = aesthetic_encode(neg, False)
+                else:
+                    ne, npool = prompt.encode_sdxl(pipe, neg, gp.clip_skip)
+                if pe.shape[1] != ne.shape[1]:
+                    empty, _ = prompt.encode_sdxl(pipe, "", gp.clip_skip)
+                    if neg.strip() == "":
+                        empty = torch.zeros_like(empty)
+                        ne = torch.zeros((ne.shape[0], pe.shape[1], ne.shape[2]), dtype=ne.dtype, device=ne.device)
+                    else:
+                        pe, ne = prompt.pad_to_match(pe, ne, empty)
+                return {"prompt_embeds": pe.repeat(bs, 1, 1).to(self.dtype),
+                        "negative_prompt_embeds": ne.repeat(bs, 1, 1).to(self.dtype),
+                        "pooled_prompt_embeds": pp.repeat(bs, 1).to(self.dtype),
+                        "negative_pooled_prompt_embeds": npool.repeat(bs, 1).to(self.dtype)}
+            oc = self.kind == "sd2"
+            pe = (aesthetic_encode(pos, oc) if aesthetic is not None and not aesthetic["negative"]
+                  else prompt.encode_sd15(pipe, pos, gp.clip_skip, oc))
+            ne = (aesthetic_encode(neg, oc) if aesthetic is not None and aesthetic["negative"] and neg.strip()
+                  else prompt.encode_sd15(pipe, neg, gp.clip_skip, oc))
+            if pe.shape[1] != ne.shape[1]:
+                empty = prompt.encode_sd15(pipe, "", gp.clip_skip, oc)
+                pe, ne = prompt.pad_to_match(pe, ne, empty)
+            return {"prompt_embeds": pe.repeat(bs, 1, 1).to(self.dtype),
+                    "negative_prompt_embeds": ne.repeat(bs, 1, 1).to(self.dtype)}
+
+    def _encode_scheduled(self, pos: str, neg: str, gp: GenerationParams, bs: int, steps: int,
+                          hires_total: Optional[int] = None, gradient_total: Optional[int] = None) -> dict:
+        from .embedding_editor_generation import preview_encoding
+        return preview_encoding(self, lambda: self._merge_encoding(pos, neg, lambda texts:
+            self._encode_scheduled_unmerged(texts[0], texts[1], gp, bs, steps, hires_total, gradient_total)))
+
+    def _encode_scheduled_unmerged(self, pos: str, neg: str, gp: GenerationParams, bs: int, steps: int,
+                                   hires_total: Optional[int] = None, gradient_total: Optional[int] = None) -> dict:
+        """_encode plus A1111 prompt editing / alternation: returns the embeddings for step 1; when the prompt
+        changes during sampling the result is a ScheduledEmbeds carrying [(end_step, embeds), ...] (equal lengths)."""
+        cio = hooks_mod.hook_config(gp.hooks, "clip_io", clip_io.DEFAULTS)
+        if cio is not None:
+            cio = clip_io.normalize(cio)
+            modes = clip_io.applies(cio, pos, neg, gp)
+            self._clip_io_export(cio, pos, neg, gp, steps, modes)
+            if modes != ("off", "off"):
+                try:
+                    return clip_io.encode_input(self, cio, pos, neg, gp, bs, modes)
+                except (OSError, ValueError, RuntimeError) as exc:
+                    raise EngineError(INVALID_PARAMS, f"Clip I/O: {exc}") from exc
+        job = getattr(self, "_composable_job", None)
+        if job is not None and hooks_mod.hook_config(gp.hooks, "composable_lora", {}) is not None:
+            try:
+                composed = job.encode(self, pos, neg, gp, bs, steps, hires_total, gradient_total)
+            except (ValueError, KeyError, OverflowError, RecursionError) as exc:
+                raise EngineError(INVALID_PARAMS, f"Composable LoRA: {exc}") from exc
+            if composed is not None:
+                return composed
+        nc = hooks_mod.hook_config(gp.hooks, "neutral_prompt", {"cfg_rescale": 0})
+        if nc is not None:
+            try:
+                phi = float(nc["cfg_rescale"])
+                if not math.isfinite(phi) or not 0 <= phi <= 1:
+                    raise ValueError("Neutral Prompt CFG rescale must be between 0 and 1")
+                tree = neutral_prompt.parse(pos)
+            except ValueError as exc:
+                raise EngineError(INVALID_PARAMS, str(exc)) from exc
+            nodes = neutral_prompt.leaves(tree)
+            # Literal ordinary prompts bypass all wrappers and retain original encoding bytes/attention semantics.
+            active = phi != 0 or len(nodes) != 1 or any(n.weight != 1 or n.kind != "AND" for n in nodes) or nodes[0].text != pos
+            if active:
+                sub = replace(gp, hooks={k: v for k, v in gp.hooks.items() if k != "neutral_prompt"})
+                branches = [self._encode_scheduled(n.text, neg, sub, bs, steps, hires_total, gradient_total) for n in nodes]
+                out = dict(branches[0])
+                out["_neutral"] = neutral_runtime.Plan(tree, branches, phi)
+                return out
+        if (hooks_mod.hook_config(gp.hooks, "prompt_fusion", {}) is not None
+                and (prompt_fusion.active(pos) or prompt_fusion.active(neg))):
+            return prompt_fusion.encode(self, pos, neg, gp, bs, steps, hires_total, gradient_total)
+        def schedule(text):
+            text = prompt.strip_extra_networks(text)
+            if hooks_mod.hook_config(gp.hooks, "weight_gradient", {}) is not None:
+                return weight_gradient.schedule(text, steps, hires_total, gradient_total)
+            return prompt_schedule.schedule(text, steps, hires_total)
+        ps, ns = schedule(pos), schedule(neg)
+        if len(ps) == 1 and len(ns) == 1:
+            return self._encode(ps[0][1], ns[0][1], gp, bs)
+        cache: dict = {}
+        variants = []
+        for e in sorted({e for e, _ in ps} | {e for e, _ in ns}):
+            key = (prompt_schedule.text_at(ps, e), prompt_schedule.text_at(ns, e))
+            if key not in cache:
+                cache[key] = self._encode(key[0], key[1], gp, bs)
+            variants.append((e, cache[key]))
+        longest = max(v["prompt_embeds"].shape[1] for _, v in variants)
+        if any(v.get("_negpip") for _, v in variants):
+            variants = negpip.align_variants(variants)
+        elif any(v["prompt_embeds"].shape[1] != longest for _, v in variants):
+            with torch.no_grad():
+                empty = (prompt.encode_sdxl(self.pipe, "", gp.clip_skip)[0] if self.sdxl
+                         else prompt.encode_sd15(self.pipe, "", gp.clip_skip, self.kind == "sd2"))
+            for d in cache.values():
+                for k in ("prompt_embeds", "negative_prompt_embeds"):
+                    t = d[k]
+                    if t.shape[1] < longest:
+                        fill = torch.zeros_like(empty) if not bool(t.abs().any()) else empty
+                        reps = (longest - t.shape[1]) // fill.shape[1]
+                        d[k] = torch.cat([t] + [fill.to(t.device, t.dtype).repeat(t.shape[0], 1, 1)] * reps, dim=1)
+        out = ScheduledEmbeds(variants[0][1])
+        out.schedule = variants
+        return out
+
+    def _clip_io_export(self, cio: dict, pos: str, neg: str, gp: GenerationParams, steps: int, modes: tuple) -> None:
+        """Clip Output: write the conditioning of the generation's own prompts once per request."""
+        if not cio["output_enabled"]:
+            return
+        done = getattr(self, "_clip_io_done", None)
+        if done is None:
+            done = self._clip_io_done = set()
+        ctx = getattr(self, "_embedding_merge_ctx", None)
+        for text, own, name, mode in ((pos, gp.prompt, cio["output_name"], modes[0]),
+                                      (neg, gp.negative_prompt, cio["negative_output_name"], modes[1])):
+            if not name or text != own or mode != "off" or (name, text) in done:
+                continue
+            done.add((name, text))
+            first = prompt_schedule.schedule(prompt.strip_extra_networks(text), steps)[0][1]
+            try:
+                path = clip_io.export(self, cio, first, name, gp)
+            except (OSError, ValueError, RuntimeError) as exc:
+                raise EngineError(INVALID_PARAMS, f"Clip I/O: {exc}") from exc
+            if path is None:
+                if ctx is not None:
+                    ctx.warn(f"Clip Output: '{name}' already exists and Overwrite is off; not written")
+            else:
+                log.info("Clip Output: wrote %s", path)
+
+    def _adjust_embeds(self, gp: GenerationParams, embeds: dict, ctx: JobContext) -> dict:
+        if "_neutral" in embeds:
+            plan = embeds["_neutral"]
+            branches = [self._adjust_embeds(gp, branch, ctx) for branch in plan.branches]
+            out = dict(branches[0])
+            out["_neutral"] = neutral_runtime.Plan(plan.tree, branches, plan.phi, plan.image_trees)
+            return out
+        sch = getattr(embeds, "schedule", None)
+        def apply(d):
+            return negpip.adjust(d, lambda plain: ext_mod.adjust_embeds(self, gp, plain, ctx))
+        if not sch:
+            return apply(embeds)
+        done: dict = {}
+        variants = []
+        for e, v in sch:
+            if id(v) not in done:
+                done[id(v)] = apply(v)
+            variants.append((e, done[id(v)]))
+        out = ScheduledEmbeds(variants[0][1])
+        out.schedule = variants
+        return out
+
+    def _set_lora_step(self, step: int, total: int):
+        """LoRA Block Weight start/stop: U-Net part of windowed adapters on only inside their window."""
+        names, weights = self._lora_state
+        cur = list(weights)
+        for idx, start, stop in self._lora_windows:
+            active = lora_blocks.active(step, total, start, stop)
+            if idx in self._dora_step_weights:
+                for values, unet in self._dora_step_weights[idx]:
+                    values['unet'] = unet if active else 0.0
+            elif not active:
+                cur[idx] = lora_blocks.zero_unet(weights[idx], self.sdxl)
+        key = tuple(i for i, w in enumerate(cur) if w is not weights[i])
+        if key != getattr(self, "_lora_key", None):
+            self._set_inference_adapters(self.pipe, names, cur)
+            self._lora_key = key
+
+    def _lora_window_callback(self):
+        def cb(pipe, i, t, d):
+            total = int(getattr(pipe, "_num_timesteps", 0) or 1)
+            self._set_lora_step(i + 2, total)  # applies to the next step
+            return d
+        return cb
+
+    def _schedule_swapper(self, schedule: list):
+        """callback_on_step_end that swaps the (CFG / PAG concatenated) text embeddings when the prompt changes."""
+        state = {"last": schedule[0][1]}
+
+        def at(step):
+            for e, v in schedule:
+                if step <= e:
+                    return v
+            return schedule[-1][1]
+
+        def cb(pipe, i, t, d):
+            # Heun / DPM2 / DPM++ SDE evaluate each inference step twice. Keep one conditioning state
+            # for both stages instead of finishing a requested-step schedule halfway through the pass.
+            order = max(1, int(getattr(getattr(pipe, "scheduler", None), "order", 1)))
+            cur = at((int(i) + 1) // order + 1)  # next logical step, 1-based
+            if cur is state["last"]:
+                return d
+            state["last"] = cur
+            cfg = bool(getattr(pipe, "do_classifier_free_guidance", False))
+            pag = bool(getattr(pipe, "do_perturbed_attention_guidance", False))
+
+            def build(pk, nk, ref):
+                p, n = cur[pk], cur[nk]
+                parts = [n, p, p] if cfg and pag else [n, p] if cfg else [p, p] if pag else [p]
+                x = torch.cat(parts).to(ref.device, ref.dtype)
+                return x if x.shape == ref.shape else None
+            pe = d.get("prompt_embeds")
+            if pe is not None:
+                x = build("prompt_embeds", "negative_prompt_embeds", pe)
+                if x is not None:
+                    d["prompt_embeds"] = x
+            te = d.get("add_text_embeds")
+            if te is not None and "pooled_prompt_embeds" in cur:
+                x = build("pooled_prompt_embeds", "negative_pooled_prompt_embeds", te)
+                if x is not None:
+                    d["add_text_embeds"] = x
+            return d
+        return cb
+
+    # -- noise ---------------------------------------------------------------
+    def _rng_device(self, gp: GenerationParams) -> str:
+        r = (gp.extra or {}).get("rng", "gpu").lower()
+        return "cuda" if (r == "gpu" and self.cuda) else "cpu"
+
+    def _noise(self, seeds: list[int], subseeds: list[int], strength: float, w: int, h: int, gp: GenerationParams):
+        ch = int(getattr(self.pipe.vae.config, "latent_channels", 4))
+        shape = (ch, h // 8, w // 8)
+        dev = self._rng_device(gp)
+        out = []
+        for s, ss in zip(seeds, subseeds):
+            g = torch.Generator(dev).manual_seed(int(s) & 0xFFFFFFFFFFFFFFFF)
+            n = torch.randn(shape, generator=g, device=dev, dtype=torch.float32)
+            if strength > 0:
+                g2 = torch.Generator(dev).manual_seed(int(ss) & 0xFFFFFFFFFFFFFFFF)
+                sub = torch.randn(shape, generator=g2, device=dev, dtype=torch.float32)
+                n = slerp(strength, n.unsqueeze(0), sub.unsqueeze(0))[0]
+            out.append(n)
+        return torch.stack(out).to(self.device if self.cuda else "cpu", self.dtype)
+
+    def _generators(self, seeds: list[int], gp: GenerationParams):
+        dev = self._rng_device(gp)
+        return [torch.Generator(dev).manual_seed(int(s) & 0xFFFFFFFFFFFFFFFF) for s in seeds]
+
+    # -- callback ------------------------------------------------------------
+    def _callback(self, ctx: JobContext, req: GenerationRequest, pass_: str, image: int, images: int, steps_hint: int):
+        every = int(req.preview_every or 0)
+        method = req.preview_method
+        state = {"started": False}
+        from . import nsfw_checker
+        nsfw = nsfw_checker.preview_config(getattr(req.params, "hooks", None)) if every > 0 and method != "none" else None
+
+        def censored(b64):
+            # NudeNet live preview censor; an error drops the preview instead of showing it uncensored.
+            return nsfw_checker.censor_preview_b64(b64, nsfw) if nsfw is not None and b64 else b64
+
+        def cb(pipe, i, t, kw):
+            if not state["started"]:
+                ctx.start_pass()
+                state["started"] = True
+            if ctx.interrupted:
+                raise EngineError(INTERRUPTED, "interrupted")
+            total = int(getattr(pipe, "_num_timesteps", 0) or steps_hint)
+            step = i + 1
+            ctx.progress(step, total, pass_, image=image, images=images,
+                         batch_size=int(kw["latents"].shape[0]) if kw.get("latents") is not None else 1)
+            if every > 0 and method != "none" and step % every == 0 and step < total:
+                lat = kw.get("latents")
+                if lat is not None:
+                    try:
+                        b64 = None
+                        if method == "taesd":
+                            b64 = self.taesd.decode_b64(lat, self.sdxl, self.device, self.dtype)
+                        if b64 is None:
+                            b64 = preview.latent_preview_b64(lat[:, :4].float().cpu().numpy(), self.sdxl)
+                        b64 = censored(b64)
+                        if b64:
+                            ctx.preview(b64, step)
+                    except Exception as e:  # never fail a generation because of a preview
+                        log.debug("preview failed: %s", e)
+                        if method == 'taesd':
+                            try:
+                                b64 = censored(preview.latent_preview_b64(lat[:, :4].float().cpu().numpy(), self.sdxl))
+                                if b64:
+                                    ctx.preview(b64, step)
+                            except Exception as fallback_error:
+                                log.debug('cheap preview also failed: %s', fallback_error)
+            return kw
+        return cb
+
+    # -- generation ------------------------------------------------------------
+    def txt2img(self, params: dict, ctx: JobContext) -> dict:
+        return self._generate(params, ctx, "txt2img")
+
+    def img2img(self, params: dict, ctx: JobContext) -> dict:
+        return self._generate(params, ctx, "img2img")
+
+    def _scheduler(self, sampler: str, schedule: Optional[str], ctx: JobContext):
+        plan = schedulers.plan(sampler, schedule)
+        extra = {}
+        if self.flags.get("v_pred"):
+            extra["prediction_type"] = "v_prediction"
+        if self.flags.get("ztsnr"):
+            extra["rescale_betas_zero_snr"] = True
+        extra.update(self._ms_overrides)
+        pt = (self._extra.get("prediction_type") or "").strip()
+        if pt in ("epsilon", "v_prediction"):
+            extra["prediction_type"] = pt
+        try:
+            sched, warns = schedulers.build_scheduler(plan, self.base_sched_config, self.sdxl, extra)
+        except Exception as e:
+            raise EngineError(UNSUPPORTED, f"sampler '{sampler}' is not available: {e}")
+        for w in warns:
+            ctx.warn(w)
+        return sched, plan
+
+    def _controlnets(self, gp: GenerationParams, req: GenerationRequest, init_img, w: int, h: int, ctx: JobContext):
+        units = [u for u in gp.controlnet if u.enabled]
+        if not units:
+            return [], [], {}
+        models_, images = [], []
+        wanted = {req.controlnet_paths.get(u.model, u.model) for u in units}
+        for u in units:
+            path = req.controlnet_paths.get(u.model, u.model)
+            cnm = self.cn_cache.get(path)
+            if cnm is not None:
+                self.cn_cache.move_to_end(path)
+            else:
+                for old in [k for k in self.cn_cache if k not in wanted][: max(0, len(self.cn_cache) + 1 - MAX_CONTROLNETS)]:
+                    self._evict_controlnet(old)
+                try:
+                    from .resource_hashes import FileSnapshot
+                    resource_snapshot = FileSnapshot.capture(path) if os.path.isfile(path) else None
+                    cnm = cn_mod.load_controlnet(path, self.dtype)
+                    cnm._sdfx_resource_snapshot = resource_snapshot
+                except Exception as e:
+                    raise EngineError(MODEL_LOAD_FAILED, f"failed to load ControlNet {os.path.basename(path)}: {e}{_hf_hint(e)}",
+                                      traceback.format_exc())
+                # device placement happens in _activate (gpu: .to(cuda); offload modes: accelerate hooks)
+                cnm.to(dtype=self.dtype)
+                self.cn_cache[path] = cnm
+            if u.image:
+                src = cn_mod.load_controlnet_image(u.image, u.source_compatible_resize)
+            elif init_img is not None:
+                src = init_img
+            else:
+                raise EngineError(INVALID_PARAMS, f"ControlNet unit '{u.model}' has no image")
+            if u.preprocessor not in ("none", "") and u.preprocessor not in self.preprocessors():
+                cond = src  # warned in parse_generation
+            else:
+                try:
+                    if u.preprocessor == "canny" and (u.source_compatible_resize or u.processor_res != -1 or u.pixel_perfect):
+                        cond = cn_mod.source_canny(src, cn_mod.processor_resolution(u, src, w, h), u.preprocessor_args)
+                    else:
+                        cond = cn_mod.run_preprocessor(u.preprocessor, src, u.preprocessor_args)
+                except Exception as e:
+                    raise EngineError(INVALID_PARAMS, f"preprocessor '{u.preprocessor}' failed: {e}", traceback.format_exc())
+            models_.append((path, cnm))
+            images.append(cond)
+        single = len(units) == 1
+        kw = {
+            "controlnet_conditioning_scale": float(units[0].weight) if single else [float(u.weight) for u in units],
+            "control_guidance_start": float(units[0].guidance_start) if single else [float(u.guidance_start) for u in units],
+            "control_guidance_end": float(units[0].guidance_end) if single else [float(u.guidance_end) for u in units],
+        }
+        return models_, images, kw
+
+    @staticmethod
+    def _cn_images(images: list, w: int, h: int, modes=None, compatible=None):
+        sized = cn_mod.resize_control_images(images, modes if modes is not None else [1] * len(images), w, h, compatible)
+        return sized[0] if len(sized) == 1 else sized
+
+    def _pag_config(self, gp: GenerationParams, ctx: JobContext) -> Optional[dict]:
+        cfg = hooks_mod.hook_config(gp.hooks, "pag", hooks_mod.PAG_DEFAULTS)
+        if cfg is None:
+            return None
+        if not hasattr(diffusers, "StableDiffusionXLPAGPipeline"):
+            ctx.warn("PAG requires a newer diffusers; ignored")
+            return None
+        return hooks_mod.normalize_pag(cfg)
+
+    def _run(self, task, gp, req, ctx, **kwargs):
+        if kwargs.get('embeds', {}).get('_neutral'):
+            # Reject incompatible requests before inspecting or mutating adapters.
+            cn = kwargs.get('cn')
+            neutral_runtime.validate(gp.hooks, controlnet=bool(cn and cn[0]), pag=bool(kwargs.get('pag')))
+        if hooks_mod.hook_config(gp.hooks, 'photomaker', {}) is None:
+            return self._run_unscoped(task, gp, req, ctx, **kwargs)
+        from .photomaker_adapters import adapter_scope
+        # Enter before special_pipe can mutate shared PEFT layers, including
+        # partially failed adapter loads. Keep ownership in the normal registry.
+        with adapter_scope(self) as scope:
+            return self._run_unscoped(task, gp, req, ctx, _photomaker_scope=scope, **kwargs)
+
+    def _run_unscoped(self, task: str, gp: GenerationParams, req: GenerationRequest, ctx: JobContext, *, sampler: str,
+             schedule: Optional[str], cfg_scale: float, embeds: dict, steps: int, w: int, h: int, seeds: list[int],
+             pass_: str, image_idx: int, images_total: int, latents=None, image=None, mask=None, strength: float = 1.0,
+             expected_steps: int = 0, cn: Optional[tuple] = None, output_type: str = "pil", pag: Optional[dict] = None,
+             hook_seed: int = 0, latent_source=None, hires_noise=None, photomaker_prompts=None, _photomaker_scope=None, conditioning_denoise=None):
+        cn_models, cn_images, cn_kw = cn if cn else ([], [], {})
+        neutral_plan = embeds.get("_neutral")
+        xplan = ext_mod.pre_run(self, task, gp, mask_present=mask is not None, controlnet=bool(cn_models), pag=bool(pag))
+        for wmsg in xplan.warnings:
+            ctx.warn(wmsg)
+        task = xplan.task
+        try:
+            pipe = ext_mod.special_pipe(self, xplan) or self._get_pipe(task, cn_models or None, pag)
+        except Exception as e:
+            if pag:
+                ctx.warn(f"PAG could not be enabled: {e}")
+                pag = None
+                pipe = self._get_pipe(task, cn_models or None, None)
+            else:
+                raise
+        if _photomaker_scope is not None:
+            _photomaker_scope.activate(pipe)
+        sched, plan = self._scheduler(sonar.effective_sampler(gp.hooks, sampler), schedule, ctx)
+        if xplan.sag and type(sched).__name__ not in SAG_SCHEDULERS:
+            ctx.warn(f"SAG does not work with sampler '{sampler}' (use DDIM, UniPC or a DPM++ sampler); ignored")
+            xplan.sag = None
+            pipe = self._get_pipe(task, cn_models or None, pag)
+        pipe.scheduler = sched
+        kw: dict = dict(embeds)
+        kw.pop("_negpip", None)
+        kw.pop("_neutral", None)
+        kw.pop("_clora_branch", None)
+        kw.pop("_clora_prompt", None)
+        kw.pop("_clora_negative", None)
+        for key in ('_photo_raw_branch', '_photo_raw_prompt', '_photo_raw_negative'):
+            kw.pop(key, None)
+        kw.update(num_inference_steps=steps, guidance_scale=cfg_scale, generator=self._generators(seeds, gp),
+                  output_type=output_type, callback_on_step_end=self._callback(ctx, req, pass_, image_idx, images_total,
+                                                                               expected_steps or steps))
+        if gp.eta is not None:
+            kw["eta"] = float(gp.eta)
+        if task == "txt2img":
+            kw.update(width=w, height=h)
+            if latents is not None:
+                kw["latents"] = latents
+            if cn_models:
+                kw["image"] = self._cn_images(cn_images, w, h, [u.resize_mode for u in gp.controlnet if u.enabled],
+                                              [u.source_compatible_resize for u in gp.controlnet if u.enabled])
+        else:
+            kw.update(image=image, strength=strength)
+            if task == "inpaint":
+                kw.update(mask_image=mask, width=w, height=h)
+            if cn_models:
+                kw["control_image"] = self._cn_images(cn_images, w, h, [u.resize_mode for u in gp.controlnet if u.enabled],
+                                                      [u.source_compatible_resize for u in gp.controlnet if u.enabled])
+        if cn_models:
+            kw.update(cn_kw)
+        if pag:
+            kw["pag_scale"] = pag["scale"]
+            kw["pag_adaptive_scale"] = pag["adaptive_scale"]
+        photo_capture = None
+        if xplan.photomaker:
+            pm = (gp.hooks or {}).get("photomaker") or {}
+            kw["input_id_images"] = [load_rgb(p) for p in (pm.get("images") or [])]
+            if not kw["input_id_images"]:
+                raise EngineError(INVALID_PARAMS, "PhotoMaker needs at least one ID image")
+            kw["start_merge_step"] = int(xplan.photomaker["start_merge_step"])
+            # PhotoMaker locates the trigger word in the token stream, so it needs the prompt text, not embeddings
+            for k in ("prompt_embeds", "negative_prompt_embeds", "pooled_prompt_embeds", "negative_pooled_prompt_embeds"):
+                kw.pop(k, None)
+            kw["prompt"] = prompt.strip_extra_networks(gp.prompt)
+            kw["negative_prompt"] = prompt.strip_extra_networks(gp.negative_prompt)
+            kw["num_images_per_prompt"] = len(seeds)
+            if photomaker_prompts and len(set(photomaker_prompts)) > 1:
+                if len(photomaker_prompts) != len(seeds):
+                    raise EngineError(INVALID_PARAMS, 'PhotoMaker prompt and seed counts differ')
+                from .photomaker_batch import validate_pipeline
+                try:
+                    validate_pipeline(pipe)
+                except ValueError as exc:
+                    raise EngineError(UNSUPPORTED, str(exc)) from exc
+                kw['prompt'] = photomaker_prompts
+                kw['negative_prompt'] = [prompt.strip_extra_networks(gp.negative_prompt)] * len(seeds)
+                kw['num_images_per_prompt'] = 1
+            if getattr(embeds, "schedule", None):
+                ctx.warn("prompt editing is not available with PhotoMaker; the first prompt is used")
+            prompt_values = kw['prompt'] if isinstance(kw['prompt'], list) else [kw['prompt']]
+            if any(not re.search(r"\b" + re.escape(pm.get("trigger_word", "img")) + r"\b", value) for value in prompt_values):
+                raise EngineError(INVALID_PARAMS, f"PhotoMaker: put the trigger word '{pm.get('trigger_word', 'img')}' after "
+                                                  "the class word in the prompt, e.g. 'a man img'")
+            composable = getattr(self, '_composable_job', None)
+            if neutral_plan is not None and composable is not None:
+                from .photomaker_batch import configure_composable_photo, validate_pipeline, reject_unverified_merge_composable
+                try:
+                    raw_texts = [gp.prompt, gp.negative_prompt] + list(photomaker_prompts or ())
+                    reject_unverified_merge_composable(raw_texts)
+                    validate_pipeline(pipe)
+                    photo_capture = configure_composable_photo(neutral_plan, composable, kw, count=len(seeds),
+                        total=composable_lora.clock_total(gp, composable.config, int(expected_steps or steps)),
+                        cfg=cfg_scale, trigger=pm.get('trigger_word', 'img'), pass_name=pass_, schedule_steps=gp.steps)
+                except ValueError as exc:
+                    raise EngineError(UNSUPPORTED, str(exc)) from exc
+
+        if getattr(self, "_lora_windows", None):
+            ext_mod._chain_callback(kw, self._lora_window_callback())
+            self._set_lora_step(1, max(int(expected_steps or steps), 1))  # state for the first step
+        thermal = hooks_mod.hook_config(gp.hooks, "gpu_temperature_guard", {})
+        if thermal is not None:
+            from .temperature_guard import TemperatureGuard, nvidia_temperature, rocm_temperature, ohm_temperature
+            device_index = thermal.get("device", 0)
+            providers = {"NVIDIA": nvidia_temperature, "ROCm": rocm_temperature,
+                         "OpenHardwareMonitor": lambda _: ohm_temperature(thermal.get("sensor_id", ""))}
+            provider = thermal.get("provider", "NVIDIA")
+            if provider not in providers:
+                raise EngineError(INVALID_PARAMS, f"unknown temperature provider '{provider}'")
+            def thermal_event(kind, temperature):
+                if kind == "reading" and not thermal.get("print_readings", False):
+                    return
+                message = f"GPU temperature {kind}: {temperature:g} C (provider={provider}, device={device_index})"
+                if kind == "timeout":
+                    ctx.warn(message + "; maximum pause reached, continuing before wake temperature")
+                else:
+                    ctx.log("info", message)
+            guard = TemperatureGuard(lambda: providers[provider](device_index), on_event=thermal_event,
+                **{key: thermal[key] for key in ("sleep_temperature", "wake_temperature", "interval", "sleep_time", "max_sleep") if key in thermal})
+            def thermal_callback(pipe, step, timestep, callback_kwargs):
+                guard.step(ctx.check_interrupt)
+                return callback_kwargs
+            ext_mod._chain_callback(kw, thermal_callback)
+        sch = getattr(embeds, "schedule", None)
+        if sch and "prompt_embeds" in kw:
+            ext_mod._chain_callback(kw, self._schedule_swapper(sch))
+            avail = list(getattr(pipe, "_callback_tensor_inputs", ["latents"]))
+            want = list(kw.get("callback_on_step_end_tensor_inputs") or ["latents"])
+            for k in ("prompt_embeds", "add_text_embeds"):
+                if k in avail and k not in want:
+                    want.append(k)
+            kw["callback_on_step_end_tensor_inputs"] = [k for k in want if k in avail]
+
+        from .token_downsampling import TokenDownsampling, DEFAULTS as TODO_DEFAULTS, step_budget
+        todo_config = hooks_mod.hook_config(gp.hooks, 'token_downsampling', TODO_DEFAULTS)
+        todo = TokenDownsampling(pipe.unet, todo_config, self.sdxl,
+            step_budget(gp.steps, gp.hires.second_pass_steps, pass_), branch_mode=bool(neutral_plan)) if todo_config else None
+        if todo is not None and todo.enabled:
+            if pag or hooks_mod.hook_config(gp.hooks, 'hypertile', hooks_mod.HYPERTILE_DEFAULTS):
+                raise EngineError(UNSUPPORTED, 'Token Downsampling cannot combine with PAG or HyperTile: their self-attention layouts differ')
+        cleanups = []
+        unet = pipe.unet
+        if xplan.photomaker and self._offload:
+            from .embedding_merge_pipeline import validate_keyword_offload_multidiffusion
+            raw_photo_prompts = [gp.prompt, gp.negative_prompt] + list(photomaker_prompts or ())
+            validate_keyword_offload_multidiffusion(gp.hooks, True, True,
+                hooks_mod.hook_config(gp.hooks, 'multidiffusion', {}) is not None, raw_photo_prompts)
+        self._activate(pipe)
+        fu = hooks_mod.hook_config(gp.hooks, "freeu", hooks_mod.FREEU_DEFAULTS[self.sdxl])
+        if fu:
+            pipe.enable_freeu(s1=float(fu["s1"]), s2=float(fu["s2"]), b1=float(fu["b1"]), b2=float(fu["b2"]))
+            cleanups.append(pipe.disable_freeu)
+        dt = hooks_mod.hook_config(gp.hooks, "dynamic_thresholding", hooks_mod.DYNTHRESH_DEFAULTS)
+        if dt:
+            if pag:
+                ctx.warn("dynamic thresholding is disabled while PAG is active")
+            else:
+                ac = getattr(sched, "alphas_cumprod", None)
+                if ac is None:
+                    from .sigmas import default_alphas_cumprod
+                    ac = torch.tensor(default_alphas_cumprod())
+                hk = hooks_mod.DynThreshHook(unet, ac, sched.config.get("prediction_type", "epsilon"), cfg_scale,
+                                             hooks_mod.normalize_dynthresh(dt))
+                cleanups.append(hk.remove)
+                hk.install()
+        ht = hooks_mod.hook_config(gp.hooks, "hypertile", hooks_mod.HYPERTILE_DEFAULTS)
+        if ht:
+            hk2 = hooks_mod.HyperTileHook(unet, h // 8, w // 8, hooks_mod.normalize_hypertile(ht), hook_seed)
+            cleanups.append(hk2.remove)
+        try:
+            if cn_models:
+                from . import control_mode_policy
+                cleanups.append(control_mode_policy.install(pipe, [u for u in gp.controlnet if u.enabled],
+                    hires=pass_ == "hires", neutral=bool(neutral_plan)))
+            if ht:
+                hk2.install()
+            if todo is not None:
+                cleanups.append(todo.remove)
+                todo.install()
+            branch_hooks = [] if neutral_plan else None
+            if branch_hooks is not None and todo is not None:
+                branch_hooks.append(todo)
+            forward_wrappers = []
+            ext_mod.install(self, pipe, task, gp, req, kw, ctx, cleanups, plan=xplan, w=w, h=h, sched=sched,
+                            cfg_scale=cfg_scale, image=image, mask=mask, steps=steps, seed=hook_seed,
+                            branch_hooks=branch_hooks, forward_wrappers=forward_wrappers, pass_=pass_)
+            if hooks_mod.hook_config(gp.hooks, "compile", {}) is not None:
+                from . import compile_accel
+                compile_accel.install(self, pipe, gp, ctx, cleanups, controlnet=bool(cn_models), pass_=pass_,
+                                      shape=(w, h, len(seeds)))
+            if hooks_mod.hook_config(gp.hooks, "deepcache", {}) is not None:
+                from . import deepcache
+                deepcache.install(self, pipe, gp, ctx, cleanups, controlnet=bool(cn_models), neutral=bool(neutral_plan),
+                                  pass_=pass_)
+            if pag:
+                # Capture after IP load/unload: restoring pre-install processors would discard IP weights while
+                # IPAdapterState still considers them loaded. Also restore native PAG changes on failure.
+                saved_procs = dict(unet.attn_processors)
+                cleanups.append(lambda: unet.set_attn_processor(saved_procs))
+            nh = None
+            if neutral_plan:
+                from .neutral_sampling import Controller
+                composable = getattr(self, "_composable_job", None)
+                if composable is not None and all("_clora_branch" in b for b in neutral_plan.branches):
+                    actual = int(expected_steps or steps)
+                    global_clock = hooks_mod.coerce_bool(composable.config.get("hires_global_step", False))
+                    offset = gp.steps if pass_ == "hires" and global_clock else 0
+                    total_clock = composable_lora.clock_total(gp, composable.config, actual)
+                    branch_hooks.append(composable_lora.BranchHook(composable, sched, total_clock, offset, pass_))
+                guided = cfg_scale > 1 and getattr(unet.config, "time_cond_proj_dim", None) is None
+                ip_embeds = None
+                if "ip_adapter_image" in kw:
+                    from .neutral_ip import prepare
+                    ip_embeds, kw["ip_adapter_image_embeds"] = prepare(pipe, kw.pop("ip_adapter_image"), len(seeds), guided)
+                neutral_cn = None
+                if cn_models:
+                    from .neutral_controlnet import ControlNetFrame
+                    neutral_cn = ControlNetFrame(pipe.controlnet).install()
+                    cleanups.append(neutral_cn.remove)
+                photo_transform = None
+                if photo_capture is not None:
+                    from .photomaker_batch import photo_branch_transform
+                    photo_transform = photo_branch_transform(int(xplan.photomaker['start_merge_step']))
+                neutral_cfg = 1.0 if photo_capture is not None and not guided else cfg_scale
+                nh = neutral_runtime.RuntimeHook(unet, sched, neutral_plan, neutral_cfg,
+                        float((hooks_mod.hook_config(gp.hooks, "neutral_prompt", {"cfg_rescale": 0}) or {"cfg_rescale": 0})["cfg_rescale"]),
+                        guided=guided,
+                        pag=bool(pag),
+                        controlnet=neutral_cn,
+                        image_embeds=ip_embeds,
+                        branch_hooks=branch_hooks,
+                        sampling=Controller(sched, gp.hooks, hook_seed), branch_transform=photo_transform,
+                        check_interrupt=ctx.check_interrupt).install()
+                cleanups.append(nh.remove)
+                ext_mod._chain_callback(kw, nh.callback)
+            negative_runtime = None
+            if embeds.get("_negpip") or (neutral_plan and any(v.get("_negpip") for v in neutral_plan.branches)):
+                negative_runtime = negpip.Rebindable(pipe).install()
+                cleanups.append(negative_runtime.remove)
+            recorder = getattr(self, "_intermediate_recorder", None)
+            if recorder is not None and (hooks_mod.hook_config(gp.hooks, "save_intermediate", {}) is not None
+                                         or hooks_mod.hook_config(gp.hooks, "steps_animation", {}) is not None):
+                cleanups.append(save_intermediate.install(self, pipe, kw, recorder, seeds, pass_,
+                    int(expected_steps or steps), gp.steps if pass_ == "hires" else 0,
+                    image_idx // max(1, gp.batch_size)))
+            ctx.check_interrupt()
+            from .conditioning_highres_fix import conditioning_scope, resolve_weight, source_denoising
+            config = hooks_mod.hook_config(gp.hooks, 'conditioning_highres_fix', {'mode': 'disabled'})
+            conditioning_weight = None
+            if config is not None:
+                requested = source_denoising(pass_, gp, strength, conditioning_denoise)
+                try:
+                    conditioning_weight = resolve_weight(config.get('mode', 'disabled'), requested)
+                except ValueError as exc:
+                    raise EngineError(INVALID_PARAMS, f'Conditioning Highres Fix: {exc}') from exc
+            channels = getattr(getattr(getattr(pipe, 'unet', None), 'config', None), 'in_channels', None)
+            if conditioning_weight is not None and (task != 'inpaint' or channels != 9):
+                ctx.warn('Conditioning Highres Fix has no effect without a 9-channel inpainting model')
+                conditioning_weight = None
+            if latent_source is not None:
+                source_image, source_mask = latent_source
+                config = latent_upscale.normalize(hooks_mod.hook_config(gp.hooks, "latent_upscale", {}))
+                if task == "inpaint" and not _accepts(pipe.__call__, "masked_image_latents"):
+                    raise EngineError(UNSUPPORTED, f"Latent Upscale masked input is not supported by {type(pipe).__name__}")
+                kw["image"] = latent_upscale.encode(pipe, source_image, w, h, config["method"],
+                    kw["generator"], self.device, self.dtype)
+                if task == "inpaint":
+                    # A latent image cannot be multiplied by a pixel mask inside the pipeline.
+                    # Encode source-sized masked pixels separately, then resize that conditioning in latent space.
+                    kw["masked_image_latents"] = latent_upscale.encode(pipe, source_image, w, h, config["method"],
+                        kw["generator"], self.device, self.dtype, mask=source_mask,
+                        conditioning_weight=conditioning_weight)
+            filtered = _filter_kwargs(pipe.__call__, kw)
+            for k in ("eta", "pag_scale", "pag_adaptive_scale", "controlnet_conditioning_scale", "guidance_rescale",
+                      "sag_scale", "ip_adapter_image", "input_id_images"):
+                if k in kw and k not in filtered:
+                    ctx.warn(f"'{k}' is not supported by {type(pipe).__name__}; ignored")
+            if "eta" in filtered and not _accepts(sched.step, "eta"):
+                ctx.warn(f"eta is ignored by sampler '{sampler}'")
+            kw = filtered
+            from contextlib import nullcontext
+            from .vae_tools import catch_decode
+            recovery = nullcontext()
+            if output_type == 'pil' and getattr(pipe, 'vae', None) is not None and req is not None and not getattr(self, '_benchmark_no_save', False):
+                recovery = catch_decode(self, pipe.vae, req.vae_recovery_dir or req.output_dir, ctx)
+            from .hires_tweaks import prepare_noise, resized_noise
+            noise_factory = None
+            if hires_noise is not None:
+                subseeds, variation, resize_width, resize_height = hires_noise
+                if task == 'txt2img' or len(subseeds) != len(seeds):
+                    raise EngineError(INVALID_PARAMS, 'Hires noise requires an image pass and matching seed lists')
+                rng_device = self._rng_device(gp)
+                def draw_noise(seed, shape):
+                    generator = torch.Generator(rng_device).manual_seed(int(seed) & 0xFFFFFFFFFFFFFFFF)
+                    return torch.randn(shape, generator=generator, device=rng_device, dtype=torch.float32)
+                def noise_factory(shape, generator=None, device=None, dtype=None, **unused):
+                    if len(shape) != 4 or shape[0] != len(seeds):
+                        raise EngineError(UNSUPPORTED, 'Hires noise batch shape does not match seed plan')
+                    noise = [resized_noise(tuple(shape[1:]), seed, sub, variation,
+                        resize_width, resize_height, draw_noise, slerp) for seed, sub in zip(seeds, subseeds)]
+                    return torch.stack(noise).to(device=device, dtype=dtype)
+            with torch.inference_mode(), recovery, vae_scope(self, getattr(pipe, "vae", None), w, h, len(seeds), ctx), prepare_noise(pipe, noise_factory), conditioning_scope(pipe, None if latent_source is not None else conditioning_weight):
+                if xplan.photomaker:
+                    from .embedding_editor_generation import invoke_pipeline
+                    from .photomaker_adapters import id_encoder_scope
+                    from .photomaker_batch import heterogeneous_prompts
+                    positive_list = isinstance(kw['prompt'], list)
+                    negative_list = isinstance(kw['negative_prompt'], list)
+                    positive = list(kw['prompt']) if positive_list else [kw['prompt']]
+                    negative = list(kw['negative_prompt']) if negative_list else [kw['negative_prompt']]
+                    spec_texts = [] if photo_capture is None else [
+                        (list(spec['prompts']), list(spec.get('negatives', []))) for spec in photo_capture.specs]
+                    all_text = positive + negative + [text for prompts, negatives in spec_texts for text in prompts + negatives]
+                    def invoke(texts):
+                        index = len(positive) + len(negative)
+                        current_positive = list(texts[:len(positive)])
+                        current_negative = list(texts[len(positive):index])
+                        try:
+                            if photo_capture is not None:
+                                for spec, (prompts, negatives) in zip(photo_capture.specs, spec_texts):
+                                    spec['prompts'] = list(texts[index:index + len(prompts)]); index += len(prompts)
+                                    spec['negatives'] = list(texts[index:index + len(negatives)]); index += len(negatives)
+                            def encode_signed_target(text, weight):
+                                ctx.check_interrupt()
+                                return negpip.encode_photo_target(pipe, text, weight, clip_skip=gp.clip_skip, dtype=self.dtype)
+                            signed_scope = (photo_capture.signed_terms(encode_signed_target)
+                                if photo_capture is not None and hooks_mod.hook_config(gp.hooks, 'negpip', {}) is not None
+                                else nullcontext())
+                            with signed_scope:
+                                if photo_capture is not None:
+                                    spec = photo_capture.specs[0]
+                                    current_positive, current_negative = list(spec['prompts']), list(spec['negatives'])
+                                    photo_batch = heterogeneous_prompts(pipe, spec['prompts'], route=spec['route'], capture=photo_capture)
+                                elif positive_list:
+                                    photo_batch = heterogeneous_prompts(pipe, current_positive)
+                                else:
+                                    photo_batch = nullcontext()
+                                arguments = dict(kw, prompt=current_positive if positive_list else current_positive[0],
+                                                 negative_prompt=current_negative if negative_list else current_negative[0])
+                                with id_encoder_scope(self, pipe), photo_batch:
+                                    return pipe(**arguments)
+                        finally:
+                            if photo_capture is not None:
+                                for spec, (prompts, negatives) in zip(photo_capture.specs, spec_texts):
+                                    spec['prompts'], spec['negatives'] = prompts, negatives
+                    out = invoke_pipeline(self, pipe, all_text, invoke, check=ctx.check_interrupt, runtime_hook=nh,
+                                       extra_runtime_hooks=(negative_runtime,) if negative_runtime is not None else (),
+                                       pre_runtime_hooks=forward_wrappers)
+                else:
+                    out = pipe(**kw)
+        finally:
+            if todo is not None and todo.enabled:
+                log.info('Token Downsampling: %s', dict(evaluations=todo.evaluations, active_evaluations=min(todo.limit, todo.evaluations), token_shapes=todo.stats))
+            for c in reversed(cleanups):
+                try:
+                    c()
+                except Exception:
+                    pass
+        imgs = out.images
+        if output_type == "pil":
+            imgs = ext_mod.post_images(self, gp, xplan, imgs, image=image, ctx=ctx)
+        return imgs, plan
+
+    def _generate(self, params: dict, ctx: JobContext, mode: str) -> dict:
+        self._editor_preview = None
+        self._embedding_merge_ctx = ctx
+        self._clip_io_done = set()
+        self._intermediate_recorder = None
+        self._composable_job = None
+        self._cd_tuner_job = None
+        self._incantations_job = None
+        self._vae_recovery = []
+        self._aesthetic_digests = set()
+        try:
+            fields = params.get('params', {}) if isinstance(params, dict) else {}
+            if not isinstance(fields, dict):
+                fields = {}
+            if hooks_mod.hook_config(fields.get('hooks', {}), 'inpaint_difference', {}) is None:
+                result = self._generate_recorded(params, ctx, mode)
+            else:
+                with self.difference_generation(params, mode, ctx) as prepared:
+                    result = self._generate_recorded(prepared, ctx, mode)
+            if self._vae_recovery:
+                result['vae_recovery'] = self._vae_recovery
+            if self._aesthetic_digests:
+                aesthetic_gradients.add_provenance(result, self._aesthetic_digests, ctx.warn)
+                result['warnings'] = list(ctx.warnings)
+            if self._composable_job is not None:
+                self._composable_job.finish(result, params.get("output_dir", ""))
+            if params.get('system_info_fields'):
+                from .system_info import snapshot, metadata
+                result['system_info'] = metadata(snapshot(self, full=True), params['system_info_fields'])
+            return result
+        finally:
+            try:
+                if self._composable_job is not None:
+                    self._composable_job.remove()
+                    self._composable_job = None
+                recorder = self._intermediate_recorder
+                if recorder is not None:
+                    try:
+                        recorder.close()
+                    except OSError as e:
+                        log.warning("could not close intermediate manifest: %s", e)
+            finally:
+                self._intermediate_recorder = None
+                self._editor_preview = None
+                self._embedding_merge_ctx = None
+                self._cd_tuner_job = None
+                self._incantations_job = None
+                self._aesthetic_digests = None
+
+    def _generate_recorded(self, params: dict, ctx: JobContext, mode: str) -> dict:
+        if getattr(self, "_embedding_reload_error", None):
+            raise EngineError(INVALID_PARAMS, "Embedding live refresh failed; reload the checkpoint before generating")
+        t0 = time.monotonic()
+        hardware_started = time.perf_counter()
+        req = self.parse_generation(params, mode, ctx)
+        gp = req.params
+        ctx.face_checkpoint_hashes = {}
+        from . import nsfw_checker
+        nsfw_cfg = nsfw_checker.job_config(gp.hooks, ctx)
+        from . import aesthetic_score
+        aesthetic_cfg = aesthetic_score.job_config(gp.hooks, ctx)
+        sonar_cfg = hooks_mod.hook_config(gp.hooks, "sonar", sonar.DEFAULTS)
+        sonar_cfg = sonar.normalize(sonar_cfg) if sonar_cfg is not None else None
+        face_swap_cfg = hooks_mod.hook_config(gp.hooks, "batch_face_swap", {})
+        if face_swap_cfg is not None:  # reject bad settings before the first image, not after it
+            from . import batch_face_swap
+            face_checkpoint = batch_face_swap.normalize(face_swap_cfg)["checkpoint"]
+            if face_checkpoint and not os.path.isfile(face_checkpoint):
+                raise EngineError(INVALID_PARAMS, f"Batch Face Swap: checkpoint not found: {face_checkpoint}")
+        from . import img2img_hires_fix
+        refine_config = hooks_mod.hook_config(gp.hooks, 'img2img_hires_fix', {})
+        refine_config = img2img_hires_fix.normalize(refine_config) if refine_config is not None else None
+        hp = gp.hires
+        hires = mode == "txt2img" and hp.enabled
+        from .cd_tuner import Job as CdTunerJob
+        self._cd_tuner_job = CdTunerJob(hires)  # CD Tuner state across this job's passes (hires fix on: p.enable_hr)
+        from .hires_tweaks import seed_plan, wire_seed
+        tweaks = hooks_mod.hook_config(gp.hooks, "hires_fix_tweaks", {}) if hires else None
+        seed = resolve_seed(gp.seed)
+        subseed = resolve_seed(gp.subseed)
+        bs, n_iter = gp.batch_size, gp.n_iter
+        hr_plan = seed_plan(tweaks, [seed + i for i in range(bs * n_iter)],
+            [subseed + i for i in range(bs * n_iter)], gp.subseed_strength) if tweaks is not None else None
+        repeats = hr_plan.count if hr_plan is not None else 1
+        total = bs * n_iter * repeats
+        if total > 1600:
+            raise EngineError(INVALID_PARAMS, "Hires repeats exceed the 1600-image generation limit")
+        hardware_timer = None
+        hardware_profile = None
+        if req.hardware_info.enabled:
+            from .hardware_info import ImageTiming, cached_profile
+            hardware_timer = ImageTiming(gp.batch_size, started_at=hardware_started)
+            hardware_profile = cached_profile(self)
+        ad_cfg = hooks_mod.hook_config(gp.hooks, "animatediff", animatediff.DEFAULTS)
+        ad_cfg = animatediff.normalize(ad_cfg) if ad_cfg is not None else None
+        latent_config = hooks_mod.hook_config(gp.hooks, "latent_upscale", {})
+        if latent_config is not None:
+            latent_config = latent_upscale.normalize(latent_config)
+            gp = replace(gp, scheduler=latent_upscale.schedule(latent_config, gp.scheduler))
+        animation = hooks_mod.hook_config(gp.hooks, "steps_animation", {})
+        if animation is not None:
+            steps_animation.validate_generation(gp)
+            self._intermediate_recorder = steps_animation.Recorder(req.output_dir, animation, ctx,
+                dict(prompt=gp.prompt, negative_prompt=gp.negative_prompt, seed=gp.seed, sampler=gp.sampler_name,
+                     steps=gp.steps, cfg_scale=gp.cfg_scale, mode=mode, generation=params.get("params", {})),
+                image_password=getattr(ctx, 'image_password', None),
+                allow_plaintext_video=getattr(ctx, 'allow_plaintext_video', False))
+        intermediate = hooks_mod.hook_config(gp.hooks, "save_intermediate", {})
+        if intermediate is not None:
+            self._intermediate_recorder = save_intermediate.Recorder(intermediate.get("output_dir") or req.output_dir, intermediate, ctx,
+                dict(prompt=gp.prompt, negative_prompt=gp.negative_prompt, sampler=gp.sampler_name,
+                     steps=gp.steps, cfg_scale=gp.cfg_scale, mode=mode, preview_method=req.preview_method,
+                     generation=params.get("params", {})), image_password=getattr(ctx, 'image_password', None),
+                allow_plaintext_video=getattr(ctx, 'allow_plaintext_video', False))
+        self._extra = dict(gp.extra or {})
+        self._ms_overrides = ext_mod.model_sampling_overrides(gp)
+        self.ensure_model(gp, ctx)
+        keyword_plan, keyword_loras = self.generation_keyword_plan(gp, req, seed, ctx)
+        keyword_composable = keyword_plan is not None and hooks_mod.hook_config(gp.hooks, 'composable_lora', {}) is not None
+        if keyword_composable:
+            from .model_keyword import generation_composable_loras
+            try:
+                prompts = keyword_plan['prompts'] + [gp.hires.prompt]
+                alternate = hooks_mod.hook_config(gp.hooks, 'img2imgalt', {}) or {}
+                prompts += [str(alternate.get('override_prompt', '')), str(alternate.get('override_negative', ''))]
+                if refine_config is not None:
+                    prompts += [keyword_plan.get('refinement_prompt', refine_config.prompt)]
+                manual = gp.loras if req.manual_loras is None else req.manual_loras
+                gp = replace(gp, loras=generation_composable_loras(prompts, manual, req.lora_paths))
+                if req.manual_loras is None:
+                    req = replace(req, manual_loras=manual)
+            except ValueError as exc:
+                raise EngineError(INVALID_PARAMS, f'Model keyword: {exc}') from exc
+        if self._intermediate_recorder is not None:
+            self._intermediate_recorder.metadata.update(model=self.model, vae=self.vae_info)
+        w, h = gp.width, gp.height
+        is_inpaint_model = self.kind.endswith("inpaint")
+
+        separate_loras = hires and req.hires_loras is not None and hooks_mod.hook_config(gp.hooks, "composable_lora", {}) is None
+        hr_gp = replace(gp, loras=req.hires_loras) if separate_loras else gp
+        lora_hashes = self._apply_loras(gp, req, ctx)
+        texts = [gp.prompt, gp.negative_prompt] + ([hp.prompt, hp.negative_prompt] if hires else [])
+        if refine_config is not None:
+            texts += [refine_config.prompt, refine_config.negative_prompt]
+        if keyword_plan is not None:
+            texts += keyword_plan['prompts']
+        alternate = hooks_mod.hook_config(gp.hooks, 'img2imgalt', {}) or {}
+        texts += [str(alternate.get('override_prompt', '')), str(alternate.get('override_negative', ''))]
+        gradient_enabled = hooks_mod.hook_config(gp.hooks, "weight_gradient", {}) is not None
+        if (gradient_enabled and hooks_mod.hook_config(gp.hooks, "photomaker", {}) is not None
+                and any(weight_gradient.has_gradient(text) for text in texts)):
+            raise EngineError(UNSUPPORTED, "Weight Gradient syntax is not available with PhotoMaker's text-only encoder")
+        if (hooks_mod.hook_config(gp.hooks, "negpip", {}) is not None
+                and hooks_mod.hook_config(gp.hooks, "photomaker", {}) is not None
+                and any(negpip.extract(text)[1] for text in texts)):
+            raise EngineError(UNSUPPORTED, "NegPiP negative weights are not available with PhotoMaker's text-only encoder")
+        self._load_embeddings(req, texts, ctx)
+        if 'embedding_editor_preview' in params:
+            from .embedding_editor_adapter import EngineEditorAdapter
+            from .embedding_editor_generation import validate_preview
+            from .embedding_editor_tensor import read_editor_vectors
+            try:
+                # Fail before sampling if the shared encoding transaction is unavailable.
+                from .embedding_merge_backend import run_encoding_transaction
+                adapter = EngineEditorAdapter(self, read_vectors=read_editor_vectors)
+                self._editor_preview = validate_preview(adapter, params['embedding_editor_preview'], ctx)
+            except (ValueError, ImportError) as failure:
+                raise EngineError(INVALID_PARAMS, f'Embedding editor preview: {failure}') from failure
+        ctx.resource_hashes = None
+        if hooks_mod.hook_config(gp.hooks, "pnginfo_injection", {}) is not None:
+            from .resource_hashes import record_file
+            from .resource_hashes import ResourceHashes
+            ctx.resource_hashes = ResourceHashes()
+            from .resource_hashes import file_resource_hash
+            for key, info, hash_key in (("model", self.model, "hash"), ("vae", self.vae_info, "vae_hash")):
+                # These digests were captured when the actual weights were loaded.
+                if info and info.get(hash_key) and os.path.isfile(info.get("path", "")):
+                    ctx.resource_hashes[key] = info[hash_key]
+            ctx.resource_hashes.update({f'lora:{name}': value for name, value in lora_hashes.items()})
+            for token, path in self.loaded_embedding_files.items():
+                if any(re.search(r'(?<![\w-])' + re.escape(token) + r'(?![\w-])', text) for text in texts):
+                    # Preserve the tokenizer token rather than the filename suffix.
+                    try:
+                        from .resource_hashes import file_resource_hash
+                        ctx.resource_hashes[f'embed:{token}'] = self.embedding_snapshots[token].digest()
+                    except (OSError, ValueError) as error:
+                        ctx.warn(f'Resource hash unavailable for embedding {token}: {error}')
+        pag = self._pag_config(gp, ctx)
+
+        alternative = (mode == "img2img" and gp.img2img.mask is None and not is_inpaint_model
+                       and hooks_mod.hook_config(gp.hooks, "img2imgalt", extras.IMG2IMGALT_DEFAULTS) is not None)
+        gradient_steps = ((gp.steps if latent_config is not None else img2img_steps(gp.steps, gp.img2img.denoising_strength)[2])
+                          if mode == "img2img" and not alternative else gp.steps)
+        embeds = self._encode_scheduled(gp.prompt, gp.negative_prompt, gp, bs, gp.steps, gradient_total=gradient_steps)
+        resolved_prompts = tweaks is not None and tweaks.get('prompts_resolved') is True
+        hr_pos, hr_neg = ((hp.prompt, hp.negative_prompt) if resolved_prompts else
+            (hp.prompt or gp.prompt, hp.negative_prompt or gp.negative_prompt)) if hires else ("", "")
+        gradient_hr = gradient_enabled and (weight_gradient.has_gradient(hr_pos) or weight_gradient.has_gradient(hr_neg))
+        if separate_loras:
+            embeds = self._adjust_embeds(gp, embeds, ctx)
+            hr_gp = replace(hr_gp, prompt=hr_pos, negative_prompt=hr_neg)
+            try:
+                hr_hashes = self._apply_loras(hr_gp, req, ctx)
+                lora_hashes.update(hr_hashes)
+                if ctx.resource_hashes is not None:
+                    ctx.resource_hashes.update({f'lora:{name}': value for name, value in hr_hashes.items()})
+                hr_actual = hires_steps(hp.second_pass_steps or gp.steps, hp.denoising_strength)[2]
+                hr_embeds = self._encode_scheduled(hr_pos, hr_neg, hr_gp, bs, gp.steps,
+                    hp.second_pass_steps or gp.steps, gradient_total=hr_actual)
+                hr_embeds = self._adjust_embeds(hr_gp, hr_embeds, ctx)
+            finally:
+                self._apply_loras(gp, req, ctx)
+        elif hires and (resolved_prompts or hp.prompt or hp.negative_prompt or prompt_schedule.has_schedule(hr_pos)
+                      or prompt_schedule.has_schedule(hr_neg) or gradient_hr
+                      or (hooks_mod.hook_config(gp.hooks, "prompt_fusion", {}) is not None
+                          and (prompt_fusion.active(hr_pos) or prompt_fusion.active(hr_neg)))
+                      or getattr(self, "_composable_job", None) is not None):
+            hr_actual = hires_steps(hp.second_pass_steps or gp.steps, hp.denoising_strength)[2]
+            hr_embeds = self._encode_scheduled(hr_pos, hr_neg, gp, bs, gp.steps, hp.second_pass_steps or gp.steps,
+                                               gradient_total=hr_actual)
+        else:
+            hr_embeds = embeds
+        if not separate_loras:
+            same_hr = hr_embeds is embeds
+            embeds = self._adjust_embeds(gp, embeds, ctx)
+            hr_embeds = embeds if same_hr else self._adjust_embeds(gp, hr_embeds, ctx)
+
+        init_img = None
+        job = None
+        if mode == "img2img":
+            init_img = load_rgb(gp.img2img.init_image)
+        cn = self._controlnets(gp, req, init_img, w, h, ctx)
+        if ad_cfg is not None:
+            animatediff.validate_job(self, gp, mode, ad_cfg, hires=hires, controlnet=bool(cn[0]), inpaint_model=is_inpaint_model,
+                                     model_keyword=keyword_plan is not None, refine=refine_config is not None,
+                                     hires_plan=hr_plan is not None)
+        if ctx.resource_hashes is not None:
+            from .resource_hashes import record_file
+            for path, model in cn[0]:
+                record_file(ctx.resource_hashes, 'controlnet', path, ctx.warn, getattr(model, '_sdfx_resource_snapshot', None))
+        if gp.subseed_strength > 0 and mode == "img2img":
+            ctx.warn("variation seed is only applied in txt2img")
+
+        out_images = []
+        out_auxiliary = []
+        plan = None
+        def finish_batch(imgs, base_seeds, base_subs, seeds, idx0, it, repeat=0, hr_seeds=None, hr_subs=None, pass_gp=None):
+            effective_gp = pass_gp if pass_gp is not None else gp
+            ad = hooks_mod.hook_config(gp.hooks, "adetailer", {})
+            bfs = hooks_mod.hook_config(gp.hooks, "batch_face_swap", {})
+            detail = bool(ad) or bfs is not None  # ADetailer, then the Batch Face Swap face pass
+            def face_passes(pass_gp, images, item_seeds, first):
+                if ad:
+                    images = self._adetailer(pass_gp, req, ctx, ad, images, item_seeds, first, total, pag)
+                if bfs is not None:
+                    from . import batch_face_swap
+                    images = self._adetailer(pass_gp, req, ctx, batch_face_swap.to_adetailer(bfs), images,
+                                             item_seeds, first, total, pag, batch_face_swap.normalize(bfs)["checkpoint"], bfs)
+                return images
+            if hr_plan is None and refine_config is None and (keyword_plan is None or not detail):
+                if detail:
+                    imgs = face_passes(effective_gp, imgs, seeds, idx0)
+                imgs = ext_mod.post_images(self, gp, None, imgs, ctx=ctx, faces=True)
+            for j, im in enumerate(imgs):
+                if hr_plan is not None or refine_config is not None or (keyword_plan is not None and detail):
+                    # Publish each finished item before another item's detector/inpaint can interrupt.
+                    item_gp = (replace(effective_gp, prompt=keyword_plan['batches'][it]['clean_prompts'][j])
+                               if keyword_plan is not None else effective_gp)
+                    if detail and keyword_plan is not None:
+                        from .model_keyword import postprocess_keyword_items
+                        item = postprocess_keyword_items([im], [item_gp.prompt], [seeds[j]],
+                            lambda image, text, item_seed, _: face_passes(item_gp, [image], [item_seed], idx0 + j)[0])
+                    else:
+                        item = face_passes(item_gp, [im], [seeds[j]], idx0 + j) if detail else [im]
+                    im = ext_mod.post_images(self, gp, None, item, ctx=ctx, faces=True)[0]
+                if refine_config is not None:
+                    refine_gp, refine_req = gp, req
+                    if keyword_plan is not None and 'refinement_prompt' in keyword_plan:
+                        text = (keyword_plan['refinement_prompt'] if keyword_composable else
+                                keyword_plan['refinement_clean_prompt'])
+                        refine_gp = replace(gp, prompt=text)
+                        refine_req = replace(req, img2img_hires_loras=keyword_plan['refinement_loras'])
+                    im = img2img_hires_fix.refine(self, refine_gp, refine_req, ctx, refine_config, im,
+                        seeds[j], idx0 + j, total, pag, cn, effective_gp, lora_hashes)
+                # NudeNet NSFW Censor: after ADetailer, post-images and img2img Hires Fix, just before saving.
+                im, censor_auxiliaries = nsfw_checker.censor_final(im, nsfw_cfg, ctx)
+                if sonar_cfg is not None:
+                    im = sonar.upscale_image(self, im, sonar_cfg, gp, req, ctx)
+                path = next_output_path(req.output_dir, str(base_seeds[j]))
+                image_result = {"path": path, "seed": base_seeds[j], "subseed": base_subs[j],
+                                "width": im.width, "height": im.height}
+                face_hash = ctx.face_checkpoint_hashes.get(idx0 + j)
+                if face_hash:
+                    image_result.setdefault("infotext_fields", []).append(["Face checkpoint hash", face_hash])
+                if keyword_plan is not None:
+                    image_result['effective_prompt'] = keyword_plan['replay_prompts'][it * bs + j]
+                    image_result['model_keyword_source_prompt'] = keyword_plan['prompts'][it * bs + j]
+                    if 'refinement_prompt' in keyword_plan:
+                        image_result['model_keyword_refinement_prompt'] = keyword_plan['refinement_prompt']
+                if hr_plan is not None and hr_seeds is not None:
+                    image_result.update(hires_seed=wire_seed(hr_seeds[j]), hires_subseed=wire_seed(hr_subs[j]),
+                        hires_subseed_strength=hr_plan.strength, hires_repeat=repeat,
+                        hires_seed_resize_from_w=hr_plan.resize_width,
+                        hires_seed_resize_from_h=hr_plan.resize_height)
+                if hardware_timer is not None:
+                    from .hardware_info import record
+                    image_result['hardware_info'] = record(hardware_profile, hardware_timer.next_image(), req.hardware_info.remark)
+                if aesthetic_cfg is not None:
+                    # Aesthetic score: the final image as it is saved (after censoring and any upscale).
+                    score = aesthetic_score.score_final(im, aesthetic_cfg, ctx, gp, seed, self.model["hash"])
+                    score_fields = score.pop("infotext_fields", [])
+                    image_result.update(score)
+                    image_result.setdefault("infotext_fields", []).extend(score_fields)
+                if getattr(self, '_benchmark_no_save', False):
+                    if getattr(self, '_vram_capture_sample', False) and getattr(self, '_vram_sample', None) is None:
+                        self._vram_sample = im.copy()
+                    path = ''  # internal benchmark excludes PNG encoding/disk I/O, like upstream do_not_save_samples
+                    image_result['path'] = path
+                else:
+                    save_png(im, path)
+                out_images.append(image_result)
+                if path and censor_auxiliaries:
+                    out_auxiliary.extend(nsfw_checker.save_auxiliaries(image_result, censor_auxiliaries,
+                                                                       req.output_dir, len(out_images) - 1))
+                if self._intermediate_recorder is not None:
+                    self._intermediate_recorder.final(im, base_seeds[j], it * repeats + repeat, j)
+
+        interrupted = False
+        base_gp = gp
+        try:
+            for it in range(n_iter):
+                idx0 = it * bs
+                seeds = [seed + idx0 + j for j in range(bs)]
+                subs = [subseed + idx0 + j for j in range(bs)]
+                ctx.check_interrupt()
+                if keyword_plan is not None:
+                    from .model_keyword_conditioning import encode_batch
+                    gp = base_gp if keyword_composable else replace(base_gp, loras=keyword_loras[it])
+                    if hooks_mod.hook_config(gp.hooks, 'photomaker', {}) is not None:
+                        gp = replace(gp, prompt=keyword_plan['batches'][it]['clean_prompts'][0])
+                    if not keyword_composable:
+                        lora_hashes.update(self._apply_loras(gp, req, ctx))
+                    if ctx.resource_hashes is not None:
+                        ctx.resource_hashes.update({f'lora:{name}': value for name, value in lora_hashes.items()})
+                    def scheduled(variants):
+                        result = ScheduledEmbeds(variants[0][1]); result.schedule = variants; return result
+                    batch_prompts = (keyword_plan['prompts'][it * bs:(it + 1) * bs] if keyword_composable
+                                     else keyword_plan['batches'][it]['clean_prompts'])
+                    if keyword_composable:
+                        composable_job = self._composable_job
+                        clock = composable_lora.clock_total(gp, composable_job.config, gradient_steps)
+                        empty_cache = {}
+                        def empty(index, item, key):
+                            source = item.get('_clora_branch', batch_prompts[index])
+                            full = item.get('_clora_prompt', batch_prompts[index])
+                            negative = item.get('_clora_negative', gp.negative_prompt)
+                            cache_key = source, full, negative, key
+                            if cache_key not in empty_cache:
+                                with composable_job.using(source, [key == 'prompt_embeds'], -1, clock, phase='text_encoder',
+                                               full_prompt=full, negative_prompt=negative):
+                                    empty_cache[cache_key] = self._encode_plain('', '', gp, 1)[key]
+                            return empty_cache[cache_key]
+                    else:
+                        empty = self._encode_plain('', '', gp, 1)['prompt_embeds']
+                    embeds = encode_batch(batch_prompts,
+                        lambda text: self._encode_scheduled(text, gp.negative_prompt, gp, 1, gp.steps,
+                                                            gradient_total=gradient_steps),
+                        empty, gp.steps, scheduled)
+                    embeds = self._adjust_embeds(gp, embeds, ctx)
+                    if hires and not separate_loras:
+                        hr_actual = hires_steps(hp.second_pass_steps or gp.steps, hp.denoising_strength)[2]
+                        hr_embeds = self._adjust_embeds(gp, self._encode_scheduled(hr_pos, hr_neg, gp, bs,
+                            gp.steps, hp.second_pass_steps or gp.steps, gradient_total=hr_actual), ctx)
+                if ad_cfg is not None:
+                    video = animatediff.generate_frames(self, gp, req, ctx, ad_cfg, mode, seeds[0])
+                    finish_batch(video, [seeds[0]] * len(video), [subs[0]] * len(video), [seeds[0]] * len(video), idx0, it)
+                    continue
+                if mode == "txt2img":
+                    latent_hr = hires and hires_mod.is_latent(hp.upscaler)
+                    otype = "latent" if latent_hr else "pil"
+                    if is_inpaint_model:
+                        gray = Image.new("RGB", (w, h), (127, 127, 127))
+                        white = Image.new("L", (w, h), 255)
+                        imgs, plan = self._run("inpaint", gp, req, ctx, sampler=gp.sampler_name, schedule=gp.scheduler,
+                                               cfg_scale=gp.cfg_scale, embeds=embeds, steps=gp.steps, w=w, h=h, seeds=seeds,
+                                               pass_="base", image_idx=idx0 * repeats, images_total=total, image=[gray] * bs,
+                                               mask=[white] * bs, strength=1.0, cn=cn, output_type=otype, pag=pag,
+                                               hook_seed=seeds[0])
+                    else:
+                        lat = self._noise(seeds, subs, gp.subseed_strength, w, h, gp)
+                        imgs, plan = self._run("txt2img", gp, req, ctx, sampler=gp.sampler_name, schedule=gp.scheduler,
+                                               cfg_scale=gp.cfg_scale, embeds=embeds, steps=gp.steps, w=w, h=h, seeds=seeds,
+                                               pass_="base", image_idx=idx0 * repeats, images_total=total, latents=lat, cn=cn,
+                                               output_type=otype, pag=pag, hook_seed=seeds[0],
+                                               photomaker_prompts=batch_prompts if keyword_plan is not None else None)
+                    if hires:
+                        tw, th = hp.target_size(w, h)
+                        uw, uh = hp.upscale_size(w, h)
+                        if latent_hr:
+                            src = hires_mod.upscale_latents(imgs, uw, uh, hp.upscaler)
+                            if (uw, uh) != (tw, th):
+                                l, t, r, b = center_crop_box(uw // 8, uh // 8, tw // 8, th // 8)
+                                src = src[:, :, t:b, l:r]
+                        else:
+                            src = []
+                            for im in imgs:
+                                ctx.check_interrupt()
+                                try:
+                                    up = upscalers.upscale_to(im, uw, uh, hp.upscaler, req.upscaler_paths.get(hp.upscaler),
+                                                              self.device, self.dtype, ctx.check_interrupt)
+                                except EngineError:
+                                    raise
+                                except ImportError as e:
+                                    raise EngineError(UNSUPPORTED, f"hires upscaler '{hp.upscaler}' needs spandrel: {e}")
+                                except Exception as e:
+                                    raise EngineError(MODEL_LOAD_FAILED, f"hires upscaler '{hp.upscaler}' failed: {e}",
+                                                      traceback.format_exc())
+                                if up.size != (tw, th):
+                                    up = up.crop(center_crop_box(up.width, up.height, tw, th, 8))
+                                src.append(up)
+                        n, strength, actual = hires_steps(hp.second_pass_steps or gp.steps, hp.denoising_strength)
+                        task2 = "inpaint" if is_inpaint_model else "img2img"
+                        if task2 == "inpaint" and latent_hr:
+                            ctx.warn("latent hires upscale is not supported for inpainting models; decoding first")
+                            src = self._decode(src, ctx, req.vae_recovery_dir or req.output_dir)
+                        hr_cn = (cn[0], cn[1], cn[2]) if cn[0] else None
+                        for repeat in range(repeats):
+                            ctx.check_interrupt()
+                            hr_seeds, hr_subs = hr_plan.batch(idx0, bs, repeat) if hr_plan is not None else (seeds, subs)
+                            noise = ((hr_subs, hr_plan.strength, hr_plan.resize_width, hr_plan.resize_height)
+                                if hr_plan is not None and (hr_plan.strength > 0 or hr_plan.resize_width > 0) else None)
+                            output_idx = (it * repeats + repeat) * bs
+                            try:
+                                if separate_loras:
+                                    self._apply_loras(hr_gp, req, ctx)
+                                imgs, _ = self._run(task2, hr_gp, req, ctx, sampler=hp.sampler_name or gp.sampler_name,
+                                                    schedule=hp.scheduler or gp.scheduler,
+                                                    cfg_scale=hp.cfg_scale if hp.cfg_scale is not None else gp.cfg_scale,
+                                                    embeds=hr_embeds, steps=n, w=tw, h=th, seeds=hr_seeds, pass_="hires", image_idx=output_idx,
+                                                    images_total=total, image=src, mask=[Image.new("L", (tw, th), 255)] * bs,
+                                                    strength=strength, expected_steps=actual, cn=hr_cn, pag=pag, hook_seed=hr_seeds[0] + 1, hires_noise=noise)
+                                finish_batch(imgs, seeds, subs, hr_seeds, output_idx, it, repeat, hr_seeds, hr_subs, hr_gp)
+                            finally:
+                                if separate_loras:
+                                    self._apply_loras(gp, req, ctx)
+                        continue
+                else:
+                    ip = gp.img2img
+                    n, strength, actual = (latent_upscale.full_steps(gp.steps, ip.denoising_strength) if latent_config is not None
+                                           else img2img_steps(gp.steps, ip.denoising_strength))
+                    latent_source = None
+                    if ip.mask is not None:
+                        source_mask = load_mask(ip.mask)
+                        job = inpaint.prepare(init_img, source_mask, w, h, 0 if latent_config is not None else ip.resize_mode, ip.mask_blur, ip.inpainting_fill,
+                                              ip.inpaint_full_res, ip.inpaint_full_res_padding, ip.inpainting_mask_invert, seeds[0])
+                        image, mask, task = job.image, job.mask, "inpaint"
+                        if latent_config is not None:
+                            if ip.inpaint_full_res:
+                                # Upstream full-res inpainting crops/resizes pixels before latent interpolation too.
+                                latent_source = (job.image, job.mask)
+                            else:
+                                source_job = inpaint.prepare(init_img, source_mask, init_img.width, init_img.height, 0,
+                                    ip.mask_blur, ip.inpainting_fill, False, ip.inpaint_full_res_padding,
+                                    ip.inpainting_mask_invert, seeds[0])
+                                latent_source = (source_job.image, source_job.mask)
+                    else:
+                        image = resize_image(0 if latent_config is not None else ip.resize_mode, init_img, w, h)
+                        mask = Image.new("L", (w, h), 255)
+                        task = "inpaint" if is_inpaint_model else "img2img"
+                        if latent_config is not None:
+                            latent_source = (init_img, Image.new("L", init_img.size, 255) if is_inpaint_model else None)
+                    alt = hooks_mod.hook_config(gp.hooks, "img2imgalt", extras.IMG2IMGALT_DEFAULTS)
+                    if alt and (ip.mask is not None or is_inpaint_model):
+                        ctx.warn("img2img alternative test needs plain img2img with a normal model; ignored")
+                        alt = None
+                    if alt:
+                        inverse_embeds = None
+                        if keyword_plan is not None:
+                            inverse_steps = int(alt.get('inversion_steps', 0)) or gp.steps
+                            inverse_embeds = self._adjust_embeds(gp, self._encode_scheduled(
+                                base_gp.prompt, base_gp.negative_prompt, gp, 1, inverse_steps,
+                                gradient_total=inverse_steps), ctx)
+                        args = (gp, req, ctx, alt, image, embeds, seeds, idx0, total, w, h, cn, pag)
+                        imgs, plan = (self._img2imgalt(*args, inverse_embeds=inverse_embeds)
+                                      if keyword_plan is not None else self._img2imgalt(*args))
+                    else:
+                        imgs, plan = self._run(task, gp, req, ctx, sampler=gp.sampler_name, schedule=gp.scheduler,
+                                               cfg_scale=gp.cfg_scale, embeds=embeds, steps=n, w=w, h=h, seeds=seeds,
+                                               pass_="base", image_idx=idx0, images_total=total, image=[image] * bs,
+                                               mask=[mask] * bs, strength=strength, expected_steps=actual, cn=cn, pag=pag,
+                                               hook_seed=seeds[0], latent_source=latent_source)
+                    if job is not None:
+                        imgs = [job.finalize(im) for im in imgs]
+                finish_batch(imgs, seeds, subs, seeds, idx0 * repeats, it)
+        except EngineError as error:
+            if error.code != "interrupted" or (hr_plan is None and refine_config is None and keyword_plan is None) or not out_images:
+                raise
+            interrupted = True
+
+        m = self.model
+        intermediate_artifacts = self._intermediate_recorder.finish() if self._intermediate_recorder else []
+        return {
+            "images": out_images,
+            "interrupted": interrupted,
+            "timing_s": round(time.monotonic() - t0, 3),
+            "model_name": m["name"], "model_hash": m["hash"],
+            "vae_name": self.vae_info["vae_name"] if self.vae_info else None,
+            "vae_hash": self.vae_info["vae_hash"] if self.vae_info else None,
+            "lora_hashes": lora_hashes,
+            **({"resource_hashes": ctx.resource_hashes} if ctx.resource_hashes is not None else {}),
+            "scheduler": plan.schedule if plan else schedulers.resolve_schedule(gp.sampler_name, gp.scheduler),
+            "warnings": list(ctx.warnings),
+            "intermediate_artifacts": intermediate_artifacts,
+            **({"auxiliary_images": out_auxiliary} if out_auxiliary else {}),
+        }
+
+    # hooks that must not run again on ADetailer's inpainting passes (whole-image effects, or ADetailer itself)
+    _ADETAILER_SKIP_HOOKS = ("steps_animation", "adetailer", "save_intermediate", "tiling", "latent_mirroring", "multidiffusion", "kohya_hrfix", "reference",
+                             "revision", "ip_adapter", "controllllite", "photomaker", "img2imgalt", "soft_inpainting",
+                             "agent_attention", "incantations", "sonar", "llul", "aesthetic_gradients", "batch_face_swap")
+
+    def _adetailer(self, gp, req, ctx, cfg, imgs, seeds, idx0, total, pag, checkpoint="", face_config=None):
+        from contextlib import ExitStack
+        if checkpoint and self.model and self.model.get("path"):
+            try:
+                if os.path.samefile(checkpoint, self.model["path"]):
+                    checkpoint = ""
+            except OSError:
+                pass
+        with ExitStack() as stack:
+            worker = None
+            def face_engine(sub):
+                nonlocal worker
+                from . import batch_face_swap
+                if not checkpoint:
+                    batch_face_swap.verify_checkpoint_hash((face_config or {}).get("checkpoint_hash", ""), self.model)
+                    return self
+                if worker is None:
+                    worker = stack.enter_context(batch_face_swap.face_engine_scope(self, checkpoint, ctx, Engine))
+                    batch_face_swap.verify_checkpoint_hash((face_config or {}).get("checkpoint_hash", ""), worker.model)
+                    batch_face_swap.prepare_face_engine(worker, sub, req, ctx, face_config or {})
+                return worker
+            return self._adetailer_impl(gp, req, ctx, cfg, imgs, seeds, idx0, total, pag, face_engine, face_config)
+
+    def _adetailer_impl(self, gp, req, ctx, cfg, imgs, seeds, idx0, total, pag, face_engine, face_config):
+        """ADetailer: detect, then inpaint every detection of every unit (in unit order) at full resolution."""
+        import dataclasses
+
+        from . import adetailer as adm
+        units = adm.normalize_units(cfg)
+        if not units:
+            return imgs
+        sub = dataclasses.replace(gp, hooks={k: v for k, v in (gp.hooks or {}).items()
+                                             if k not in self._ADETAILER_SKIP_HOOKS and not k.endswith("_xyz")})
+        dev = "cuda" if self.cuda else "cpu"
+        out = []
+        for j, im in enumerate(imgs):
+            seed = seeds[j] if j < len(seeds) else seeds[0]
+            for ui, u in enumerate(units):
+                ctx.check_interrupt()
+                try:
+                    if getattr(ctx, 'resource_hashes', None) is not None:
+                        resolved = adm.resolve_model(u['model'], cfg.get('model_dirs'))
+                        masks = adm.unit_masks(im, {**u, 'model': resolved}, dev, cfg.get("model_dirs"))
+                        if resolved != 'opencv_face':
+                            from .resource_hashes import record_file
+                            resource = adm.loaded_snapshot(resolved)
+                            resource_path = str(resource.path) if resolved == 'mediapipe_face' and resource else resolved
+                            record_file(ctx.resource_hashes, 'adetailer', resource_path, ctx.warn, resource)
+                    else:
+                        masks = adm.unit_masks(im, u, dev, cfg.get("model_dirs"))
+                except ImportError as e:
+                    package = 'mediapipe' if u['model'] == 'mediapipe_face' else 'ultralytics'
+                    raise EngineError(UNSUPPORTED, f"ADetailer model '{u['model']}' needs the {package} package: {e}")
+                except FileNotFoundError as e:
+                    raise EngineError(INVALID_PARAMS, str(e))
+                if not masks:
+                    log.info("ADetailer unit %d: nothing detected", ui + 1)
+                    continue
+                worker = face_engine(sub)
+                pos = adm.unit_prompts(u["prompt"], gp.prompt, len(masks))
+                neg = adm.unit_prompts(u["negative_prompt"], gp.negative_prompt, len(masks))
+                if u["use_inpaint_width_height"]:
+                    w, h = int(u["inpaint_width"]) // 8 * 8, int(u["inpaint_height"]) // 8 * 8
+                else:
+                    w, h = gp.width, gp.height
+                steps = int(u["steps"]) if u["use_steps"] else gp.steps
+                cfg_scale = float(u["cfg_scale"]) if u["use_cfg_scale"] else gp.cfg_scale
+                sampler = u["sampler"] if u["use_sampler"] and u["sampler"] else gp.sampler_name
+                n, strength, actual = img2img_steps(steps, float(u["denoising_strength"]))
+                for k, m in enumerate(masks):
+                    ctx.check_interrupt()
+                    job = inpaint.prepare(im, m, w, h, 0, int(u["mask_blur"]), 1, bool(u["inpaint_only_masked"]),
+                                          int(u["inpaint_padding"]), False, seed)
+                    emb = worker._adjust_embeds(sub, worker._encode_scheduled(pos[k], neg[k], sub, 1, steps,
+                                                                         gradient_total=actual), ctx)
+                    res, _ = worker._run("inpaint", sub, req, ctx, sampler=sampler, schedule=gp.scheduler,
+                                       cfg_scale=cfg_scale, embeds=emb, steps=n, w=w, h=h, seeds=[seed],
+                                       pass_="adetailer", image_idx=idx0 + j, images_total=total, image=[job.image],
+                                       mask=[job.mask], strength=strength, expected_steps=actual, pag=pag,
+                                       hook_seed=seed, conditioning_denoise=float(u['denoising_strength']))
+                    if face_config and face_config.get("checkpoint"):
+                        face_hash = (getattr(worker, "model", None) or {}).get("hash")
+                        if face_hash:
+                            ctx.face_checkpoint_hashes[idx0 + j] = face_hash
+                            resources = getattr(ctx, "resource_hashes", None)
+                            if resources is not None:
+                                name = os.path.basename(face_config["checkpoint"])
+                                resources[f"face_model:{name}"] = face_hash
+                    redrawn = res[0]
+                    if u["color_correction"]:
+                        redrawn = adm.match_colors(redrawn, job.image)
+                    im = job.finalize(redrawn)
+            out.append(im)
+        return out
+
+    def _img2imgalt(self, gp, req, ctx, alt, image, embeds, seeds, idx0, total, w, h, cn, pag, inverse_embeds=None):
+        """img2imgalt.py: invert the init image to noise with DDIM, then sample from that noise."""
+        from .embedding_editor_generation import preview_encoding
+        c = adapters.normalize(alt, extras.IMG2IMGALT_DEFAULTS)
+        steps = int(c["inversion_steps"]) or gp.steps
+        enc = embeds if inverse_embeds is None else inverse_embeds
+        if (hooks_mod.hook_config(gp.hooks, "prompt_fusion", {}) is not None
+                and any(prompt_fusion.active(t) for t in
+                        (c["override_prompt"] or gp.prompt, c["override_negative"] or gp.negative_prompt))):
+            raise EngineError(UNSUPPORTED, "Prompt Fusion schedules are not supported during img2img Alternative inversion")
+        if c["override_prompt"] or c["override_negative"]:
+            if (hooks_mod.hook_config(gp.hooks, "neutral_prompt", {}) is not None or
+                    getattr(self, '_composable_job', None) is not None):
+                candidate = self._encode_scheduled(c["override_prompt"] or gp.prompt, c["override_negative"] or gp.negative_prompt,
+                                                   gp, 1, steps, gradient_total=steps)
+                if "_neutral" in candidate:
+                    enc = self._adjust_embeds(gp, candidate, ctx)
+                else:
+                    # Keep the legacy override route byte-for-byte when enabling Neutral does no composition.
+                    enc = preview_encoding(self, lambda: self._encode(
+                        c["override_prompt"] or gp.prompt, c["override_negative"] or gp.negative_prompt, gp, 1))
+            else:
+                enc = preview_encoding(self, lambda: self._encode(
+                        c["override_prompt"] or gp.prompt, c["override_negative"] or gp.negative_prompt, gp, 1))
+        elif "_neutral" in enc:
+            enc = self._adjust_embeds(gp, self._encode_scheduled(gp.prompt, gp.negative_prompt, gp, 1, steps,
+                                                               gradient_total=steps), ctx)
+        inverse_plan = enc.get("_neutral")
+        if inverse_plan:
+            neutral_runtime.validate(gp.hooks, controlnet=bool(cn and cn[0]), pag=bool(pag))
+        self._activate(self.pipe)
+        ip_image = None
+        if (hooks_mod.hook_config(gp.hooks, "ip_adapter", {}) is not None or
+                getattr(getattr(self, "ip_state", None), "loaded", None) is not None):
+            ip_image = ext_mod.configure_ip_adapter(self, self.pipe, gp, req)
+        if ip_image is not None:
+            from .neutral_ip import prepare
+            ip_embeds, _ = prepare(self.pipe, ip_image, 1, float(c["decode_cfg_scale"]) != 1)
+            enc = dict(enc, _ip_image_embeds=ip_embeds)
+        sched, _ = self._scheduler(gp.sampler_name, gp.scheduler, ctx)
+        self.pipe.scheduler = sched
+        lat = ext_mod.encode_image(self, self.pipe, image)
+        use_negpip = enc.get("_negpip") or (inverse_plan and any(v.get("_negpip") for v in inverse_plan.branches))
+        remove_negpip = negpip.install(self.pipe) if use_negpip else lambda: None
+        image_cleanups = []
+        def inverse_images(scheduler):
+            branch_hooks = []
+            if inverse_plan:
+                hook = composable_lora.inversion_branch_hook(getattr(self, '_composable_job', None),
+                                                              inverse_plan, scheduler, gp, steps)
+                if hook is not None:
+                    branch_hooks.append(hook)
+            ext_mod.install_reference(self, self.pipe, gp, image_cleanups, w=w, h=h, scheduler=scheduler,
+                                      branch_hooks=branch_hooks)
+            ext_mod.install_lllite(self, self.pipe, gp, req, image_cleanups, w=w, h=h, image=image,
+                                   branch_hooks=branch_hooks)
+            return branch_hooks
+        try:
+            inverse_options = {}
+            if inverse_plan:
+                from .neutral_sampling import Controller
+                inverse_options = dict(branch_setup=inverse_images,
+                    sampling_setup=lambda scheduler: Controller(scheduler, gp.hooks, seeds[0]))
+            inv = extras.invert_latents(self, self.pipe, lat, enc, steps, float(c["decode_cfg_scale"]), w, h,
+                                        ctx.check_interrupt, **inverse_options)
+        finally:
+            for cleanup in reversed(image_cleanups):
+                cleanup()
+            remove_negpip()
+        noise = inv.repeat(len(seeds), 1, 1, 1)
+        r = float(c["randomness"])
+        if r > 0:
+            rnd = self._noise(seeds, seeds, 0.0, w, h, gp).to(noise.device, noise.dtype)
+            noise = ((1 - r) * noise + r * rnd) / math.sqrt((1 - r)**2 + r**2)
+        # DDIM's inverse state has meaningful amplitude. Empirical std normalization changes the recovered
+        # signal (and even changes a pure seeded Gaussian at randomness=1), causing excessive contrast.
+        return self._run("txt2img", gp, req, ctx, sampler=gp.sampler_name, schedule=gp.scheduler, cfg_scale=gp.cfg_scale,
+                         embeds=embeds, steps=gp.steps, w=w, h=h, seeds=seeds, pass_="base", image_idx=idx0,
+                         images_total=total, latents=noise, image=image, cn=cn, pag=pag, hook_seed=seeds[0])
+
+    def _decode(self, latents, ctx=None, recovery_dir=None, device=None):
+        from contextlib import nullcontext
+        from .vae_tools import catch_decode
+        pipe = self.pipe
+        vae = pipe.vae
+        recovery = catch_decode(self, vae, recovery_dir, ctx) if ctx is not None and recovery_dir else nullcontext()
+        with torch.inference_mode(), recovery, vae_scope(self, vae, int(latents.shape[-1]) * 8, int(latents.shape[-2]) * 8,
+                                                         int(latents.shape[0]), ctx):
+            original_dtype = vae.dtype
+            needs_upcast = original_dtype == torch.float16 and getattr(vae.config, "force_upcast", False)
+            try:
+                if needs_upcast:
+                    vae.to(torch.float32)
+                # `device`: the compute device. With model offload the VAE rests on the CPU until its decode hook moves it.
+                lat = latents.to(device or vae.device, vae.dtype) / vae.config.scaling_factor
+                img = vae.decode(lat, return_dict=False)[0]
+            finally:
+                if needs_upcast:
+                    vae.to(original_dtype)
+        return pipe.image_processor.postprocess(img, output_type="pil")
+
+    # -- extras ----------------------------------------------------------------
+    def restore_faces(self, params: dict, ctx: JobContext) -> dict:
+        path = params.get("model") or ""
+        if not os.path.isfile(path):
+            raise EngineError(INVALID_PARAMS, f"face restoration model not found: {path}")
+        img = load_rgb(params["image_path"])
+        try:
+            out = extras.restore_faces_image(img, path, float(params.get("visibility", 1.0)),
+                                             float(params.get("codeformer_weight", 0.5)), self.device)
+        except ImportError as e:
+            raise EngineError(UNSUPPORTED, f"face restoration needs spandrel and opencv: {e}")
+        dst = next_output_path(params["output_dir"], "faces")
+        save_png(out, dst)
+        return {"path": dst}
+
+    def caption(self, params: dict, ctx: JobContext) -> dict:
+        img = load_rgb(params["image_path"])
+        try:
+            text = extras.caption_image(img, str(params.get("method", "blip")), float(params.get("threshold", 0.35)),
+                                        self.device)
+        except ImportError as e:
+            raise EngineError(UNSUPPORTED, f"captioning needs transformers: {e}")
+        return {"caption": text}
+
+    def run_code(self, params: dict, ctx: JobContext) -> dict:
+        ns = {"engine": self, "pipe": self.pipe, "torch": torch, "Image": Image, "params": params, "ctx": ctx}
+        res = extras.run_code(str(params.get("code", "")), ns)
+        paths = []
+        for i, im in enumerate(res.pop("images")):
+            dst = next_output_path(params.get("output_dir") or ".", f"code{i}")
+            save_png(im, dst)
+            paths.append(dst)
+        res["images"] = paths
+        return res
+
+    def img2vid(self, params: dict, ctx: JobContext) -> dict:
+        return extras.img2vid(self, params, ctx)
+
+    def novel_view(self, params: dict, ctx: JobContext) -> dict:
+        return extras.novel_view(self, params, ctx)
+
+    # -- tools -----------------------------------------------------------------
+    def preprocess(self, params: dict, ctx: JobContext) -> dict:
+        req = self.parse_preprocess(params)
+        img = load_rgb(req.image_path)
+        info, notes = None, []
+        try:
+            if req.standalone:
+                out, info, notes = cn_mod.standalone_preprocess(req.preprocessor, img, req.args, req.processor_res, req.pixel_perfect)
+            else:
+                out = cn_mod.run_preprocessor(req.preprocessor, img, req.args)
+        except Exception as e:
+            raise EngineError(INVALID_PARAMS, f"preprocessor '{req.preprocessor}' failed: {e}", traceback.format_exc())
+        path = next_output_path(req.output_dir, f"pre-{req.preprocessor}")
+        if info is None:
+            save_png(out, path)
+            return {"path": path}
+        for note in notes:
+            ctx.warn(note)
+        cn_mod.save_preprocessed(out, path, info, req.image_path)
+        return {"path": path, "info": info, "notes": notes}
+
+    def upscale(self, params: dict, ctx: JobContext) -> dict:
+        hardware_started = time.perf_counter()
+        req = self.parse_upscale(params)
+        hardware_timer = None
+        hardware_profile = None
+        if req.hardware_info.enabled:
+            from .hardware_info import ImageTiming, cached_profile
+            hardware_timer = ImageTiming(1, started_at=hardware_started)
+            hardware_profile = cached_profile(self)
+        img = load_rgb(req.image_path)
+        try:
+            out = upscalers.upscale_by(img, req.scale, req.upscaler, req.upscaler_paths.get(req.upscaler),
+                                       self.device, self.dtype, ctx.check_interrupt)
+        except EngineError:
+            raise
+        except ImportError as e:
+            raise EngineError(UNSUPPORTED, f"upscaler '{req.upscaler}' needs spandrel: {e}")
+        except Exception as e:
+            raise EngineError(MODEL_LOAD_FAILED, f"upscaler '{req.upscaler}' failed: {e}", traceback.format_exc())
+        path = next_output_path(req.output_dir, f"up-{req.upscaler}")
+        result = {"path": path}
+        if hardware_timer is not None:
+            from .hardware_info import record
+            result['hardware_info'] = record(hardware_profile, hardware_timer.next_image(), req.hardware_info.remark)
+        save_png(out, path)
+        return result
+
+
+SAG_SCHEDULERS = ("DDIMScheduler", "PNDMScheduler", "DDPMScheduler", "DEISMultistepScheduler", "UniPCMultistepScheduler",
+                  "DPMSolverMultistepScheduler", "DPMSolverSinglestepScheduler")
+
+__all__ = ["Engine", "slerp", "LATENT_UPSCALERS", "math"]

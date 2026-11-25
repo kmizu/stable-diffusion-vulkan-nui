@@ -1,0 +1,266 @@
+package sdfx.ui.view
+
+import javafx.beans.property.*
+import javafx.collections.{FXCollections, ObservableList}
+import javafx.scene.Node
+import javafx.scene.control.{Control as _, *}
+import javafx.scene.layout.VBox
+import sdfx.core.plugins.api.*
+import sdfx.ui.vm.{PluginValuesVM, PluginsVM, Widget}
+
+/** Renders plugin [[Control]]s generically and binds them to a [[PluginValuesVM]]. */
+object PluginForm:
+  def render(ctx: UiContext, form: PluginValuesVM): Node = render(ctx, form, form.plugin.controls)
+
+  def render(ctx: UiContext, form: PluginValuesVM, selected: Seq[Control]): Node =
+    val v = new VBox(8)
+    if form.plugin.description.nonEmpty then
+      val d = W.label(form.plugin.description, "muted", "plugin-description")
+      d.setWrapText(true)
+      v.getChildren.add(d)
+    // controls before the first Section go straight into the panel, each Section becomes a collapsible group
+    val groups = PluginForm.groups(selected)
+    groups.foreach { (section, controls) =>
+      val grid = renderControls(ctx, form, controls)
+      section match
+        case None => v.getChildren.add(grid)
+        case Some(s) =>
+          val tp = new TitledPane(s.label, grid)
+          tp.setExpanded(s.expanded)
+          tp.setAnimated(false)
+          tp.getStyleClass.add("plugin-subsection")
+          v.getChildren.add(tp)
+    }
+    form.plugin match
+      case p: sdfx.plugins.CreaPromptPlugin =>
+        // A Script form is mounted only while that script is selected.
+        Option(v.lookup("#plugin-creaprompt-preset")).foreach { n =>
+          val combo = n.asInstanceOf[ComboBox[String]]
+          combo.setOnShowing { _ =>
+            p.presetNames.filterNot(combo.getItems.contains).foreach(combo.getItems.add)
+          }
+        }
+        val active = new Label("CreaPrompt: Active")
+        active.setId("creaprompt-active")
+        val preview = new Label()
+        preview.setId("creaprompt-preview")
+        preview.setWrapText(true)
+        def updatePreview(): Unit =
+          try
+            val value = p.manualPreview(form.values)
+            preview.setText(if value.isEmpty then "Prompt preview: (no manual picks)" else "Prompt preview: " + value)
+          catch case e: IllegalArgumentException => preview.setText("Prompt preview: " + e.getMessage)
+        form.props.values.foreach(_.addListener((_, _, _) => updatePreview()))
+        updatePreview()
+        val name = new TextField()
+        name.setId("creaprompt-preset-name")
+        name.setPromptText("Preset name")
+        val save = new Button("Save category preset")
+        save.setId("creaprompt-save-preset")
+        val status = new Label()
+        status.setId("creaprompt-preset-status")
+        status.setWrapText(true)
+        save.setOnAction { _ =>
+          try
+            val saved = p.savePreset(form.values, name.getText)
+            val preset = v.lookup("#plugin-creaprompt-preset").asInstanceOf[ComboBox[String]]
+            val savedName = saved.getFileName.toString.stripSuffix(".config")
+            if preset != null then
+              if !preset.getItems.contains(savedName) then preset.getItems.add(savedName)
+              preset.setValue(savedName)
+            status.setText("Saved preset " + savedName)
+          catch case scala.util.control.NonFatal(e) => status.setText("Could not save preset: " + Option(e.getMessage).getOrElse(e.getClass.getSimpleName))
+        }
+        // Keep the summary and save action visible above the long per-category controls.
+        val insertion = if form.plugin.description.nonEmpty then 1 else 0
+        v.getChildren.add(insertion, active)
+        v.getChildren.add(insertion + 1, preview)
+        v.getChildren.add(insertion + 2, new javafx.scene.layout.HBox(6, name, save))
+        v.getChildren.add(insertion + 3, status)
+      case _ => ()
+    if form.plugin.promptActions.nonEmpty then
+      val actions = new javafx.scene.layout.FlowPane(8, 8)
+      form.plugin.promptActions.foreach { action =>
+        val button = new Button(action.label)
+        button.setId(form.plugin.id + "-action-" + action.id)
+        button.setOnAction { _ =>
+          try ctx.editPositivePrompt(action.text(form.values), action.replace)
+          catch case error: IllegalArgumentException => ctx.toaster.show(error.getMessage, Toaster.Kind.Error)
+        }
+        actions.getChildren.add(button)
+      }
+      v.getChildren.add(actions)
+    v
+
+  /** Splits controls at Section markers: (None, leading controls), (Some(section), its controls)... */
+  def groups(controls: Seq[Control]): Seq[(Option[Control.Section], Seq[Control])] =
+    val out = scala.collection.mutable.ArrayBuffer[(Option[Control.Section], Seq[Control])]()
+    var cur: Option[Control.Section] = None
+    val buf = scala.collection.mutable.ArrayBuffer[Control]()
+    def flush(): Unit =
+      if buf.nonEmpty || cur.nonEmpty then out += cur -> buf.toSeq
+      buf.clear()
+    controls.foreach {
+      case s: Control.Section => flush(); cur = Some(s)
+      case c                  => buf += c
+    }
+    flush()
+    out.toSeq
+
+  private[view] def renderControls(ctx: UiContext, form: PluginValuesVM, controls: Seq[Control]): Node =
+    val f = W.form()
+    controls.foreach { c =>
+      val widget = PluginValuesVM.widgetFor(c)
+      widget match
+        case Widget.Section => ()
+        case Widget.Label =>
+          val l = W.label(c.label, "plugin-note")
+          l.setWrapText(true)
+          f.full(l)
+        case Widget.CheckBox =>
+          // the AlwaysOn "enabled" toggle lives in the section header
+          if !(c.key == "enabled" && form.plugin.kind == PluginKind.AlwaysOn) then
+            f.full(W.check(c.label, boolProp(form.props(c.key))))
+        case _ =>
+          val node = control(ctx, c, widget, form.props(c.key), form.plugin.id)
+          node.setId(s"plugin-${form.plugin.id}-${c.key}")
+          bindEnabled(form, c.key, node)
+          f.add(c.label, node)
+    }
+    f.grid
+
+  /** Greys a control out while the checkbox named by `Plugin.enabledBy` is off. */
+  private def bindEnabled(form: PluginValuesVM, key: String, node: Node): Unit =
+    form.plugin.enabledBy.get(key).flatMap(form.props.get).foreach { gate =>
+      def update(v: String): Unit = node.setDisable(!Values(Map("v" -> v)).bool("v"))
+      update(gate.get)
+      gate.addListener((_, _, v) => update(v))
+    }
+
+  private def control(ctx: UiContext, c: Control, widget: Widget, p: StringProperty, pluginId: String): Node = (c, widget) match
+    case (s: Control.Slider, _) =>
+      val row = W.doubleSlider(doubleProp(p, s.defaultValue), s.min, s.max, s.step)
+      row.getChildren.forEach { case spinner: Spinner[?] => W.setNumericOwner(spinner, p); case _ => () }
+      row
+    case (i: Control.IntField, _) =>
+      if i.max - i.min <= 4096 then
+        val row = W.intSlider(intProp(p, i.defaultValue), i.min, i.max)
+        row.getChildren.forEach { case spinner: Spinner[?] => W.setNumericOwner(spinner, p); case _ => () }
+        row
+      else
+        val spinner = W.intSpinner(intProp(p, i.defaultValue), i.min, i.max)
+        W.setNumericOwner(spinner, p)
+        spinner
+    case (ch: Control.Choice, _) if ch.previewResources.nonEmpty =>
+      PreviewChoice.render(ch, p)
+    case (ch: Control.Choice, _) =>
+      val items = if pluginId == "model_keyword" && ch.key == "model_choice" then ctx.modelKeywordChoices
+        else if pluginId == "model_keyword" && ch.key == "lora_choice" then ctx.loraKeywordChoices
+        else FXCollections.observableArrayList(ch.options*)
+      val combo = W.combo(items, p)
+      combo.setEditable(ch.allowCustom)
+      combo
+    case (dc: Control.DynamicChoice, _) =>
+      val combo = W.combo(dynamicItems(ctx, dc), p)
+      if dc.source == ChoiceSource.Checkpoints then
+        def refreshLabels(): Unit = combo.setConverter(new javafx.util.StringConverter[String]:
+          def toString(value: String): String = if value == null then "" else ctx.checkpointLabel(value)
+          def fromString(value: String): String = value)
+        refreshLabels()
+        ctx.hiresPreferences.addListener((_, _, _) => refreshLabels())
+        ctx.catalog.snapshot.addListener((_, _, _) => refreshLabels())
+      combo
+    case (t: Control.Text, Widget.TextArea) =>
+      val a = new TextArea()
+      a.textProperty.bindBidirectional(p)
+      a.setPromptText(t.placeholder)
+      a.setPrefRowCount(4)
+      a.setWrapText(true)
+      a
+    case (t: Control.Text, _) =>
+      W.textField(p, t.placeholder)
+    case (_: Control.ImageFile, Widget.ImageList) =>
+      val a = new TextArea()
+      a.textProperty.bindBidirectional(p)
+      a.setPromptText("One image path per line")
+      a.setPrefRowCount(3)
+      val add = W.button("Add images…", "Choose one or more image files") {
+        val fs = ImageFiles.chooser("Add images").showOpenMultipleDialog(ctx.stage)
+        if fs != null && !fs.isEmpty then
+          val cur = p.get.split("[\\r\\n]+").map(_.trim).filter(_.nonEmpty).toSeq
+          p.set((cur ++ (0 until fs.size).map(i => fs.get(i).toPath.toString)).distinct.mkString("\n"))
+      }
+      new VBox(4, a, add)
+    case (_: Control.ImageFile, _) =>
+      new ImageDropZone(ctx, p, "Image", 140).node
+    case _ => W.textField(p)
+
+  /** Dynamic choice options that follow the catalog. */
+  private def dynamicItems(ctx: UiContext, dc: Control.DynamicChoice): ObservableList[String] =
+    val out = FXCollections.observableArrayList[String]()
+    def refresh(): Unit = out.setAll(PluginValuesVM.options(dc, s => ctx.catalog.choices(s).toArray(Array.empty[String]).toSeq)*)
+    refresh()
+    ctx.catalog.choices(dc.source).addListener((_: javafx.collections.ListChangeListener.Change[? <: String]) => refresh())
+    out
+
+  // String-valued plugin props mirrored into typed properties for the numeric widgets.
+  private def doubleProp(p: StringProperty, d: Double): DoubleProperty =
+    val dp = new SimpleDoubleProperty(p.get.trim.toDoubleOption.getOrElse(d))
+    dp.addListener((_, _, v) => if !p.get.trim.toDoubleOption.contains(v.doubleValue) then p.set(Values.fmt(v.doubleValue)))
+    p.addListener((_, _, v) => v.trim.toDoubleOption.foreach(x => if x != dp.get then dp.set(x)))
+    dp
+
+  private def intProp(p: StringProperty, d: Int): IntegerProperty =
+    val ip = new SimpleIntegerProperty(p.get.trim.toDoubleOption.map(_.toInt).getOrElse(d))
+    ip.addListener((_, _, v) => if !p.get.trim.toIntOption.contains(v.intValue) then p.set(v.toString))
+    p.addListener((_, _, v) => v.trim.toDoubleOption.map(_.toInt).foreach(x => if x != ip.get then ip.set(x)))
+    ip
+
+  def boolProp(p: StringProperty): BooleanProperty =
+    val bp = new SimpleBooleanProperty(Values(Map("v" -> p.get)).bool("v"))
+    bp.addListener((_, _, v) => p.set(v.toString))
+    p.addListener((_, _, v) => bp.set(Values(Map("v" -> v)).bool("v")))
+    bp
+
+  /** "Script" dropdown with the selected script's controls rendered below. */
+  def scriptSection(ctx: UiContext, plugins: PluginsVM): Node =
+    val names = FXCollections.observableArrayList[String]("None")
+    names.addAll(plugins.scriptForms.map(_.plugin.name)*)
+    val combo = new ComboBox[String](names)
+    combo.setMaxWidth(Double.MaxValue)
+    def idOf(name: String) = plugins.scriptForms.find(_.plugin.name == name).map(_.plugin.id).getOrElse("")
+    def nameOf(id: String) = plugins.scriptForms.find(_.plugin.id == id).map(_.plugin.name).getOrElse("None")
+    val body = new VBox(8)
+    // each script form is rendered once and reused: re-rendering would leak listeners on the long-lived props
+    val rendered = scala.collection.mutable.Map.empty[String, Node]
+    def show(id: String): Unit =
+      body.getChildren.setAll(plugins.scriptForms.find(_.plugin.id == id).map(f => rendered.getOrElseUpdate(id, render(ctx, f))).toSeq*)
+    combo.setValue(nameOf(plugins.selectedScript.get))
+    show(plugins.selectedScript.get)
+    combo.valueProperty.addListener((_, _, n) => plugins.selectedScript.set(idOf(Option(n).getOrElse("None"))))
+    plugins.selectedScript.addListener((_, _, id) =>
+      if combo.getValue != nameOf(id) then combo.setValue(nameOf(id))
+      show(id)
+    )
+    W.tip(combo, "A script takes over the run (X/Y/Z plot, prompt matrix, loopback…). Only one can be active.")
+    val v = new VBox(8, combo, body)
+    v.getStyleClass.add("script-section")
+    v
+
+  /** Collapsible pane for an AlwaysOn plugin with its "enabled" checkbox in the header. */
+  def alwaysOnSection(ctx: UiContext, form: PluginValuesVM, expanded: Boolean): TitledPane =
+    val pane = W.section(form.plugin.name, render(ctx, form), expanded, form.plugin.description)
+    pane.setId(s"plugin-${form.plugin.id}-section")
+    form.prop("enabled").foreach { en =>
+      val cb = new CheckBox()
+      cb.setId(s"plugin-${form.plugin.id}-enabled")
+      cb.selectedProperty.bindBidirectional(boolProp(en))
+      W.tip(cb, s"Enable ${form.plugin.name}")
+      pane.setGraphic(cb)
+      pane.setContentDisplay(ContentDisplay.LEFT)
+      cb.selectedProperty.addListener((_, _, on) =>
+        if on then pane.getStyleClass.add("section-active") else pane.getStyleClass.remove("section-active")
+      )
+      if cb.isSelected then pane.getStyleClass.add("section-active")
+    }
+    pane

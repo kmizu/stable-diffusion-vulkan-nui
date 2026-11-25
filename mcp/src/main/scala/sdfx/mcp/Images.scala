@@ -1,0 +1,317 @@
+package sdfx.mcp
+
+import java.awt.RenderingHints
+import java.awt.image.BufferedImage
+import java.io.{ByteArrayInputStream, ByteArrayOutputStream, File}
+import java.nio.file.{Files, Path, Paths}
+import java.util.Base64
+import javax.imageio.ImageIO
+import javax.imageio.stream.{ImageInputStream, MemoryCacheImageInputStream}
+import org.w3c.dom.Element
+import scala.util.control.NonFatal
+
+/** Which local files MCP clients may name by path: the outputs folder (incl. its tmp dir) plus extra folders
+  * (`--allow-dir`, `SDFX_MCP_ALLOWED_DIRS`). Real paths are compared (symlinks / junctions cannot escape) and
+  * UNC / network paths are rejected before touching the filesystem (no SMB credential leaks).
+  */
+final class PathPolicy(roots: () => Seq[Path]):
+  def allowedRoots: Seq[Path] = roots().map(_.toAbsolutePath.normalize()).distinct
+
+  private def denied(field: String): ToolError =
+    ToolError(s"$field: no such file inside the allowed folders (${allowedRoots.mkString(", ")}); pass base64 or a data URI for other images")
+
+  /** Resolves `spec` (absolute, or relative to `base`) to a real path inside an allowed root, or throws. The
+    * message is the same whether the file is missing or outside the roots (no existence oracle).
+    */
+  def resolve(spec: String, field: String, base: Path): Path =
+    resolveKind(spec, field, base, directory = false)
+
+  def resolveDirectory(spec: String, field: String, base: Path): Path =
+    resolveKind(spec, field, base, directory = true)
+
+  private def resolveKind(spec: String, field: String, base: Path, directory: Boolean): Path =
+    val s = spec.trim
+    if PathPolicy.isNetworkPath(s) then throw ToolError(s"$field: network (UNC) paths are not allowed")
+    val p =
+      try Paths.get(s)
+      catch case NonFatal(_) => throw denied(field)
+    val abs = (if p.isAbsolute then p else base.resolve(p)).normalize()
+    val rs = allowedRoots
+    // Windows temp paths can use short names while toRealPath returns their long-name aliases.
+    // Accept lexical paths under either spelling, then still enforce containment on real paths.
+    val realRoots = rs.flatMap(r =>
+      try Some(r.toRealPath())
+      catch case NonFatal(_) => None
+    )
+    if !abs.isAbsolute || !(rs ++ realRoots).exists(r => abs.startsWith(r)) then throw denied(field)
+    val real =
+      try abs.toRealPath()
+      catch case NonFatal(_) => throw denied(field)
+    if !realRoots.exists(r => real.startsWith(r) && (directory || real != r)) ||
+        !(if directory then Files.isDirectory(real) else Files.isRegularFile(real)) then throw denied(field)
+    real
+
+object PathPolicy:
+  val EnvVar = "SDFX_MCP_ALLOWED_DIRS"
+
+  def isNetworkPath(s: String): Boolean =
+    val t = s.trim
+    t.startsWith("\\\\") || t.startsWith("//") || t.startsWith("\\/") || t.startsWith("/\\") ||
+    t.toLowerCase.startsWith("file:") || t.toLowerCase.startsWith("smb:")
+
+  /** Extra allowed folders from the environment (path-separator separated). */
+  def fromEnv(): Seq[Path] =
+    Option(System.getenv(EnvVar)).toSeq.flatMap(_.split(File.pathSeparator)).map(_.trim).filter(_.nonEmpty)
+      .filterNot(isNetworkPath).flatMap(d =>
+        try Some(Paths.get(d).toAbsolutePath.normalize())
+        catch case NonFatal(_) => None
+      )
+
+/** Image helpers: decoding tool inputs (path / base64 / data URI) and encoding downscaled previews. */
+object Images:
+  final case class Encoded(base64: String, mimeType: String, width: Int, height: Int)
+
+  /** Input images larger than this per side are refused (checked from the header, before decoding). */
+  val MaxInputSide = 4096
+  val MaxInputBytes: Int = 48 * 1024 * 1024
+  /** Images beyond this are never decoded for previews. */
+  val MaxDecodeSide = 16384
+
+  private val DataUri = """(?s)^data:([\w/+.-]*)(;[^,]*)?,(.*)$""".r
+
+  /** Apply the same protection policy to file-only script and VAE inputs without decoding non-image data. */
+  def rejectProtectedPng(p: Path, field: String): Unit =
+    val signature = Array[Byte](-119, 80, 78, 71, 13, 10, 26, 10)
+    val in = Files.newInputStream(p)
+    val header = new Array[Byte](8)
+    val count = try in.readNBytes(header, 0, header.length) finally in.close()
+    if count == signature.length && java.util.Arrays.equals(header, signature) then
+      rejectProtected(ImageIO.createImageInputStream(p.toFile), field)
+
+  /** Inspect already verified bytes without reopening a filesystem path. */
+  def rejectProtectedPng(bytes: Array[Byte], field: String): Unit =
+    rejectProtected(new MemoryCacheImageInputStream(new ByteArrayInputStream(bytes)), field)
+
+  /** Heuristic: base64 never contains '\', ':' or '.'; PNG base64 starts with "iVBOR", JPEG with "/9j/". */
+  def looksLikePath(s: String): Boolean =
+    s.length < 4096 && !s.contains('\n') &&
+    (s.contains('\\') || s.contains(':') || s.contains('.') || (s.startsWith("/") && !s.startsWith("/9j/") && s.length < 1024))
+
+  /** Decodes `spec` into an image file the engine can read. Paths must pass `policy` (relative paths resolve
+    * against `base`); base64 / data URIs are written as PNG via `tempFile` (returned so the caller deletes them).
+    */
+  def materialize(spec: String, field: String, policy: PathPolicy, base: Path, tempFile: String => Path,
+      platform: String = System.getProperty("os.name")): (Path, Option[Path]) =
+    val (staged, temporary, _) = materializeWithSource(spec, field, policy, base, tempFile, platform)
+    (staged, temporary)
+
+  /** One resolution produces both the verified byte snapshot and its durable source identity. */
+  def materializeWithSource(spec: String, field: String, policy: PathPolicy, base: Path, tempFile: String => Path,
+      platform: String = System.getProperty("os.name")): (Path, Option[Path], Option[String]) =
+    val s = spec.trim
+    if s.isEmpty then throw ToolError(s"$field is empty")
+    s match
+      case DataUri(_, meta, data) =>
+        if !Option(meta).exists(_.contains("base64")) then throw ToolError(s"$field: only base64 data URIs are supported")
+        val (staged, temporary) = writeDecoded(decodeB64(data, field), field, tempFile)
+        (staged, temporary, None)
+      case _ if PathPolicy.isNetworkPath(s) || looksLikePath(s) =>
+        val p = policy.resolve(s, field, base)
+        val data = readVerifiedBytes(p, policy, field, platform = platform, base64Alternative = true)
+        checkDims(dimensions(data), field)
+        rejectProtected(ImageIO.createImageInputStream(new ByteArrayInputStream(data)), field)
+        val img = try ImageIO.read(new ByteArrayInputStream(data)) catch case NonFatal(_) => null
+        if img == null then throw ToolError(s"$field: not a supported image file")
+        val filename = p.getFileName.toString
+        val dot = filename.lastIndexOf('.')
+        val suffix = if dot >= 0 && filename.substring(dot).matches("\\.[A-Za-z0-9]{1,8}") then filename.substring(dot) else ".img"
+        val staged = tempFile(suffix)
+        try
+          Files.write(staged, data)
+          (staged.toAbsolutePath, Some(staged), Some(p.toString))
+        catch
+          case error: Throwable =>
+            try Files.deleteIfExists(staged)
+            catch case cleanup: Throwable => error.addSuppressed(cleanup)
+            throw error
+      case _ =>
+        val (staged, temporary) = writeDecoded(decodeB64(s, field), field, tempFile)
+        (staged, temporary, None)
+
+  private[mcp] def readVerifiedBytes(p: Path, policy: PathPolicy, field: String,
+      afterOpen: () => Unit = () => (), platform: String = System.getProperty("os.name"),
+      base64Alternative: Boolean = false): Array[Byte] =
+    val roots = policy.allowedRoots.flatMap(r => scala.util.Try(r.toRealPath()).toOption)
+    val out = new ByteArrayOutputStream()
+    try sdfx.engine.VerifiedFolderInput.copy(p, roots, out, afterOpen = afterOpen, platform = platform, maxBytes = MaxInputBytes.toLong)
+    catch case NonFatal(_) =>
+      val hint = if base64Alternative then "; use base64 image data if verified file handles are unavailable" else ""
+      throw ToolError(s"$field: verified input could not be read inside an allowed folder$hint")
+    out.toByteArray
+
+  private def decodeB64(data: String, field: String): Array[Byte] =
+    val clean = data.replaceAll("\\s", "")
+    if clean.length.toLong * 3 / 4 > MaxInputBytes then throw ToolError(s"$field: image data larger than ${MaxInputBytes / 1024 / 1024} MB")
+    try Base64.getDecoder.decode(clean)
+    catch case NonFatal(_) => throw ToolError(s"$field is neither a file path nor valid base64 image data")
+
+  private def checkDims(d: Option[(Int, Int)], field: String): Unit = d match
+    case None => throw ToolError(s"$field: not a supported image (PNG/JPEG/BMP/GIF)")
+    case Some((w, h)) =>
+      if w <= 0 || h <= 0 || w > MaxInputSide || h > MaxInputSide then
+        throw ToolError(s"$field: ${w}x$h is too large (max ${MaxInputSide}x$MaxInputSide)")
+
+  private[mcp] def writeDecoded(bytes: Array[Byte], field: String, tempFile: String => Path,
+      writer: (BufferedImage, Path) => Boolean = (img, path) => ImageIO.write(img, "png", path.toFile)): (Path, Option[Path]) =
+    checkDims(dimensions(bytes), field)
+    rejectProtected(ImageIO.createImageInputStream(new ByteArrayInputStream(bytes)), field)
+    val img =
+      try ImageIO.read(new ByteArrayInputStream(bytes))
+      catch case NonFatal(_) => null
+    if img == null then throw ToolError(s"$field: decoded data is not a PNG/JPEG/BMP/GIF image")
+    val f = tempFile(".png")
+    try
+      if !writer(toRgbOrArgb(img), f) then throw ToolError(s"$field: PNG writer unavailable")
+      (f.toAbsolutePath, Some(f))
+    catch
+      case error: Throwable =>
+        try Files.deleteIfExists(f)
+        catch case cleanup: Throwable => error.addSuppressed(cleanup)
+        throw error
+
+  /** Width/height from the image header without decoding the pixels. */
+  def dimensions(p: Path): Option[(Int, Int)] =
+    try withStream(ImageIO.createImageInputStream(p.toFile))
+    catch case NonFatal(_) => None
+
+  def dimensions(bytes: Array[Byte]): Option[(Int, Int)] =
+    try withStream(ImageIO.createImageInputStream(new ByteArrayInputStream(bytes)))
+    catch case NonFatal(_) => None
+
+  private def withStream(iis: ImageInputStream): Option[(Int, Int)] =
+    if iis == null then None
+    else
+      try
+        val it = ImageIO.getImageReaders(iis)
+        if !it.hasNext then None
+        else
+          val r = it.next()
+          try
+            r.setInput(iis, true, true)
+            Some((r.getWidth(0), r.getHeight(0)))
+          finally r.dispose()
+      finally iis.close()
+
+  /** MCP has no desktop image-password session; never re-encode marked pixels as ordinary images. */
+  private def rejectProtected(iis: ImageInputStream, field: String): Unit =
+    if iis == null then throw ToolError(s"$field: cannot read image metadata")
+    try
+      val readers = ImageIO.getImageReaders(iis)
+      if !readers.hasNext then throw ToolError(s"$field: cannot read image metadata")
+      val reader = readers.next()
+      try
+        reader.setInput(iis, true, false)
+        val meta = reader.getImageMetadata(0)
+        val format = "javax_imageio_png_1.0"
+        if meta != null && meta.getMetadataFormatNames.contains(format) then
+          val root = meta.getAsTree(format).asInstanceOf[Element]
+          val marked = Seq("tEXtEntry", "iTXtEntry", "zTXtEntry").exists { name =>
+            val entries = root.getElementsByTagName(name)
+            (0 until entries.getLength).exists(i => entries.item(i).asInstanceOf[Element].getAttribute("keyword") == "Encrypt")
+          }
+          if marked then throw ToolError(s"$field: protected image requires an image password; MCP has no image-password session")
+      finally reader.dispose()
+    finally iis.close()
+
+  def size(p: Path): (Int, Int) = dimensions(p).getOrElse(throw ToolError(s"not an image: $p"))
+
+  private def toRgbOrArgb(img: BufferedImage): BufferedImage =
+    if img.getType == BufferedImage.TYPE_INT_RGB || img.getType == BufferedImage.TYPE_INT_ARGB || img.getType == BufferedImage.TYPE_3BYTE_BGR || img.getType == BufferedImage.TYPE_4BYTE_ABGR then img
+    else
+      val out = new BufferedImage(img.getWidth, img.getHeight, if img.getColorModel.hasAlpha then BufferedImage.TYPE_INT_ARGB else BufferedImage.TYPE_INT_RGB)
+      val g = out.createGraphics()
+      try g.drawImage(img, 0, 0, null)
+      finally g.dispose()
+      out
+
+  def mimeOf(p: Path): String =
+    val n = p.getFileName.toString.toLowerCase
+    if n.endsWith(".jpg") || n.endsWith(".jpeg") then "image/jpeg"
+    else if n.endsWith(".webp") then "image/webp"
+    else if n.endsWith(".gif") then "image/gif"
+    else "image/png"
+
+  /** Base64 of `p`; images larger than `maxSide` (0 = unlimited) are downscaled and re-encoded as PNG. The size is
+    * read from the header first; files already small enough are sent as-is without decoding.
+    */
+  def encode(p: Path, maxSide: Int): Encoded =
+    val (w, h) = dimensions(p).getOrElse(throw ToolError(s"not a readable image: $p"))
+    rejectProtected(ImageIO.createImageInputStream(p.toFile), "image")
+    if maxSide <= 0 || math.max(w, h) <= maxSide then
+      Encoded(Base64.getEncoder.encodeToString(Files.readAllBytes(p)), mimeOf(p), w, h)
+    else if math.max(w, h) > MaxDecodeSide then throw ToolError(s"$p is too large to preview (${w}x$h)")
+    else
+      val img = ImageIO.read(p.toFile)
+      if img == null then throw ToolError(s"not a readable image: $p")
+      val s = maxSide.toDouble / math.max(w, h)
+      val nw = math.max(1, math.round(w * s).toInt)
+      val nh = math.max(1, math.round(h * s).toInt)
+      val out = new BufferedImage(nw, nh, if img.getColorModel.hasAlpha then BufferedImage.TYPE_INT_ARGB else BufferedImage.TYPE_INT_RGB)
+      val g = out.createGraphics()
+      try
+        g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BICUBIC)
+        g.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_QUALITY)
+        g.drawImage(img, 0, 0, nw, nh, null)
+      finally g.dispose()
+      val bos = new ByteArrayOutputStream()
+      ImageIO.write(out, "png", bos)
+      Encoded(Base64.getEncoder.encodeToString(bos.toByteArray), "image/png", nw, nh)
+
+  private[mcp] def encodeBytes(data: Array[Byte], name: Path, maxSide: Int): Encoded =
+    val (w, h) = dimensions(data).getOrElse(throw ToolError("not a readable image"))
+    rejectProtected(ImageIO.createImageInputStream(new ByteArrayInputStream(data)), "image")
+    if maxSide <= 0 || math.max(w, h) <= maxSide then
+      Encoded(Base64.getEncoder.encodeToString(data), mimeOf(name), w, h)
+    else if math.max(w, h) > MaxDecodeSide then throw ToolError(s"image is too large to preview (${w}x$h)")
+    else
+      val img = ImageIO.read(new ByteArrayInputStream(data))
+      if img == null then throw ToolError("not a readable image")
+      val s = maxSide.toDouble / math.max(w, h)
+      val nw = math.max(1, math.round(w * s).toInt)
+      val nh = math.max(1, math.round(h * s).toInt)
+      val out = new BufferedImage(nw, nh, if img.getColorModel.hasAlpha then BufferedImage.TYPE_INT_ARGB else BufferedImage.TYPE_INT_RGB)
+      val g = out.createGraphics()
+      try
+        g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BICUBIC)
+        g.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_QUALITY)
+        g.drawImage(img, 0, 0, nw, nh, null)
+      finally g.dispose()
+      val bos = new ByteArrayOutputStream()
+      ImageIO.write(out, "png", bos)
+      Encoded(Base64.getEncoder.encodeToString(bos.toByteArray), "image/png", nw, nh)
+
+  private[mcp] def estimateBase64(data: Array[Byte], maxSide: Int): Long =
+    rejectProtected(ImageIO.createImageInputStream(new ByteArrayInputStream(data)), "image")
+    dimensions(data) match
+      case None => Long.MaxValue
+      case Some((w, h)) =>
+        if maxSide <= 0 || math.max(w, h) <= maxSide then (data.length.toLong + 2) / 3 * 4
+        else
+          val s = maxSide.toDouble / math.max(w, h)
+          (math.round(w * s) * math.round(h * s) * 4 + 1024) * 4 / 3
+
+  /** Upper bound of the base64 size [[encode]] would produce, without reading the pixels. */
+  def estimateBase64(p: Path, maxSide: Int): Long =
+    rejectProtected(ImageIO.createImageInputStream(p.toFile), "image")
+    dimensions(p) match
+      case None => Long.MaxValue
+      case Some((w, h)) =>
+        if maxSide <= 0 || math.max(w, h) <= maxSide then (Files.size(p) + 2) / 3 * 4
+        else
+          val s = maxSide.toDouble / math.max(w, h)
+          // re-encoded PNG: at most ~4 bytes per pixel plus overhead
+          (math.round(w * s) * math.round(h * s) * 4 + 1024) * 4 / 3
+
+  def deleteQuietly(p: Path): Unit =
+    try Files.deleteIfExists(p)
+    catch case NonFatal(_) => ()

@@ -1,0 +1,1706 @@
+"""One real-GPU check per engine process: python gpu_one.py <venv python> <out dir> <case>."""
+import json
+import atexit
+import os
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+
+PY, OUT, CASE = sys.argv[1], sys.argv[2], sys.argv[3]
+PY, OUT = os.path.abspath(PY), os.path.abspath(OUT)
+SD15 = r"D:\stable-diffusion-webui-reForge\models\Stable-diffusion\animekawa_v10.safetensors"
+SDXL = r"D:\stable-diffusion-webui-reForge\models\Stable-diffusion\waiIllustriousSDXL_v170.safetensors"
+MODELS = os.environ.get("SDFX_MODELS", os.path.join(OUT, "models"))
+os.makedirs(MODELS, exist_ok=True)
+os.makedirs(OUT, exist_ok=True)
+FACE = os.path.join(OUT, "face_base.png")
+
+
+def fetch(url, name):
+    p = os.path.join(MODELS, name)
+    if not os.path.isfile(p):
+        print("downloading", name, flush=True)
+        urllib.request.urlretrieve(url, p + ".part")
+        os.replace(p + ".part", p)
+    return p
+
+
+def hf(repo, file):
+    from huggingface_hub import hf_hub_download
+    return hf_hub_download(repo, file, local_dir=os.path.join(MODELS, repo.replace("/", "__")))
+
+
+env = dict(os.environ, PYTHONUNBUFFERED="1")
+if CASE.startswith('waifu_'):
+    env['SDFX_WAIFU2X_CACHE'] = os.path.abspath('outputs/waifu2x-models')
+if CASE == "custom_code":
+    env["SDFX_ALLOW_CODE"] = "1"
+engine_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "python"))
+proc = subprocess.Popen([PY, "-m", "sdfx"], cwd=engine_dir,
+                        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                        stderr=open(os.path.join(OUT, f"stderr-{CASE}.txt"), "w"), text=True, encoding="utf-8", env=env)
+lines, cv, n = [], threading.Condition(), [0]
+
+
+def cleanup_engine():
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(10)
+
+
+atexit.register(cleanup_engine)
+
+
+def reader():
+    for ln in proc.stdout:
+        with cv:
+            lines.append(json.loads(ln))
+            cv.notify_all()
+
+
+threading.Thread(target=reader, daemon=True).start()
+
+
+def call(typ, params, timeout=5400):
+    n[0] += 1
+    rid = f"r{n[0]}"
+    trace = os.path.join(OUT, 'request-response.jsonl') if CASE == 'model_keyword_photomaker_composable' else None
+    if trace:
+        with open(trace, 'a', encoding='utf-8') as stream:
+            stream.write(json.dumps({'id': rid, 'direction': 'request', 'type': typ, 'params': params}, ensure_ascii=False) + '\n')
+    proc.stdin.write(json.dumps({"id": rid, "type": typ, "params": params}) + "\n")
+    proc.stdin.flush()
+    t0 = time.time()
+    with cv:
+        while True:
+            for m in lines:
+                if m.get("id") == rid and m["type"] in ("result", "error"):
+                    lines.remove(m)
+                    if trace:
+                        with open(trace, 'a', encoding='utf-8') as stream:
+                            stream.write(json.dumps({'direction': 'response', **m}, ensure_ascii=False) + '\n')
+                    return m
+            cv.wait(1)
+            if time.time() - t0 > timeout:
+                return {"type": "error", "message": "timeout"}
+
+
+def gp(**kw):
+    p = {"prompt": "portrait photo of a smiling woman, detailed face", "negative_prompt": "lowres", "seed": 7, "subseed": -1,
+         "subseed_strength": 0.0, "sampler_name": "DPM++ 2M", "scheduler": "Automatic", "steps": 16, "cfg_scale": 6.0,
+         "width": 512, "height": 512, "batch_size": 1, "n_iter": 1, "clip_skip": 1, "eta": None,
+         "hires": {"enabled": False, "scale": 2.0, "upscaler": "Latent", "second_pass_steps": 0, "resize_x": 0, "resize_y": 0,
+                   "denoising_strength": 0.55, "sampler_name": None, "scheduler": None, "prompt": "", "negative_prompt": "",
+                   "cfg_scale": None},
+         "img2img": None, "loras": [], "controlnet": [], "hooks": {}, "styles": [], "checkpoint": None, "vae": None, "extra": {}}
+    p.update(kw)
+    return p
+
+
+def req(params):
+    return {"params": params, "output_dir": OUT, "lora_paths": {}, "embedding_paths": [], "controlnet_paths": {},
+            "upscaler_paths": {}, "preview_every": 0, "preview_method": "none"}
+
+
+def i2i(init, mask=None, denoise=0.75):
+    return {"init_image": init, "mask": mask, "denoising_strength": denoise, "resize_mode": 0, "mask_blur": 4,
+            "inpainting_fill": 1, "inpaint_full_res": False, "inpaint_full_res_padding": 32, "inpainting_mask_invert": False}
+
+
+def keep(r, name):
+    if r.get("type") == "result":
+        res = r["result"]
+        imgs = res.get("images") or []
+        src = (imgs[0]["path"] if isinstance(imgs[0], dict) else imgs[0]) if imgs else res.get("path")
+        if src and os.path.isfile(src):
+            dst = os.path.join(OUT, f"{name}{os.path.splitext(src)[1]}")
+            os.replace(src, dst)
+            return dst
+    return None
+
+
+with cv:
+    while not lines:
+        cv.wait(1)
+    hello = lines.pop(0)
+
+
+def load(path):
+    mode = os.environ.get('SDFX_PHOTOMAKER_VRAM_MODE', 'gpu') if CASE == 'model_keyword_photomaker_composable' else 'gpu'
+    r = call("load_model", {"path": path, "dtype": "fp16", "vram_mode": mode})
+    assert r["type"] == "result", r
+
+
+def mask_png(size):
+    from PIL import Image, ImageDraw
+    p = os.path.join(OUT, f"mask{size[0]}x{size[1]}.png")
+    m = Image.new("L", size, 0)
+    ImageDraw.Draw(m).rectangle((size[0] // 4, size[1] // 3, 3 * size[0] // 4, 2 * size[1] // 3), fill=255)
+    m.save(p)
+    return p
+
+
+t0 = time.time()
+r = None
+if CASE in ('hires_tweaks_sd15', 'hires_tweaks_sdxl'):
+    import copy
+    from pathlib import Path
+    import hashlib
+    import numpy as np
+    from PIL import Image
+    load(SDXL if CASE.endswith('sdxl') else SD15)
+    report = {}
+    base = gp(prompt='blue ceramic teapot, red flowers, wooden table, window sunlight, detailed illustration',
+              width=512, height=512, steps=10, cfg_scale=6, seed=7, subseed=19)
+    base['hires'].update(enabled=True, scale=1.5, second_pass_steps=8, denoising_strength=.55)
+    def run(name, params):
+        start = time.perf_counter()
+        before = len(lines)
+        result = call('txt2img', req(params))
+        assert result['type'] == 'result', result
+        records, pixels = [], []
+        for index, record in enumerate(result['result']['images']):
+            dest = Path(OUT, f'{name}-{index}.png')
+            os.replace(record['path'], dest)
+            rgb = np.asarray(Image.open(dest).convert('RGB'))
+            assert rgb.shape == (768, 768, 3), rgb.shape
+            pixels.append(rgb)
+            records.append(dict(record, path=str(dest), rgb_sha256=hashlib.sha256(rgb.tobytes()).hexdigest()))
+        progress = [e for e in lines[before:] if e.get('event') == 'progress']
+        report[name] = dict(images=records, seconds=time.perf_counter()-start,
+                            progress=progress, interrupted=result['result'].get('interrupted', False))
+        Path(OUT, CASE+'.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
+        print('HIRES CHECK', name, len(records), flush=True)
+        return pixels
+    baseline = run('baseline', base)[0]
+    disabled = copy.deepcopy(base)
+    disabled['hooks'] = dict(hires_fix_tweaks=dict(enabled=False, seed_enabled=True, seed=100, batch_count=3))
+    assert np.array_equal(run('disabled', disabled)[0], baseline)
+    repeat = copy.deepcopy(base)
+    repeat['hooks'] = dict(hires_fix_tweaks=dict(batch_count=3, seed_enabled=True, seed=100))
+    repeated = run('latent-repeat', repeat)
+    assert [x['hires_seed'] for x in report['latent-repeat']['images']] == [100, 101, 102]
+    assert [x['seed'] for x in report['latent-repeat']['images']] == [7, 7, 7]
+    progress = report['latent-repeat']['progress']
+    assert sum(e['pass'] == 'base' and e['step'] == 1 for e in progress) == 1, 'first pass repeated'
+    for i in range(3):
+        single = copy.deepcopy(repeat)
+        single['hooks']['hires_fix_tweaks'].update(batch_count=1, seed=100+i)
+        assert np.array_equal(run(f'latent-single-{i}', single)[0], repeated[i]), 'cached repeat differs from single'
+    varied = copy.deepcopy(repeat)
+    varied['hires']['upscaler'] = 'Lanczos'
+    varied['hooks']['hires_fix_tweaks'].update(batch_count=2, extras=True, subseed=200,
+        strength=.35, resize_width=512, resize_height=512)
+    varied_pixels = run('pixel-variation-resize', varied)
+    assert [x['hires_seed'] for x in report['pixel-variation-resize']['images']] == [100, 100]
+    assert [x['hires_subseed'] for x in report['pixel-variation-resize']['images']] == [200, 201]
+    assert not np.array_equal(*varied_pixels)
+    batches = copy.deepcopy(base)
+    batches.update(batch_size=2, n_iter=2)
+    batches['hooks'] = dict(hires_fix_tweaks=dict(batch_count=2, seed_enabled=False))
+    batch_pixels = run('inherited-multibatch', batches)
+    records = report['inherited-multibatch']['images']
+    assert [x['seed'] for x in records] == [7, 8, 7, 8, 9, 10, 9, 10]
+    assert [x['hires_seed'] for x in records] == [7, 8, 8, 9, 9, 10, 10, 11]
+    assert sum(e['pass'] == 'base' and e['step'] == 1 for e in report['inherited-multibatch']['progress']) == 2
+    for index in range(2):
+        part = copy.deepcopy(batches)
+        part.update(n_iter=1, seed=7+2*index, subseed=19+2*index)
+        actual = run(f'inherited-batch-{index}', part)
+        assert all(np.array_equal(a, b) for a, b in zip(actual, batch_pixels[4*index:4*index+4]))
+    randoms = copy.deepcopy(base)
+    randoms['batch_size'] = 2
+    randoms['hooks'] = dict(hires_fix_tweaks=dict(batch_count=2, seed_enabled=True, seed=-1,
+        extras=True, subseed=-1, strength=.35))
+    random_pixels = run('random-primary-and-variation', randoms)
+    random_records = report['random-primary-and-variation']['images']
+    primary, variation = random_records[0]['hires_seed'], random_records[0]['hires_subseed']
+    assert [x['hires_seed'] for x in random_records] == [primary] * 4
+    assert [x['hires_subseed'] for x in random_records] == [variation, variation+1, variation+1, variation+2]
+    assert primary > 0 and variation > 0, 'effective zero seed requires separate replay handling'
+    randoms['hooks']['hires_fix_tweaks'].update(seed=primary, subseed=variation)
+    replay = run('random-effective-replay', randoms)
+    assert all(np.array_equal(a, b) for a, b in zip(replay, random_pixels))
+    empty = copy.deepcopy(repeat)
+    empty['hooks']['hires_fix_tweaks'].update(batch_count=1, prompts_resolved=True)
+    empty['hires'].update(prompt='', negative_prompt='')
+    run('resolved-empty', empty)
+    interrupted = copy.deepcopy(repeat)
+    interrupted['hires']['second_pass_steps'] = 24
+    before = len(lines)
+    failures = []
+    def cancel_job():
+        try:
+            run('partial-cancel', interrupted)
+        except BaseException as error:
+            failures.append(error)
+    worker = threading.Thread(target=cancel_job)
+    worker.start()
+    deadline = time.monotonic() + 180
+    with cv:
+        while not any(e.get('event') == 'progress' and e.get('pass') == 'hires' and
+                      e.get('image', 0) >= 1 and e.get('step', 0) >= 1 for e in lines[before:]):
+            assert worker.is_alive() and time.monotonic() < deadline, 'second hires pass never started'
+            cv.wait(.1)
+    decision = call('interrupt', {}, timeout=10)
+    assert decision['type'] == 'result', decision
+    worker.join(120)
+    assert not worker.is_alive() and not failures, failures
+    assert report['partial-cancel']['interrupted'] is True
+    assert 1 <= len(report['partial-cancel']['images']) < 3
+    assert np.array_equal(run('recovery', base)[0], baseline), 'hires state leaked'
+    r = dict(type='result', result=dict(result='disabled/recovery exact; cached repeats match individual seeds; variation/resize; empty prompts'))
+elif CASE in ('todo_sd15', 'todo_sdxl'):
+    import copy
+    from pathlib import Path
+    import numpy as np
+    from PIL import Image
+    load(SDXL if CASE.endswith('sdxl') else SD15)
+    size = 768 if CASE.endswith('sdxl') else 512
+    base = gp(prompt='blue and white ceramic teapot, flowers, wooden table, window sunlight, detailed illustration',
+              width=size, height=size, steps=12, cfg_scale=6)
+    report = {}
+    def run(name, params, kind='txt2img'):
+        start = time.perf_counter()
+        result = call(kind, req(params))
+        assert result['type'] == 'result', result
+        path = keep(result, name)
+        pixels = np.asarray(Image.open(path).convert('RGB'))
+        report[name] = dict(path=path, seconds=time.perf_counter()-start, shape=list(pixels.shape))
+        return path, pixels
+    source, baseline = run('baseline', base)
+    for name, config in [('noop', dict(factor=1, factor2=1)), ('cutoff-zero', dict(factor=3, disable_after=0))]:
+        params = copy.deepcopy(base)
+        params['hooks'] = {'token_downsampling': config}
+        _, pixels = run(name, params)
+        assert np.array_equal(pixels, baseline), name
+    for name, config in [('shallow', dict(factor=2, factor2=1, disable_after=.7)),
+                         ('deep', dict(factor=1, factor2=2, disable_after=.7)),
+                         ('both', dict(factor=2, factor2=2, disable_after=1))]:
+        params = copy.deepcopy(base)
+        params['hooks'] = {'token_downsampling': config}
+        _, pixels = run(name, params)
+        assert not np.array_equal(pixels, baseline), name
+        report[name]['mean_absolute_delta'] = float(np.abs(pixels.astype(float)-baseline).mean())
+    params = copy.deepcopy(base)
+    params['hooks'] = {'token_downsampling': dict(factor=2, factor2=2, disable_after=.7)}
+    params['img2img'] = i2i(source)
+    run('img2img', params, 'img2img')
+    params['img2img'] = None
+    params['width'] = params['height'] = 256
+    params['steps'] = 4
+    params['hires'].update(enabled=True, scale=2, second_pass_steps=4)
+    run('hires', params)
+    branch = copy.deepcopy(base)
+    branch['prompt'] += ' AND_TOPK red flowers :0.7'
+    branch['hooks'] = {'neutral_prompt': {}}
+    _, branch_baseline = run('branch-baseline', branch)
+    branch['hooks']['token_downsampling'] = dict(factor=2, factor2=2, disable_after=.5)
+    _, branch_active = run('branch-active', branch)
+    assert not np.array_equal(branch_active, branch_baseline)
+    for incompatible in ('hypertile', 'pag'):
+        params = copy.deepcopy(base)
+        params['hooks'] = {'token_downsampling': dict(factor=2), incompatible: {}}
+        error = call('txt2img', req(params))
+        assert error['type'] == 'error' and 'Token Downsampling cannot combine' in error.get('message', ''), error
+    _, recovered = run('recovery', base)
+    assert np.array_equal(recovered, baseline), 'hook leaked into subsequent generation'
+    Path(OUT, CASE+'.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
+    r = dict(type='result', result=dict(result='two no-op exact comparisons; both factors; img2img/hires; exact baseline recovery'))
+elif CASE in ('waifu_sd15', 'waifu_sdxl'):
+    from pathlib import Path
+    import numpy as np
+    from PIL import Image
+    from sdfx.waifu2x import NAMES
+    load(SDXL if CASE.endswith('sdxl') else SD15)
+    source_size = 768 if CASE.endswith('sdxl') else 256
+    generated = call('txt2img', req(gp(width=source_size, height=source_size, steps=12 if CASE.endswith('sdxl') else 8,
+                                     cfg_scale=4 if CASE.endswith('sdxl') else 6, prompt='a ceramic teapot with blue flowers on a wooden table, daylight')))
+    assert generated['type'] == 'result', generated
+    source = keep(generated, 'source')
+    report = []
+    for index, name in enumerate(NAMES):
+        result = call('upscale', dict(image_path=source, output_dir=OUT, scale=2, upscaler=name, upscaler_paths={}))
+        assert result['type'] == 'result', result
+        path = keep(result, f'upscale-{index}')
+        with Image.open(path) as image:
+            assert image.size == (source_size*2, source_size*2)
+            pixels = np.asarray(image.convert('RGB')).copy()
+        style = 'Anime' if index < 4 else 'Photo' if index < 8 else 'CarnV2'
+        tool = call('image_tool', dict(tool='waifu2x', image_path=source, output_dir=OUT, style=style, noise=index % 4, scale=2))
+        assert tool['type'] == 'result', tool
+        other = keep(tool, f'extras-{index}')
+        with Image.open(other) as image:
+            difference = np.abs(pixels.astype(int) - np.asarray(image.convert('RGB')).astype(int))
+        repeated = call('upscale', dict(image_path=source, output_dir=OUT, scale=2, upscaler=name, upscaler_paths={}))
+        assert repeated['type'] == 'result', repeated
+        repeated_path = keep(repeated, f'upscale-repeat-{index}')
+        with Image.open(repeated_path) as image:
+            repeat_difference = np.abs(pixels.astype(int) - np.asarray(image.convert('RGB')).astype(int))
+        # CUDA convolution can move a value across a uint8 truncation boundary.
+        # Record actual same-route variance, never call this bit-exact parity.
+        assert difference.max() <= 1 and np.count_nonzero(difference) < pixels.size * .001, name
+        report.append(dict(name=name, upscale=path, extras=other, exact_rgb=not difference.any(),
+                           max_channel_error=int(difference.max()), changed_channels=int(np.count_nonzero(difference)),
+                           same_route_repeat_max=int(repeat_difference.max()), same_route_repeat_changed=int(np.count_nonzero(repeat_difference))))
+    tiny = str(Path(OUT) / 'tiny-input.png')
+    with Image.open(source) as image:
+        image.crop((0, 0, 24, 20)).save(tiny)
+    for scale in (4, 8, 16):
+        result = call('image_tool', dict(tool='waifu2x', image_path=tiny, output_dir=OUT, style='CarnV2', noise=2, scale=scale))
+        assert result['type'] == 'result', result
+        path = keep(result, f'carn-{scale}x')
+        with Image.open(path) as image:
+            assert image.size == (24*scale, 20*scale)
+    hires = gp(width=256, height=256, steps=2)
+    hires['hires'].update(enabled=True, scale=2, upscaler=NAMES[1], second_pass_steps=2)
+    result = call('txt2img', req(hires))
+    assert result['type'] == 'result', result
+    hires_path = keep(result, 'pixel-hires')
+    with Image.open(hires_path) as image:
+        assert image.size == (512, 512)
+    Path(OUT, CASE + '.json').write_text(json.dumps(dict(models=report, hires=hires_path), indent=2), encoding='utf-8')
+    r = dict(type='result', result=dict(result='nine direct/Extras RGB comparisons with recorded CUDA repeat variance; 4x/8x/16x CARN; pixel hires'))
+elif CASE in ("vram_sd15", "vram_sdxl", "vram_holdout_sd15", "vram_holdout_sdxl"):
+    import math
+    from pathlib import Path
+    load(SDXL if CASE.endswith('sdxl') else SD15)
+    holdout = CASE.startswith('vram_holdout_')
+    max_size, max_batch = (512, 2) if holdout else (320, 1)
+    measured = call('vram_estimator', dict(max_size=max_size, max_batch=max_batch, steps=1, save_samples=True, output_dir=OUT))
+    assert measured['type'] == 'result', measured
+    profile = measured['result']
+    assert profile['status'] == 'complete' and len(profile['rows']) == 4*((max_size-256)//64+1)*max_batch, profile
+    assert {row['mode'] for row in profile['rows']} == {'txt2img', 'txt2img_hr', 'txt2img_hr_latent', 'img2img'}
+    samples = [row['sample_path'] for row in profile['rows'] if row.get('sample_path')]
+    assert len(samples) == 4 and all(Path(path).is_file() for path in samples), samples
+    for row in profile['rows']:
+        assert math.isfinite(row['reserved_delta_mb']) and row['reserved_delta_mb'] >= 0, row
+        assert row['reserved_peak_mb'] >= row['baseline_reserved_mb'], row
+    saved = json.loads(Path(profile['profile_path']).read_text(encoding='utf-8'))
+    assert saved['fingerprint'] == profile['fingerprint'] and saved['status'] == 'complete'
+    recovery = call('txt2img', req(gp(steps=4)))
+    assert recovery['type'] == 'result' and Path(recovery['result']['images'][0]['path']).is_file(), recovery
+    current = call('vram_estimator', {'operation':'profile'})
+    assert current['type'] == 'result' and current['result']['compatible'], current
+    predicted = call('vram_estimator', {'operation':'estimate', 'mode':'txt2img', 'width':288, 'height':288, 'batch':1})
+    assert predicted['type'] == 'result' and predicted['result']['available'], predicted
+    import copy, hashlib
+    mismatch = copy.deepcopy(saved)
+    mismatch['identity']['model']['hash'] = 'deliberately different model'
+    canonical_identity = json.loads(json.dumps(mismatch['identity']), parse_float=lambda value: int(float(value)) if float(value).is_integer() else float(value))
+    mismatch['fingerprint'] = hashlib.sha256(json.dumps(canonical_identity, sort_keys=True, separators=(',', ':')).encode()).hexdigest()[:24]
+    rejected = call('vram_estimator', {'operation':'estimate', 'profile':mismatch})
+    assert rejected['type'] == 'result' and rejected['result']['reason'] == 'profile_identity_mismatch', rejected
+    errors = []
+    if holdout:
+        training = copy.deepcopy(saved)
+        training['rows'] = [row for row in training['rows'] if row['target'] != 448]
+        for row in saved['rows']:
+            if row['target'] != 448: continue
+            prediction = call('vram_estimator', dict(operation='estimate', profile=training, mode=row['mode'], width=448, height=448, batch=row['batch_size']))
+            assert prediction['type'] == 'result' and prediction['result']['available'], prediction
+            estimate_mb = prediction['result']['incremental_mb']
+            errors.append(dict(mode=row['mode'], batch=row['batch_size'], observed_mb=row['reserved_delta_mb'],
+                predicted_mb=estimate_mb, absolute_error_mb=abs(estimate_mb-row['reserved_delta_mb'])))
+    report = dict(profile=profile, recovery=keep(recovery, CASE + '_recovery'), samples=samples,
+                  estimate=predicted['result'], identity_mismatch_rejected=True, holdout_errors=errors)
+    with open(os.path.join(OUT, CASE + '.json'), 'w') as output:
+        json.dump(report, output, indent=2)
+    r = {'type': 'result', 'result': {'result': report}}
+elif CASE in ("steps_animation_sd15", "steps_animation_sdxl", "steps_animation_img_sd15", "steps_animation_img_sdxl", "steps_animation_hires_sd15", "steps_animation_hires_sdxl"):
+    from PIL import Image
+    import numpy as np
+    xl = CASE.endswith('sdxl')
+    load(SDXL if xl else SD15)
+    source = None
+    if '_img_' in CASE:
+        base = call('txt2img', req(gp(width=768 if xl else 512, height=768 if xl else 512, steps=4)))
+        assert base['type'] == 'result', base
+        source = keep(base, CASE + '_source')
+    paths, response = {}, None
+    for active in (False, True):
+        response = call('img2img' if source else 'txt2img', req(gp(width=768 if xl else 512, height=768 if xl else 512, steps=4,
+            img2img=i2i(source, denoise=1.0) if source else None,
+            hires=dict(gp()['hires'], enabled=True, scale=1.25, second_pass_steps=4) if '_hires_' in CASE else gp()['hires'], hooks={'steps_animation': {'duration': 1, 'fps': 10}} if active else {})))
+        assert response['type'] == 'result', response
+        paths[str(active)] = keep(response, CASE + '_' + str(active))
+    artifacts = response['result']['intermediate_artifacts']
+    assert len([entry for entry in artifacts if entry['type'] == 'image']) == (8 if '_hires_' in CASE else 4), artifacts
+    videos = [entry['path'] for entry in artifacts if entry['type'] == 'video']
+    assert len(videos) == 1 and os.path.getsize(videos[0]) > 0, artifacts
+    with Image.open(paths['False']) as before, Image.open(paths['True']) as after:
+        assert np.array_equal(np.asarray(before), np.asarray(after))
+    report = dict(paths=paths, artifacts=artifacts, exact_rgb=True)
+    with open(os.path.join(OUT, CASE + '.json'), 'w') as output:
+        json.dump(report, output, indent=2)
+    r = {'type': 'result', 'result': {'result': report}}
+elif CASE in ("pnginfo_sd15", "pnginfo_sdxl"):
+    from PIL import Image
+    import numpy as np
+    import hashlib
+    checkpoint = SDXL if CASE.endswith("sdxl") else SD15
+    load(checkpoint)
+    size = 768 if CASE.endswith("sdxl") else 512
+    paths, responses = {}, {}
+    for name, hooks in (("off", {}), ("on", {"pnginfo_injection": {}})):
+        result = call("txt2img", req(gp(width=size, height=size, steps=8, hooks=hooks)))
+        assert result['type'] == 'result', result
+        responses[name] = result['result']
+        paths[name] = keep(result, CASE + '_' + name)
+    assert 'resource_hashes' not in responses['off']
+    digest = hashlib.sha256()
+    with open(checkpoint, 'rb') as weights:
+        for chunk in iter(lambda: weights.read(1024 * 1024), b''):
+            digest.update(chunk)
+    assert responses['on']['resource_hashes']['model'] == digest.hexdigest()[:10]
+    with Image.open(paths['off']) as source, Image.open(paths['on']) as output:
+        assert np.array_equal(np.asarray(source), np.asarray(output))
+    report = dict(exact_rgb=True, resource_hashes=responses['on']['resource_hashes'], paths=paths)
+    with open(os.path.join(OUT, CASE + '.json'), 'w') as output:
+        json.dump(report, output, indent=2)
+    r = {'type': 'result', 'result': {'result': report}}
+elif CASE == "pnginfo_controlnet_sd15":
+    import hashlib
+    from PIL import Image
+    import numpy as np
+    load(SD15)
+    weights = hf("lllyasviel/control_v11p_sd15_canny", "diffusion_pytorch_model.safetensors")
+    hint = os.path.join(OUT, 'control_hint.png')
+    Image.new('RGB', (512, 512), 'white').save(hint)
+    unit = dict(enabled=True, model="canny", image=hint, preprocessor="none", weight=0.5,
+                guidance_start=0.0, guidance_end=1.0)
+    paths, hashes = {}, {}
+    for active in (False, True):
+        request = req(gp(steps=8, controlnet=[unit], hooks={"pnginfo_injection": {}} if active else {}))
+        request['controlnet_paths'] = {'canny': weights}
+        result = call('txt2img', request)
+        assert result['type'] == 'result', result
+        hashes[str(active)] = result['result'].get('resource_hashes', {})
+        paths[str(active)] = keep(result, CASE + '_' + str(active))
+    expected = hashlib.sha256(open(weights, 'rb').read()).hexdigest()[:10]
+    assert hashes['True']['controlnet:diffusion_pytorch_model.safetensors'] == expected, hashes
+    assert not hashes['False']
+    with Image.open(paths['False']) as before, Image.open(paths['True']) as after:
+        assert np.array_equal(np.asarray(before), np.asarray(after))
+    report = dict(resource_hashes=hashes, paths=paths, weights=weights, exact_rgb=True)
+    with open(os.path.join(OUT, CASE + '.json'), 'w') as output:
+        json.dump(report, output, indent=2)
+    r = {'type': 'result', 'result': {'result': report}}
+elif CASE in ("pnginfo_embed_sd15", "pnginfo_embed_sdxl"):
+    import hashlib
+    import torch
+    from safetensors.torch import save_file
+    from PIL import Image
+    import numpy as np
+    xl = CASE.endswith("sdxl")
+    load(SDXL if xl else SD15)
+    embedding = os.path.join(OUT, "provenance_fixture.safetensors")
+    # Synthetic zero vectors exercise real tokenizer/encoder loading, not an artistic embedding.
+    save_file({"clip_l": torch.zeros(1, 768), "clip_g": torch.zeros(1, 1280)} if xl else
+              {"provenance_fixture": torch.zeros(1, 768)}, embedding)
+    paths, hashes = {}, {}
+    for active in (False, True):
+        request = req(gp(prompt="portrait photo of a woman provenance_fixture", width=768 if xl else 512,
+                         height=768 if xl else 512, steps=8, hooks={"pnginfo_injection": {}} if active else {}))
+        request['embedding_paths'] = [embedding]
+        result = call("txt2img", request)
+        assert result['type'] == 'result', result
+        hashes[str(active)] = result['result'].get('resource_hashes', {})
+        paths[str(active)] = keep(result, CASE + '_' + str(active))
+    expected = hashlib.sha256(open(embedding, 'rb').read()).hexdigest()[:10]
+    assert hashes['True']['embed:provenance_fixture'] == expected, hashes
+    assert not hashes['False']
+    with Image.open(paths['False']) as before, Image.open(paths['True']) as after:
+        assert np.array_equal(np.asarray(before), np.asarray(after))
+    report = dict(resource_hashes=hashes, paths=paths, synthetic_embedding=embedding, exact_rgb=True)
+    with open(os.path.join(OUT, CASE + '.json'), 'w') as output:
+        json.dump(report, output, indent=2)
+    r = {'type': 'result', 'result': {'result': report}}
+elif CASE in ("pnginfo_ad_sd15", "pnginfo_ad_sdxl"):
+    import hashlib
+    from PIL import Image
+    import numpy as np
+    load(SDXL if CASE.endswith("sdxl") else SD15)
+    detector = hf("Bingsu/adetailer", "face_yolov8n.pt")
+    hashes, paths = {}, {}
+    for active in (False, True):
+        hooks = {"adetailer": {"units": [{"model": detector}]}}
+        if active:
+            hooks["pnginfo_injection"] = {}
+        size = 768 if CASE.endswith("sdxl") else 512
+        result = call("txt2img", req(gp(width=size, height=size, steps=8, hooks=hooks)))
+        assert result['type'] == 'result', result
+        hashes[str(active)] = result['result'].get('resource_hashes', {})
+        paths[str(active)] = keep(result, CASE + '_' + str(active))
+    expected = hashlib.sha256(open(detector, 'rb').read()).hexdigest()[:10]
+    assert hashes['True']['adetailer:face_yolov8n.pt'] == expected, hashes
+    assert not hashes['False']
+    with Image.open(paths['False']) as before, Image.open(paths['True']) as after:
+        assert np.array_equal(np.asarray(before), np.asarray(after))
+    report = dict(resource_hashes=hashes, paths=paths, detector=detector, exact_rgb=True)
+    with open(os.path.join(OUT, CASE + '.json'), 'w') as output:
+        json.dump(report, output, indent=2)
+    r = {'type': 'result', 'result': {'result': report}}
+elif CASE in ("temperature_modes_sd15", "temperature_modes_sdxl"):
+    from PIL import Image
+    import numpy as np
+    load(SDXL if CASE.endswith("sdxl") else SD15)
+    size = 768 if CASE.endswith("sdxl") else 512
+    source_result = call("txt2img", req(gp(width=size, height=size, steps=8)))
+    assert source_result["type"] == "result", source_result
+    source = keep(source_result, CASE + "_source")
+    report = {}
+    for mode in ("img2img", "hires"):
+        images = []
+        for active in (False, True):
+            params = gp(width=size, height=size, steps=8)
+            if mode == "img2img":
+                params['img2img'] = i2i(source, denoise=0.5)
+            else:
+                params['hires'].update(enabled=True, scale=1.25, second_pass_steps=4)
+            if active:
+                params['hooks'] = {"gpu_temperature_guard": {"sleep_temperature": 1, "wake_temperature": 0,
+                    "interval": 0.1, "sleep_time": 0.1, "max_sleep": 0.1}}
+            result = call("img2img" if mode == "img2img" else "txt2img", req(params))
+            assert result['type'] == 'result', result
+            path = keep(result, CASE + '_' + mode + ('_guard' if active else '_off'))
+            with Image.open(path) as image:
+                images.append(np.asarray(image).copy())
+        assert np.array_equal(*images), mode
+        report[mode] = dict(exact_rgb=True, shape=list(images[0].shape))
+    with open(os.path.join(OUT, CASE + '.json'), 'w') as output:
+        json.dump(report, output, indent=2)
+    r = {'type': 'result', 'result': {'result': report}}
+elif CASE in ("steps_interrupt_sd15", "steps_interrupt_sdxl"):
+    from pathlib import Path
+    load(SDXL if CASE.endswith('sdxl') else SD15)
+    size = 768 if CASE.endswith('sdxl') else 512
+    report = {}
+    for partial in (False, True):
+        root = Path(OUT) / ('partial-' + str(partial))
+        request = req(gp(width=size, height=size, steps=40, hooks={'steps_animation': {
+            'run_incomplete': partial, 'duration': 1, 'fps': 10}}))
+        request['output_dir'] = str(root)
+        completed = []
+        worker = threading.Thread(target=lambda: completed.append(call('txt2img', request)), daemon=True)
+        worker.start()
+        deadline = time.monotonic() + 120
+        while len(list(root.rglob('*.png'))) < 2:
+            assert not completed, completed
+            assert time.monotonic() < deadline, 'no captured frames before interrupt'
+            time.sleep(.05)
+        started = time.monotonic()
+        decision = call('interrupt', {}, timeout=10)
+        worker.join(30)
+        assert not worker.is_alive(), 'interrupted animation did not finish'
+        assert completed[0].get('code') == 'interrupted', completed
+        manifests = [json.loads(path.read_text(encoding='utf-8')) for path in root.rglob('manifest.json')]
+        assert len(manifests) == 1 and manifests[0]['status'].startswith('incomplete'), manifests
+        videos = list(root.rglob('*.mp4'))
+        assert bool(videos) == partial, manifests
+        report[str(partial)] = dict(seconds=time.monotonic() - started, decision=decision,
+            frames=len(list(root.rglob('*.png'))), videos=[str(path) for path in videos])
+    recovery = call('txt2img', req(gp(width=size, height=size, steps=4)))
+    assert recovery['type'] == 'result', recovery
+    report['recovery'] = keep(recovery, CASE + '_recovery')
+    with open(os.path.join(OUT, CASE + '.json'), 'w') as output:
+        json.dump(report, output, indent=2)
+    r = {'type': 'result', 'result': {'result': report}}
+elif CASE in ("temperature_interrupt_sd15", "temperature_interrupt_sdxl"):
+    load(SDXL if CASE.endswith("sdxl") else SD15)
+    size = 768 if CASE.endswith("sdxl") else 512
+    completed = []
+    request = req(gp(width=size, height=size, steps=8, hooks={"gpu_temperature_guard": {
+        "sleep_temperature": 1, "wake_temperature": 0, "interval": 0.1,
+        "sleep_time": 10, "max_sleep": 0}}))
+    worker = threading.Thread(target=lambda: completed.append(call("txt2img", request)), daemon=True)
+    worker.start()
+    deadline = time.monotonic() + 120
+    with cv:
+        while not any("GPU temperature pause:" in json.dumps(line) for line in lines):
+            assert proc.poll() is None, "engine exited before pause"
+            assert not completed, completed
+            assert time.monotonic() < deadline, "no temperature pause observed"
+            cv.wait(0.1)
+    started = time.monotonic()
+    decision = call("interrupt", {}, timeout=10)
+    worker.join(10)
+    assert not worker.is_alive(), "temperature wait did not interrupt"
+    assert completed and completed[0].get("code") == "interrupted", completed
+    elapsed = time.monotonic() - started
+    assert elapsed < 5, elapsed
+    recovery = call("txt2img", req(gp(width=size, height=size, steps=8)))
+    assert recovery["type"] == "result", recovery
+    keep(recovery, CASE + "_recovery")
+    report = dict(interrupt_seconds=elapsed, interrupted=completed[0], decision=decision)
+    with open(os.path.join(OUT, CASE + ".json"), "w") as output:
+        json.dump(report, output, indent=2)
+    r = {"type": "result", "result": {"result": report}}
+elif CASE in ("temperature_sd15", "temperature_sdxl"):
+    from PIL import Image
+    import numpy as np
+    load(SDXL if CASE.endswith("sdxl") else SD15)
+    size = 768 if CASE.endswith("sdxl") else 512
+    paths, report = {}, {}
+    for name, hook in (("off", {}),
+        ("cool", {"gpu_temperature_guard": {"sleep_temperature": 100, "wake_temperature": 90, "interval": 0.1}}),
+        ("wait", {"gpu_temperature_guard": {"sleep_temperature": 1, "wake_temperature": 0,
+                                            "interval": 0.1, "sleep_time": 0.1, "max_sleep": 0.2}})):
+        start = time.monotonic()
+        result = call("txt2img", req(gp(width=size, height=size, steps=8, hooks=hook)))
+        assert result["type"] == "result", result
+        paths[name] = keep(result, CASE + "_" + name)
+        report[name] = {"seconds": time.monotonic() - start, "path": paths[name]}
+    with Image.open(paths["off"]) as source:
+        expected = np.asarray(source).copy()
+    for name in ("cool", "wait"):
+        with Image.open(paths[name]) as candidate:
+            assert np.array_equal(expected, np.asarray(candidate)), name
+    with open(os.path.join(OUT, CASE + ".json"), "w") as output:
+        json.dump(report, output, indent=2)
+    r = {"type": "result", "result": {"result": report}}
+elif CASE in ("color_correction_sd15", "color_correction_sdxl"):
+    from PIL import Image
+    import numpy as np
+    load(SDXL if CASE.endswith("sdxl") else SD15)
+    size = 768 if CASE.endswith("sdxl") else 512
+    generated = call("txt2img", req(gp(width=size, height=size, steps=16,
+        prompt="a ceramic teapot on a wooden table, warm window light, detailed photograph")))
+    assert generated["type"] == "result", generated
+    source = keep(generated, CASE + "_source")
+    assert source
+    reference_result = call("txt2img", req(gp(width=size, height=size, steps=16, seed=19,
+        prompt="a ceramic teapot on a blue table, cool blue window light, detailed photograph")))
+    assert reference_result["type"] == "result", reference_result
+    reference = keep(reference_result, CASE + "_reference")
+    report = {}
+    for method in ("A1111", "Wavelet", "AdaIN"):
+        result = call("image_tool", {"tool": "color_correction", "image_path": source,
+            "reference_path": reference, "method": method, "output_dir": OUT})
+        assert result["type"] == "result", result
+        path = keep(result, CASE + "_" + method)
+        with Image.open(path) as image:
+            assert image.size == (size, size)
+            assert np.asarray(image).std() > 1
+        report[method] = path
+    with open(os.path.join(OUT, CASE + ".json"), "w", encoding="utf-8") as output:
+        json.dump(dict(source=source, reference=reference, outputs=report), output, indent=2)
+    r = {"type": "result", "result": {"result": report}}
+elif CASE in ("neutral_sampling_sd15", "neutral_sampling_sdxl", "sampling_pag_sd15", "sampling_pag_sdxl"):
+    from PIL import Image, ImageChops, ImageStat
+    xl = CASE.endswith("sdxl")
+    load(SDXL if xl else SD15)
+    size = dict(width=832, height=832) if xl else dict(width=512, height=768)
+    plain = "portrait of a woman, in a park, detailed"
+    text = plain + " AND_TOPK red scarf :0.5"
+    common = dict(prompt=plain, steps=10, seed=11, **size)
+    source = call("txt2img", req(gp(**common)))
+    init = keep(source, CASE + "_input")
+    assert init, source
+    cads = dict(noise_scale=0.25)
+    cs = dict(start_cfg=9., end_cfg=2., curve="cosine")
+    both = dict(cads=cads, cfg_schedule=cs)
+    def composed(prompt=text, phi=.3, cfg=6., batch=1, hooks=None, **kw):
+        return dict(prompt=prompt, cfg_scale=cfg, batch_size=batch,
+                    hooks=dict(neutral_prompt=dict(cfg_rescale=phi), **(hooks or {})), **kw)
+    hires = dict(gp()["hires"], enabled=True, resize_x=1024 if xl else 640,
+                 resize_y=1024 if xl else 960, second_pass_steps=4)
+    cases = [("baseline", {}), ("cads_native", dict(hooks=dict(cads=cads))),
+             ("cads_noop", composed(prompt=plain, phi=0., hooks=dict(cads=cads))),
+             ("schedule_native", dict(hooks=dict(cfg_schedule=cs))),
+             ("schedule_noop", composed(prompt=plain, phi=0., hooks=dict(cfg_schedule=cs))),
+             ("compose", composed()),
+             ("schedule_constant", composed(hooks=dict(cfg_schedule=dict(start_cfg=6., end_cfg=6.)))),
+             ("cads_gamma1", composed(hooks=dict(cads=dict(tau1=1., tau2=1.)))),
+             ("cads", composed(hooks=dict(cads=cads))), ("cads_repeat", composed(hooks=dict(cads=cads))),
+             ("negative_noise", composed(hooks=dict(cads=dict(cads, apply_to_uncond=True)))),
+             ("combined", composed(hooks=both)),
+             ("pag", composed(hooks=dict(both, pag=dict(scale=2.)))),
+             ("cfg1_batch", composed(cfg=1., batch=2, hooks=dict(cads=dict(cads, apply_to_uncond=True)))),
+             ("heun_edit", composed(prompt=plain + " AND_SALT [red scarf:blue scarf:0.5] :0.5",
+                                      sampler_name="Heun", hooks=both)),
+             ("negpip", composed(prompt=plain + " AND_PERP (black hair:-1) :0.4",
+                                    hooks=dict(both, negpip={}))),
+             ("reference", composed(hooks=dict(both, reference=dict(image=init, style_fidelity=.5,
+                                                                       attention_auto_machine_weight=.5)))),
+             ("hires", composed(hooks=both, hires=hires)),
+             ("img2img", composed(hooks=both, img2img=i2i(init, denoise=.5))),
+             ("alternative", composed(hooks=dict(both, img2imgalt=dict(randomness=.2, inversion_steps=6,
+                                          override_prompt=plain + " AND_SALT blue scarf :0.4", decode_cfg_scale=6.)),
+                                        img2img=i2i(init))),
+             ("cfg0", composed(cfg=0., phi=0.)),
+             ("schedule_zero", composed(phi=0., hooks=dict(cfg_schedule=dict(start_cfg=0., end_cfg=0.)))),
+             ("restored", {})]
+    focus = "pag" if CASE.startswith("sampling_pag_") else os.environ.get("SDFX_SAMPLING_FOCUS", "")
+    if focus == "pag":
+        pag = dict(scale=2.)
+        pag_both = dict(both, pag=pag)
+        cases = [("baseline", {}), ("pag_base", dict(hooks=dict(pag=pag))),
+                 ("pag_constant", dict(hooks=dict(pag=pag, cfg_schedule=dict(start_cfg=6., end_cfg=6.)))),
+                 ("pag_schedule", dict(hooks=dict(pag=pag, cfg_schedule=cs))),
+                 ("pag_schedule_noop", composed(prompt=plain, phi=0., hooks=dict(pag=pag, cfg_schedule=cs))),
+                 ("pag_cads", dict(hooks=dict(pag=pag, cads=cads))),
+                 ("pag_cads_noop", composed(prompt=plain, phi=0., hooks=dict(pag=pag, cads=cads))),
+                 ("pag_cads_repeat", dict(hooks=dict(pag=pag, cads=cads))),
+                 ("pag_both", dict(hooks=pag_both)), ("pag_batch", dict(batch_size=2, hooks=pag_both)),
+                 ("pag_cfg1", dict(cfg_scale=1., hooks=dict(pag=pag, cads=cads))),
+                 ("pag_cfg1_batch", dict(cfg_scale=1., batch_size=2, hooks=dict(pag=pag, cads=cads))),
+                 ("pag_signed", dict(prompt=plain + ", (black hair:-1)", hooks=dict(pag_both, negpip={}))),
+                 ("compose_pag", composed(hooks=pag_both)),
+                 ("scale_zero", dict(hooks=dict(both, pag=dict(scale=0.)))),
+                 ("no_pag_both", dict(hooks=both)),
+                 ("adaptive", dict(hooks=dict(both, pag=dict(scale=2., adaptive_scale=1.)))),
+                 ("heun", dict(sampler_name="Heun", hooks=pag_both)),
+                 ("hires", dict(hires=hires, hooks=pag_both)),
+                 ("img2img", dict(img2img=i2i(init, denoise=.5), hooks=pag_both)),
+                 ("alternative", dict(img2img=i2i(init), hooks=dict(pag_both,
+                     img2imgalt=dict(randomness=.2, inversion_steps=6, decode_cfg_scale=6.)))),
+                 ("nonpag_cads", dict(hooks=dict(cads=cads))),
+                 ("nonpag_schedule", dict(hooks=dict(cfg_schedule=cs))), ("restored", {})]
+    if focus == "metadata":
+        signed = plain + ", (black hair:-1)"
+        hooks = dict(cads=cads, negpip={})
+        cases = [("baseline", {}), ("signed_native", dict(prompt=signed, hooks=hooks)),
+                 ("signed_noop", composed(prompt=signed, phi=0., hooks=hooks)),
+                 ("signed_repeat", dict(prompt=signed, hooks=hooks)), ("restored", {})]
+    paths, report, errors = {}, {}, []
+    for tag, changes in cases:
+        method = "img2img" if changes.get("img2img") else "txt2img"
+        result = call(method, req(gp(**dict(common, **changes))))
+        path = keep(result, CASE + "_" + tag)
+        if path:
+            paths[tag] = path
+            report[tag] = dict(path=path, warnings=result["result"]["warnings"], images=len(result["result"]["images"]))
+            if report[tag]["warnings"]:
+                errors.append({tag: report[tag]["warnings"]})
+        else:
+            errors.append({tag: result})
+        print(tag, report.get(tag) or result, flush=True)
+    pairs = [("baseline", "restored"), ("cads_native", "cads_noop"), ("schedule_native", "schedule_noop"),
+             ("compose", "schedule_constant"), ("compose", "cads_gamma1"), ("cads", "cads_repeat"), ("cfg0", "schedule_zero")]
+    if focus == "metadata":
+        pairs = [("baseline", "restored"), ("signed_native", "signed_noop"), ("signed_native", "signed_repeat")]
+    elif focus == "pag":
+        pairs = [("baseline", "restored"), ("pag_base", "pag_constant"), ("pag_cads", "pag_cads_noop"),
+                 ("pag_cads", "pag_cads_repeat"), ("pag_schedule", "pag_schedule_noop"), ("scale_zero", "no_pag_both")]
+    for a, b in pairs:
+        if a in paths and b in paths:
+            with Image.open(paths[a]) as ia, Image.open(paths[b]) as ib:
+                diff = sum(ImageStat.Stat(ImageChops.difference(ia.convert("RGB"), ib.convert("RGB"))).mean) / 3
+            report[a + "_vs_" + b] = diff
+            if diff:
+                errors.append({a + "_vs_" + b: diff})
+    if focus == "pag":
+        for current, previous in [("nonpag_cads", "cads_native"), ("nonpag_schedule", "schedule_native")]:
+            previous_path = os.path.join("outputs", "verify-neutral-sampling-" + ("sdxl" if xl else "sd15"),
+                                         "neutral_sampling_" + ("sdxl" if xl else "sd15") + "_" + previous + ".png")
+            if current in paths and os.path.isfile(previous_path):
+                with Image.open(paths[current]) as ia, Image.open(previous_path) as ib:
+                    diff = sum(ImageStat.Stat(ImageChops.difference(ia.convert("RGB"), ib.convert("RGB"))).mean) / 3
+                report["legacy_" + current] = diff
+                if diff:
+                    errors.append({"legacy_" + current: diff})
+    with open(os.path.join(OUT, CASE + ".json"), "w", encoding="utf-8") as fh:
+        json.dump(dict(cases=report, errors=errors, focus=focus), fh, indent=2)
+    r = {"type": "error" if errors else "result", "result": {"result": report}, "message": str(errors)}
+elif CASE in ("neutral_reference_sd15", "neutral_reference_sdxl"):
+    from PIL import Image, ImageChops, ImageStat
+    xl = CASE.endswith("sdxl")
+    load(SDXL if xl else SD15)
+    size = dict(width=832, height=832) if xl else dict(width=512, height=768)
+    plain = "portrait of a woman, in a park, detailed"
+    common = dict(prompt=plain, steps=10, seed=11, **size)
+    source = call("txt2img", req(gp(**common)))
+    init = keep(source, CASE + "_input")
+    assert init, source
+    ref = dict(image=init, style_fidelity=0.5, attention_auto_machine_weight=0.8)
+    neutral = {"neutral_prompt": {}}
+    text = plain + " AND_TOPK red scarf :0.5"
+    def composed(prompt=text, phi=0., cfg=6., batch=1, hooks=None, **kw):
+        return dict(prompt=prompt, cfg_scale=cfg, batch_size=batch,
+                    hooks=dict(neutral_prompt=dict(cfg_rescale=phi), reference=ref, **(hooks or {})), **kw)
+    cases = [("baseline", {}), ("reference_native", dict(hooks={"reference": ref})),
+             ("reference_noop", dict(hooks=dict(neutral, reference=ref))),
+             ("compose_plain", dict(prompt=text, hooks=neutral)),
+             ("reference_zero", dict(prompt=text, hooks=dict(neutral, reference=dict(ref, attention_auto_machine_weight=0.)))),
+             ("topk_rescale", composed(phi=0.7)),
+             ("salt", composed(prompt=plain + " AND_SALT red scarf :0.5")),
+             ("perp", composed(prompt=plain + " AND_PERP black hair :-0.4")),
+             ("cfg1_batch", composed(cfg=1., batch=2)),
+             ("heun_edit", composed(prompt=plain + " AND_TOPK [red scarf:blue scarf:0.5] :0.5", sampler_name="Heun")),
+             ("pag", composed(hooks={"pag": {"scale": 2.}})),
+             ("pag_cfg1", composed(cfg=1., hooks={"pag": {"scale": 2.}})),
+             ("img2img", composed(img2img=i2i(init, denoise=0.5))),
+             ("alternative", composed(img2img=i2i(init), hooks={"img2imgalt": {"randomness": 0.2, "inversion_steps": 6,
+                 "override_prompt": plain + " AND_SALT blue scarf :0.4", "decode_cfg_scale": 1.}}))]
+    model = None
+    if xl:
+        import hashlib
+        model = hf("kohya-ss/controlnet-lllite", "controllllite_v01032064e_sdxl_canny_anime.safetensors")
+        edge = call("preprocess", {"preprocessor": "canny", "image_path": init, "output_dir": OUT, "args": {}})
+        assert edge["type"] == "result", edge
+        ll = dict(model=model, image=edge["result"]["path"], strength=0.6, start_percent=0.25, end_percent=0.75)
+        with open(model, "rb") as fh:
+            digest = hashlib.file_digest(fh, "sha256").hexdigest() if hasattr(hashlib, "file_digest") else hashlib.sha256(fh.read()).hexdigest()
+        with open(os.path.join(OUT, "adapter-sources.json"), "w", encoding="utf-8") as fh:
+            json.dump(dict(path=model, sha256=digest, url="https://huggingface.co/kohya-ss/controlnet-lllite/blob/main/controllllite_v01032064e_sdxl_canny_anime.safetensors"), fh, indent=2)
+        cases += [("lllite_native", dict(hooks={"controllllite": ll})),
+                  ("lllite_noop", dict(hooks=dict(neutral, controllllite=ll))),
+                  ("lllite_compose", dict(prompt=text, hooks=dict(neutral, controllllite=ll))),
+                  ("lllite_reference_pag", composed(hooks={"controllllite": ll, "pag": {"scale": 2.}})),
+                  ("lllite_cfg1_batch", composed(cfg=1., batch=2, hooks={"controllllite": ll})),
+                  ("lllite_alternative", composed(img2img=i2i(init), hooks={"controllllite": ll,
+                      "img2imgalt": {"randomness": 0.2, "inversion_steps": 6, "decode_cfg_scale": 0.5}}))]
+    focus = os.environ.get("SDFX_REFERENCE_FOCUS", "")
+    if focus == "passes":
+        hires = dict(gp()["hires"], enabled=True, resize_x=1024 if xl else 640,
+                     resize_y=1024 if xl else 960, second_pass_steps=4)
+        cases = [("baseline", {}), ("hires_reference", composed(hires=hires))]
+        if xl:
+            cases += [("hires_lllite", composed(hires=hires, hooks={"controllllite": ll})),
+                      ("lllite_alternative_fallback", composed(img2img=i2i(init), hooks={
+                          "controllllite": dict(ll, image=""), "img2imgalt": {"randomness": 0.2,
+                          "inversion_steps": 6, "decode_cfg_scale": 1.}}))]
+    cases += [("restored", {})]
+    paths, report, errors = {}, {}, []
+    for tag, changes in cases:
+        method = "img2img" if changes.get("img2img") else "txt2img"
+        result = call(method, req(gp(**dict(common, **changes))))
+        path = keep(result, CASE + "_" + tag)
+        if path:
+            paths[tag] = path
+            report[tag] = dict(path=path, warnings=result["result"]["warnings"], images=len(result["result"]["images"]))
+            if report[tag]["warnings"]:
+                errors.append({tag: report[tag]["warnings"]})
+        else:
+            errors.append({tag: result})
+        print(tag, report.get(tag) or result, flush=True)
+    pairs = [("baseline", "restored"), ("reference_native", "reference_noop"), ("compose_plain", "reference_zero")]
+    if xl:
+        pairs += [("lllite_native", "lllite_noop")]
+    for a, b in pairs:
+        if a in paths and b in paths:
+            with Image.open(paths[a]) as ia, Image.open(paths[b]) as ib:
+                diff = sum(ImageStat.Stat(ImageChops.difference(ia.convert("RGB"), ib.convert("RGB"))).mean) / 3
+            report[a + "_vs_" + b] = diff
+            if diff:
+                errors.append({a + "_vs_" + b: diff})
+    with open(os.path.join(OUT, CASE + ".json"), "w", encoding="utf-8") as fh:
+        json.dump(dict(cases=report, errors=errors, model=model, focus=focus), fh, indent=2)
+    r = {"type": "error" if errors else "result", "result": {"result": report}, "message": str(errors)}
+elif CASE in ("neutral_ip_sd15", "neutral_ip_sdxl", "neutral_ip_reload_sd15", "neutral_ip_reload_sdxl"):
+    from PIL import Image, ImageChops, ImageStat
+    from huggingface_hub import snapshot_download
+    xl = CASE.endswith("sdxl")
+    reload_check = CASE.startswith("neutral_ip_reload_")
+    if reload_check:
+        response = call("load_model", {"path": SDXL if xl else SD15, "dtype": "fp16", "vram_mode": "gpu" if xl else "model_offload"})
+        assert response["type"] == "result", response
+    else:
+        load(SDXL if xl else SD15)
+    size = dict(width=832, height=832) if xl else dict(width=512, height=768)
+    plain = "portrait of a woman, in a park, detailed"
+    common = dict(prompt=plain, steps=12, seed=11, **size)
+    reference = keep(call("txt2img", req(gp(**common))), CASE + "_input")
+    model = hf("h94/IP-Adapter", "sdxl_models/ip-adapter_sdxl.safetensors" if xl else "models/ip-adapter_sd15.safetensors")
+    plus = None if reload_check else hf("h94/IP-Adapter", "sdxl_models/ip-adapter-plus_sdxl_vit-h.safetensors" if xl else "models/ip-adapter-plus_sd15.safetensors")
+    encoder_h = None if reload_check else os.path.join(snapshot_download("h94/IP-Adapter", allow_patterns=["models/image_encoder/*"]), "models", "image_encoder")
+    image_hook = dict(model=model, image=reference, scale=0.6)
+    def composed(prompt=plain, phi=0, cfg=6, batch=1, hooks=None, **kw):
+        return dict(prompt=prompt, cfg_scale=cfg, batch_size=batch,
+                    hooks=dict({"neutral_prompt": {"cfg_rescale": phi}, "ip_adapter": image_hook}, **(hooks or {})), **kw)
+    text = plain + " AND_TOPK red scarf :0.5"
+    hint = call("preprocess", {"preprocessor": "canny", "image_path": reference, "output_dir": OUT, "args": {}})["result"]["path"]
+    cn_path = os.path.abspath("outputs/controlnet-models/sdxl-canny" if xl else "outputs/controlnet-models/sd15-canny/diffusion_pytorch_model.safetensors")
+    unit = dict(enabled=True, model="canny", image=hint, preprocessor="none", weight=0.5,
+                guidance_start=0., guidance_end=1., preprocessor_args={})
+    alt = dict(img2img=i2i(reference, denoise=0.5))
+    cases = [("baseline", dict(hooks={"ip_adapter": image_hook})), ("noop", composed()),
+        ("perp", composed(plain + " AND_PERP black hair :-0.5")),
+        ("salt", composed(plain + " AND_SALT red scarf :0.5")),
+        ("rescale", composed(text, phi=0.7)), ("cfg1", composed(text, cfg=1)),
+        ("batch", composed(text, cfg=1, batch=2)),
+        ("pag", composed(text, hooks={"pag": {"scale": 2}})),
+        ("pag_repeat", composed(text, hooks={"pag": {"scale": 2}})),
+        ("pag_cfg1", composed(text, cfg=1, hooks={"pag": {"scale": 2}})),
+        ("heun_edit", composed(plain + " AND_TOPK [red scarf:blue scarf:0.5] :0.5", sampler_name="Heun")),
+        ("hires", composed(text, hires=dict(gp()["hires"], enabled=True, scale=1.25, second_pass_steps=6))),
+        ("img2img", composed(text, img2img=i2i(reference, denoise=0.5))),
+        ("controlnet", composed(text, controlnet=[unit])),
+        ("alternative_baseline", dict(alt, hooks={"ip_adapter": image_hook, "img2imgalt": {"inversion_steps": 6, "decode_cfg_scale": 0.5}})),
+        ("alternative_noop", composed(hooks={"img2imgalt": {"inversion_steps": 6, "decode_cfg_scale": 0.5}}, **alt)),
+        ("alternative", composed(text, phi=0.3, hooks={"img2imgalt": {"inversion_steps": 6, "decode_cfg_scale": 0.5}}, **alt)),
+        ("plus", composed(text, hooks={"ip_adapter": dict(image_hook, model=plus, image_encoder=encoder_h)})),
+        ("plus_cfg1_pag", composed(text, cfg=1, hooks={"ip_adapter": dict(image_hook, model=plus, image_encoder=encoder_h), "pag": {"scale": 2}})),
+        ("restored", dict(hooks={"ip_adapter": image_hook})), ("unloaded", {})]
+    if reload_check:
+        cases = [("baseline", dict(hooks={"ip_adapter": image_hook})),
+            ("reload", dict(hooks={"ip_adapter": image_hook})),
+            ("pag", composed(text, hooks={"pag": {"scale": 2}})),
+            ("pag_repeat", composed(text, hooks={"pag": {"scale": 2}})),
+            ("negpip", composed(plain + " AND_TOPK (black hair:-1) :0.5", hooks={"negpip": {}})), ("unloaded", {})]
+    paths, report, errors = {"input": reference}, {}, []
+    for tag, changes in cases:
+        if reload_check and tag == "reload":
+            loaded = call("load_model", {"path": SDXL if xl else SD15, "dtype": "fp16", "vram_mode": "gpu" if xl else "model_offload"})
+            if loaded["type"] != "result":
+                errors.append({"reload_model": loaded})
+            print("checkpoint reloaded", loaded["type"], flush=True)
+        rq = req(gp(**dict(common, **changes))); rq["controlnet_paths"] = {"canny": cn_path}
+        result = call("img2img" if changes.get("img2img") else "txt2img", rq)
+        path = keep(result, CASE + "_" + tag)
+        if path:
+            paths[tag] = path
+            report[tag] = dict(path=path, warnings=result["result"]["warnings"], images=len(result["result"]["images"]))
+            if report[tag]["warnings"]:
+                errors.append({tag: report[tag]["warnings"]})
+        else:
+            errors.append({tag: result})
+        print(tag, report.get(tag) or str(result)[:500], flush=True)
+    comparisons = (("baseline","reload"),("input","unloaded"),("pag","pag_repeat")) if reload_check else (
+        ("baseline","noop"),("baseline","restored"),("input","unloaded"),("pag","pag_repeat"),("alternative_baseline","alternative_noop"))
+    for a,b in comparisons:
+        if a in paths and b in paths:
+            with Image.open(paths[a]) as im1, Image.open(paths[b]) as im2:
+                diff=sum(ImageStat.Stat(ImageChops.difference(im1.convert("RGB"),im2.convert("RGB"))).mean)/3
+            report[a+"_vs_"+b]=diff
+            if diff: errors.append({a+"_vs_"+b:diff})
+    with open(os.path.join(OUT,CASE+".json"),"w",encoding="utf-8") as fh: json.dump(dict(cases=report,errors=errors,model=model,plus=plus),fh,indent=2)
+    r={"type":"error" if errors else "result","result":{"result":report},"message":str(errors)}
+elif CASE in ("neutral_cn_sd15", "neutral_cn_sdxl"):
+    from PIL import Image, ImageChops, ImageStat
+    load(SD15 if CASE.endswith("sd15") else SDXL)
+    size = dict(width=512, height=768) if CASE.endswith("sd15") else dict(width=832, height=832)
+    plain = "portrait of a woman, in a park, detailed"
+    common = dict(prompt=plain, steps=12, seed=11, **size)
+    source = call("txt2img", req(gp(**common)))
+    init = keep(source, CASE + "_input")
+    edge = call("preprocess", {"preprocessor": "canny", "image_path": init, "output_dir": OUT, "args": {}})
+    cn = os.path.abspath("outputs/controlnet-models/" + ("sd15-canny" if CASE.endswith("sd15") else "sdxl-canny"))
+    if CASE.endswith("sd15"):
+        cn = os.path.join(cn, "diffusion_pytorch_model.safetensors")  # upstream A1111 keys require from_single_file
+    unit = dict(enabled=True, model="canny", image=edge["result"]["path"], preprocessor="none", weight=0.6,
+                guidance_start=0., guidance_end=1., preprocessor_args={})
+    common["controlnet"] = [unit]
+    def composed(prompt=plain, phi=0, cfg=6, batch=1, hooks=None, **kw):
+        return dict(prompt=prompt, cfg_scale=cfg, batch_size=batch,
+                    hooks=dict({"neutral_prompt": {"cfg_rescale": phi}}, **(hooks or {})), **kw)
+    text = plain + " AND_TOPK red scarf :0.5"
+    cases = [("baseline", {}), ("noop", composed()),
+        ("perp", composed(plain + " AND_PERP black hair :-0.5")),
+        ("salt", composed(plain + " AND_SALT red scarf :0.5")),
+        ("topk_rescale", composed(text, phi=0.7)),
+        ("cfg1", composed(text, cfg=1)),
+        ("cfg1_batch", composed(text, cfg=1, batch=2)),
+        ("heun_edit", composed(plain + " AND_TOPK [red scarf:blue scarf:0.5] :0.5", sampler_name="Heun")),
+        ("multi_window", composed(text, controlnet=[dict(unit, weight=0.3), dict(unit, weight=0.3, guidance_start=0.25, guidance_end=0.75)])),
+        ("pag", composed(text, hooks={"pag": {"scale": 2}})),
+        ("pag_cfg1", composed(text, cfg=1, hooks={"pag": {"scale": 2}})),
+        ("negpip", composed(plain + " AND_TOPK (black hair:-1) :0.5", hooks={"negpip": {}})),
+        ("restored", {})]
+    paths, report, errors = {}, {}, []
+    for tag, changes in cases:
+        rq = req(gp(**dict(common, **changes)))
+        rq["controlnet_paths"] = {"canny": cn}
+        result = call("txt2img", rq)
+        path = keep(result, CASE + "_" + tag)
+        if path:
+            paths[tag] = path
+            report[tag] = dict(path=path, warnings=result["result"]["warnings"], images=len(result["result"]["images"]))
+            if report[tag]["warnings"]:
+                errors.append({tag: report[tag]["warnings"]})
+        else:
+            errors.append({tag: result})
+        print(tag, report.get(tag) or result, flush=True)
+    for tag in ("noop", "restored"):
+        if "baseline" in paths and tag in paths:
+            with Image.open(paths["baseline"]) as a, Image.open(paths[tag]) as b:
+                diff = sum(ImageStat.Stat(ImageChops.difference(a.convert("RGB"), b.convert("RGB"))).mean) / 3
+            report["baseline_vs_" + tag] = diff
+            if diff:
+                errors.append({tag: diff})
+    with open(os.path.join(OUT, CASE + ".json"), "w", encoding="utf-8") as fh:
+        json.dump(dict(cases=report, errors=errors, controlnet=cn), fh, indent=2)
+    r = {"type": "error" if errors else "result", "result": {"result": report}, "message": str(errors)}
+elif CASE in ("neutral_sd15", "neutral_sdxl", "neutral_alt_sd15", "neutral_alt_sdxl", "neutral_pag_sd15", "neutral_pag_sdxl", "neutral_pag_zero_sd15", "neutral_pag_zero_sdxl"):
+    from PIL import Image, ImageChops, ImageStat
+    load(SD15 if CASE.endswith("sd15") else SDXL)
+    size = dict(width=512, height=768) if CASE.endswith("sd15") else dict(width=832, height=832)
+    plain = "portrait of a woman, in a park, detailed"
+    common = dict(prompt=plain, steps=16, seed=11, **size)
+    enabled = {"neutral_prompt": {}}
+    variants = [("baseline", {}), ("noop", dict(hooks=enabled)),
+        ("and", dict(prompt=plain + " :0.5 AND red scarf :0.5", hooks=enabled)),
+        ("perp", dict(prompt=plain + " AND_PERP black hair :-1", hooks=enabled)),
+        ("salt", dict(prompt=plain + " AND_SALT red scarf :0.7", hooks=enabled)),
+        ("topk", dict(prompt=plain + " AND_TOPK red scarf :0.7", hooks=enabled)),
+        ("nested", dict(prompt=plain + " AND_PERP [black hair AND_SALT red scarf :0.5] :-0.5", hooks=enabled)),
+        ("rescale", dict(hooks={"neutral_prompt": {"cfg_rescale": 0.7}})),
+        ("schedule", dict(prompt=plain + " AND_TOPK [red scarf:blue scarf:0.5] :0.7", hooks=enabled)),
+        ("batch", dict(prompt=plain + " AND_PERP black hair :-1", batch_size=2, hooks=enabled)),
+        ("cfg1", dict(prompt=plain + " AND_TOPK red scarf :0.7", cfg_scale=1, hooks=enabled)),
+        ("hires", dict(prompt=plain + " AND_TOPK red scarf :0.7", hires=dict(gp()["hires"], enabled=True, scale=1.25, second_pass_steps=8), hooks=enabled)),
+        ("img2img", dict(prompt=plain + " AND_TOPK red scarf :0.7", img2img=i2i(os.path.join(OUT, CASE + "_baseline.png"), denoise=0.5), hooks=enabled)),
+        ("euler", dict(prompt=plain + " AND_PERP black hair :-0.5", sampler_name="Euler", hooks=enabled)),
+        ("heun", dict(prompt=plain + " AND_TOPK [red scarf:blue scarf:0.5] :0.7", sampler_name="Heun", hooks=enabled)),
+        ("negpip", dict(prompt=plain + " AND_TOPK (black hair:-1) :0.7", hooks={"neutral_prompt": {}, "negpip": {}})),
+        ("gradient", dict(prompt=plain + " AND_TOPK {red scarf::0.1-1.5} :0.7", hooks={"neutral_prompt": {}, "weight_gradient": {}})),
+        ("restored", {})]
+    if CASE.startswith("neutral_pag_"):
+        pag = {"scale": 2, "adaptive_scale": 0}
+        def pagged(prompt=plain, phi=0, cfg=6, batch=1, extra=None, adaptive=0, sampler="DPM++ 2M"):
+            hooks = {"neutral_prompt": {"cfg_rescale": phi}, "pag": dict(pag, adaptive_scale=adaptive)}
+            hooks.update(extra or {})
+            return dict(prompt=prompt, cfg_scale=cfg, batch_size=batch, sampler_name=sampler, hooks=hooks)
+        variants = [("baseline", dict(hooks={"pag": pag})), ("noop", pagged()),
+            ("perp", pagged(plain + " AND_PERP black hair :-0.5")),
+            ("salt", pagged(plain + " AND_SALT red scarf :0.5")),
+            ("topk_rescale", pagged(plain + " AND_TOPK red scarf :0.5", phi=0.7)),
+            ("cfg1", pagged(plain + " AND_TOPK red scarf :0.5", cfg=1)),
+            ("cfg1_batch", pagged(plain + " AND_TOPK red scarf :0.5", cfg=1, batch=2)),
+            ("batch", pagged(plain + " AND_TOPK red scarf :0.5", batch=2)),
+            ("heun_edit", pagged(plain + " AND_TOPK [red scarf:blue scarf:0.5] :0.5", sampler="Heun")),
+            ("adaptive", pagged(plain + " AND_TOPK red scarf :0.5", adaptive=0.003)),
+            ("negpip", pagged(plain + " AND_TOPK (black hair:-1) :0.5", extra={"negpip": {}})),
+            ("restored", dict(hooks={"pag": pag}))]
+        if CASE.startswith("neutral_pag_zero_"):
+            text = plain + " AND_TOPK red scarf :0.5"
+            ordinary = dict(prompt=text, hooks={"neutral_prompt": {"cfg_rescale": 0.7}})
+            variants = [("baseline", ordinary),
+                ("noop", dict(ordinary, hooks={"neutral_prompt": {"cfg_rescale": 0.7}, "pag": {"scale": 0}})),
+                ("cfg1", dict(prompt=text, cfg_scale=1, hooks={"neutral_prompt": {}, "pag": {"scale": 0}})),
+                ("restored", ordinary)]
+    elif CASE.startswith("neutral_alt_"):
+        init = i2i(os.path.join(OUT, CASE + "_baseline.png"), denoise=0.5)
+        alt = {"inversion_steps": 8, "decode_cfg_scale": 1}
+        def alternative(prompt=plain, phi=0, decode=1, extra=None, count=8):
+            hooks = {"neutral_prompt": {"cfg_rescale": phi}, "img2imgalt": dict(alt, decode_cfg_scale=decode, inversion_steps=count)}
+            hooks.update(extra or {})
+            return dict(prompt=prompt, img2img=init, hooks=hooks)
+        variants = [("baseline", {}), ("noop", dict(hooks=enabled)),
+            ("alt_baseline", dict(img2img=init, hooks={"img2imgalt": alt})),
+            ("alt_noop", alternative()),
+            ("alt_perp", alternative(plain + " AND_PERP black hair :-0.5")),
+            ("alt_salt", alternative(plain + " AND_SALT red scarf :0.5")),
+            ("alt_topk_rescale", alternative(plain + " AND_TOPK red scarf :0.5", phi=0.7)),
+            ("alt_and_decode0", alternative(plain + " :0.7 AND red scarf :0.3", decode=0, phi=0.4)),
+            ("alt_schedule_decodehalf", alternative(plain + " AND_TOPK [red scarf:blue scarf:0.5] :0.5", decode=0.5)),
+            ("alt_negpip", alternative(plain + " AND_TOPK (black hair:-1) :0.5", extra={"negpip": {}})),
+            ("alt_default50", alternative(plain + " AND_TOPK red scarf :0.5", count=50)),
+            ("restored", {})]
+    paths, report, errors = {}, {}, []
+    for tag, changes in variants:
+        result = call("img2img" if changes.get("img2img") else "txt2img", req(gp(**dict(common, **changes))))
+        path = keep(result, CASE + "_" + tag)
+        if path:
+            paths[tag] = path
+            report[tag] = {"path": path, "warnings": result["result"]["warnings"], "images": len(result["result"]["images"])}
+            if report[tag]["warnings"]:
+                errors.append({tag: report[tag]["warnings"]})
+        else:
+            errors.append({tag: result})
+        print(tag, report.get(tag) or result, flush=True)
+    for a, b in [("baseline", "noop"), ("baseline", "restored")] + ([("alt_baseline", "alt_noop")] if CASE.startswith("neutral_alt_") else []):
+        if a in paths and b in paths:
+            with Image.open(paths[a]) as im1, Image.open(paths[b]) as im2:
+                diff = sum(ImageStat.Stat(ImageChops.difference(im1.convert("RGB"), im2.convert("RGB"))).mean) / 3
+            report[a + "_vs_" + b] = diff
+            if diff:
+                errors.append({a + "_vs_" + b: diff})
+    with open(os.path.join(OUT, CASE + ".json"), "w", encoding="utf-8", newline="\n") as fh:
+        json.dump({"cases": report, "errors": errors}, fh, indent=2)
+    r = {"type": "error" if errors else "result", "result": {"result": report}, "message": str(errors)}
+elif CASE in ("negpip_sd15", "negpip_sdxl"):
+    from PIL import Image, ImageChops, ImageStat
+    load(SD15 if CASE.endswith("sd15") else SDXL)
+    size = dict(width=512, height=768) if CASE.endswith("sd15") else dict(width=832, height=832)
+    plain = "portrait of a woman, black hair, in a park, detailed"
+    signed = "portrait of a woman, (black hair:-1), in a park, detailed"
+    common = dict(prompt=plain, steps=16, seed=11, **size)
+    variants = [
+        ("baseline", {}), ("noop", dict(hooks={"negpip": {}})),
+        ("ordinary_signed", dict(prompt=signed)),
+        ("positive_minus1", dict(prompt=signed, hooks={"negpip": {}})),
+        ("positive_minus2", dict(prompt=signed.replace(":-1", ":-2"), hooks={"negpip": {}})),
+        ("negative_branch", dict(negative_prompt="lowres, (red scarf:-2)", hooks={"negpip": {}})),
+        ("schedule", dict(prompt="portrait of a woman, [(black hair:-2):0.5], detailed", hooks={"negpip": {}})),
+        ("cross_zero", dict(prompt="portrait of a woman, {black hair::1--2}, detailed", hooks={"negpip": {}, "weight_gradient": {}})),
+        ("batch", dict(prompt=signed, batch_size=2, hooks={"negpip": {}})),
+        ("pag", dict(prompt=signed, hooks={"negpip": {}, "pag": {"scale": 2}})),
+        ("hires", dict(prompt=signed, hires=dict(gp()["hires"], enabled=True, scale=1.25, second_pass_steps=8), hooks={"negpip": {}})),
+        ("cfg1", dict(prompt=signed, cfg_scale=1, hooks={"negpip": {}})),
+        ("img2img", dict(prompt=signed, img2img=i2i(os.path.join(OUT, CASE + "_baseline.png"), denoise=0.5), hooks={"negpip": {}})),
+        ("alternative", dict(prompt=signed, img2img=i2i(os.path.join(OUT, CASE + "_baseline.png"), denoise=0.5),
+                             hooks={"negpip": {}, "img2imgalt": {"inversion_steps": 8}})),
+        ("restored", {})]
+    paths, report, errors = {}, {}, []
+    for tag, changes in variants:
+        result = call("img2img" if changes.get("img2img") else "txt2img", req(gp(**dict(common, **changes))))
+        path = keep(result, CASE + "_" + tag)
+        if path:
+            paths[tag] = path
+            report[tag] = {"path": path, "warnings": result["result"]["warnings"], "images": len(result["result"]["images"])}
+        else:
+            errors.append({tag: result})
+        print(tag, report.get(tag) or result, flush=True)
+    def mae(a, b):
+        with Image.open(paths[a]) as im1, Image.open(paths[b]) as im2:
+            return sum(ImageStat.Stat(ImageChops.difference(im1.convert("RGB"), im2.convert("RGB"))).mean) / 3
+    for a, b, equal in [("baseline", "noop", True), ("baseline", "restored", True),
+                         ("ordinary_signed", "positive_minus1", False), ("positive_minus1", "positive_minus2", False)]:
+        if a in paths and b in paths:
+            diff = mae(a, b)
+            report[a + "_vs_" + b] = diff
+            if (diff == 0) != equal:
+                errors.append({a + "_vs_" + b: diff})
+    with open(os.path.join(OUT, CASE + ".json"), "w", encoding="utf-8", newline="\n") as fh:
+        json.dump({"cases": report, "errors": errors}, fh, indent=2)
+    r = {"type": "error" if errors else "result", "result": {"result": report}, "message": str(errors)}
+elif CASE in ("alt_quality_sd15", "alt_quality_sdxl"):
+    from PIL import Image, ImageChops, ImageStat
+    import numpy as np
+    import cv2
+    load(SD15 if CASE.endswith("sd15") else SDXL)
+    size = dict(width=512, height=768) if CASE.endswith("sd15") else dict(width=832, height=832)
+    common = dict(prompt="portrait of a woman wearing (red scarf:0.8), in a park, detailed", steps=16, seed=11, **size)
+    baseline = call("txt2img", req(gp(**common)))
+    src = keep(baseline, CASE + "_source")
+    report, errors = {}, []
+
+    def measure(path):
+        with Image.open(path) as im:
+            a = np.asarray(im.convert("RGB"), dtype=np.float32) / 255
+        lab = cv2.cvtColor(a, cv2.COLOR_RGB2LAB)
+        return {"lightness_std": float(lab[..., 0].std()), "mean_chroma": float(np.hypot(lab[..., 1], lab[..., 2]).mean()),
+                "high_clip": float((a >= 0.98).mean()), "low_clip": float((a <= 0.02).mean())}
+
+    if src:
+        report["source"] = dict(path=src, **measure(src))
+    else:
+        errors.append(baseline)
+    variants = [(s, c, d, 0) for s, c, d in (("DPM++ 2M", 6, 1), ("DPM++ 2M", 2, 1), ("DPM++ 2M", 1, 1),
+                 ("DPM++ 2M", 6, 6), ("Euler", 6, 1), ("Euler", 2, 1), ("Euler", 1, 1), ("Euler", 2, 2), ("DDIM", 1, 1))]
+    variants += [("DPM++ 2M", 6, 0, 0), ("DPM++ 2M", 6, 0.5, 0), ("DPM++ 2M", 6, 1, 1)]
+    for sampler, cfg, decode_cfg, randomness in variants:
+        tag = sampler.replace("+", "p").replace(" ", "_") + f"_cfg{cfg}_decode{decode_cfg}"
+        if randomness:
+            tag += f"_random{randomness}"
+        result = call("img2img", req(gp(**dict(common, sampler_name=sampler, cfg_scale=cfg,
+                      img2img=i2i(src, denoise=1), hooks={"img2imgalt": {"decode_cfg_scale": decode_cfg, "randomness": randomness}}))))
+        path = keep(result, CASE + "_" + tag)
+        if path:
+            report[tag] = dict(path=path, warnings=result["result"]["warnings"], **measure(path))
+            with Image.open(src) as a, Image.open(path) as b:
+                report[tag]["source_mae"] = sum(ImageStat.Stat(ImageChops.difference(a.convert("RGB"), b.convert("RGB"))).mean) / 3
+            if randomness == 1 and report[tag]["source_mae"] != 0:
+                errors.append({tag: "randomness=1 did not reproduce the ordinary same-seed baseline"})
+        else:
+            errors.append({tag: result})
+        print(tag, report.get(tag) or result, flush=True)
+    with open(os.path.join(OUT, CASE + ".json"), "w", encoding="utf-8", newline="\n") as fh:
+        json.dump({"cases": report, "errors": errors}, fh, indent=2)
+    r = {"type": "error" if errors else "result", "result": {"result": report}, "message": str(errors)}
+elif CASE in ("weight_sd15", "weight_sdxl", "weight_alt_sd15", "weight_alt_sdxl"):
+    from PIL import Image, ImageChops, ImageStat
+    load(SD15 if CASE.endswith("sd15") else SDXL)
+    size = dict(width=512, height=768) if CASE.endswith("sd15") else dict(width=832, height=832)
+    prefix, suffix = "portrait of a woman wearing ", ", in a park, detailed"
+    plain = prefix + "(red scarf:0.8)" + suffix
+    gradient = prefix + "{red scarf::0.2-1.4:e}" + suffix
+    common = dict(steps=16, seed=11, **size)
+    reference = call("txt2img", req(gp(prompt=plain, **common)))
+    source = keep(reference, CASE + "_reference")
+    paths, errors, checks = {"reference": source}, [], {}
+    if not source:
+        errors.append({"reference": reference})
+    cases = [
+        ("constant", dict(prompt=prefix + "{red scarf::0.8-0.8}" + suffix, hooks={"weight_gradient": {}})),
+        ("start", dict(prompt=prefix + "(red scarf:0.2)" + suffix)),
+        ("end", dict(prompt=prefix + "(red scarf:1.4)" + suffix)),
+        ("exponential", dict(prompt=gradient, hooks={"weight_gradient": {}})),
+        ("return", dict(prompt=prefix + "{red scarf::1.4-0.2-1.4:c}" + suffix, hooks={"weight_gradient": {}})),
+        ("negative", dict(prompt=plain, negative_prompt="lowres, {red scarf::0.1-1.5:eo}", hooks={"weight_gradient": {}})),
+        ("hires", dict(prompt=gradient, hooks={"weight_gradient": {}},
+                       hires=dict(gp()["hires"], enabled=True, scale=1.25, second_pass_steps=7, denoising_strength=0.6))),
+        ("img2img", dict(prompt=gradient, hooks={"weight_gradient": {}}, img2img=i2i(source, denoise=0.5))),
+        ("alternative", dict(prompt=gradient, hooks={"weight_gradient": {}, "img2imgalt": {"inversion_steps": 6}},
+                             img2img=i2i(source, denoise=0.4))),
+        ("heun_reference", dict(prompt=plain, sampler_name="Heun")),
+        ("heun_constant", dict(prompt=prefix + "{red scarf::0.8-0.8}" + suffix,
+                               hooks={"weight_gradient": {}}, sampler_name="Heun")),
+        ("heun_start", dict(prompt=prefix + "(red scarf:0.2)" + suffix, sampler_name="Heun")),
+        ("heun_gradient", dict(prompt=gradient, hooks={"weight_gradient": {}}, sampler_name="Heun")),
+        ("restored", dict(prompt=plain)),
+    ]
+    if CASE.startswith("weight_alt_"):
+        cases = [
+            ("alternative_start", dict(prompt=prefix + "(red scarf:0.2)" + suffix, hooks={"img2imgalt": {}},
+                                       img2img=i2i(source, denoise=0.4))),
+            ("alternative", dict(prompt=gradient, hooks={"weight_gradient": {}, "img2imgalt": {}},
+                                 img2img=i2i(source, denoise=0.4))),
+            ("restored", dict(prompt=plain)),
+        ]
+    for tag, options in cases:
+        result = call("img2img" if options.get("img2img") else "txt2img", req(gp(**dict(common, **options))))
+        path = keep(result, CASE + "_" + tag)
+        paths[tag] = path
+        if not path or result.get("result", {}).get("warnings"):
+            errors.append({tag: result})
+            continue
+        with Image.open(path) as im:
+            rgb = im.convert("RGB")
+            checks[tag] = {"path": path, "size": list(im.size), "std": ImageStat.Stat(rgb).stddev}
+            if max(checks[tag]["std"]) < 2:
+                errors.append({tag: "uniform output"})
+        print(tag, checks[tag], flush=True)
+    differences = {}
+    for a, b in (("constant", "reference"), ("restored", "reference"),
+                 ("exponential", "start"), ("exponential", "end"),
+                 ("heun_constant", "heun_reference"), ("heun_gradient", "heun_start")):
+        if paths.get(a) and paths.get(b):
+            with Image.open(paths[a]) as x, Image.open(paths[b]) as y:
+                diff = sum(ImageStat.Stat(ImageChops.difference(x.convert("RGB"), y.convert("RGB"))).mean) / 3
+            differences[f"{a}-{b}"] = diff
+            if (a in ("constant", "restored", "heun_constant") and diff != 0) or (a in ("exponential", "heun_gradient") and diff <= 0):
+                errors.append({f"{a}-{b}": diff})
+    report = {"paths": paths, "checks": checks, "differences": differences, "errors": errors}
+    with open(os.path.join(OUT, CASE + ".json"), "w", encoding="utf-8", newline="\n") as fh:
+        json.dump(report, fh, indent=2)
+    r = {"type": "error" if errors else "result", "result": {"result": differences}, "message": str(errors)}
+elif CASE in ("image_sd15", "image_sdxl"):
+    from PIL import Image
+    import numpy as np
+    load(SD15 if CASE == "image_sd15" else SDXL)
+    size = dict(width=512, height=768) if CASE == "image_sd15" else dict(width=832, height=1216)
+    r = call("txt2img", req(gp(prompt="a woman wearing a red jacket, standing in a green park, full body, detailed", **size)))
+    assert r["type"] == "result", r
+    src = keep(r, CASE + "_source")
+    assert src, "generation returned no readable source image"
+    checks = {}
+    for tool, opts in (
+        ("pixel_art", {"pixel_size": 8, "colors": 16, "dither": 0.5}),
+        ("color_enhance", {"strength": 0.5}),
+        ("cas_upscale", {"scale": 2, "sharpness": 0.5}),
+        ("person_mask", {"dilate": 8, "invert": True}),
+        ("remove_background", {"model": "person_segmentation"}),
+        ("remove_background", {"model": "isnet-anime"}),
+        ("depth_mask", {"near": 0.5, "far": 1.0}),
+    ):
+        tag = tool + ("_" + opts["model"] if "model" in opts else "")
+        result = call("image_tool", dict(tool=tool, image_path=src, output_dir=OUT, **opts))
+        if result["type"] != "result":
+            checks[tag] = {"error": result}
+            print(tag, result, flush=True)
+            continue
+        payload = result["result"]
+        path = keep(result, CASE + "_" + tag)
+        with Image.open(path) as im:
+            arr = np.asarray(im)
+            checks[tag] = {"path": path, "size": list(im.size), "mode": im.mode,
+                           "std": float(arr.std()), "outputs": payload.get("outputs", {})}
+            if im.mode == "RGBA":
+                alpha = arr[..., 3]
+                checks[tag]["alpha_fraction"] = float((alpha > 127).mean())
+                if not 0.01 < checks[tag]["alpha_fraction"] < 0.99:
+                    checks[tag]["error"] = "cutout alpha is empty or opaque"
+            if tool in ("person_mask", "depth_mask"):
+                checks[tag]["mask_fraction"] = float((arr[..., 0] > 127).mean())
+                if not 0.01 < checks[tag]["mask_fraction"] < 0.99:
+                    checks[tag]["error"] = "mask is empty or full"
+            expected = (size["width"], size["height"])
+            if tool == "cas_upscale":
+                expected = tuple(v * 2 for v in expected)
+            if im.size != expected:
+                checks[tag]["error"] = f"wrong size: {im.size} != {expected}"
+        print(tag, checks[tag], flush=True)
+        if tool in ("person_mask", "depth_mask"):
+            edited = call("img2img", req(gp(prompt="a woman wearing a red jacket, standing on a snowy mountain", steps=20,
+                                             img2img=i2i(src, path, 0.8), **size)))
+            checks[tag]["inpaint"] = (keep(edited, CASE + "_" + tag + "_inpaint")
+                                       if edited["type"] == "result" else edited)
+    with open(os.path.join(OUT, CASE + ".json"), "w", encoding="utf-8", newline="\n") as report:
+        json.dump(checks, report, indent=2)
+    ok = all("error" not in value and ("inpaint" not in value or isinstance(value["inpaint"], str))
+             for value in checks.values())
+    r = {"type": "result" if ok else "error", "result": {"result": checks}, "message": str(checks)}
+elif CASE in ("depth_marigold", "normal_marigold", "recolor_luminance", "tile_resample", "blur_gaussian"):
+    r = call("preprocess", {"preprocessor": CASE, "image_path": FACE, "output_dir": OUT, "args": {"down_sampling_rate": 4.0}})
+elif CASE == "gfpgan":
+    model = fetch("https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.4.pth", "GFPGANv1.4.pth")
+    r = call("restore_faces", {"image_path": FACE, "model": model, "output_dir": OUT})
+elif CASE == "face_restore_hook":
+    load(SD15)
+    model = fetch("https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.4.pth", "GFPGANv1.4.pth")
+    r = call("txt2img", req(gp(hooks={"face_restore": {"model": model, "visibility": 1.0}})))
+elif CASE == "blip":
+    r = call("caption", {"image_path": FACE, "method": "blip"})
+elif CASE == "ldsr":
+    r = call("upscale", {"image_path": FACE, "upscaler": "LDSR", "scale": 2.0, "output_dir": OUT, "upscaler_paths": {}})
+elif CASE == "controlnet":
+    load(SD15)
+    cn = hf("comfyanonymous/ControlNet-v1-1_fp16_safetensors", "control_v11p_sd15_canny_fp16.safetensors")
+    canny = call("preprocess", {"preprocessor": "canny", "image_path": FACE, "output_dir": OUT, "args": {}})
+    unit = {"enabled": True, "model": "canny", "image": canny["result"]["path"], "preprocessor": "none", "weight": 1.0,
+            "guidance_start": 0.0, "guidance_end": 1.0, "preprocessor_args": {}}
+    rq = req(gp(prompt="a robot face, metal, detailed", controlnet=[unit]))
+    rq["controlnet_paths"] = {"canny": cn}
+    r = call("txt2img", rq)
+elif CASE == "codeformer":
+    model = fetch("https://github.com/sczhou/CodeFormer/releases/download/v0.1.0/codeformer.pth", "codeformer.pth")
+    r = call("restore_faces", {"image_path": FACE, "model": model, "output_dir": OUT, "codeformer_weight": 0.5})
+elif CASE == "wd14":
+    r = call("caption", {"image_path": FACE, "method": "wd14", "threshold": 0.35})
+elif CASE == "custom_code":
+    r = call("run_code", {"code": "from PIL import Image\nimages = [Image.new('RGB', (64, 64), 'red')]\nresult = type(pipe).__name__",
+                          "output_dir": OUT})
+elif CASE == "ip_adapter":
+    load(SD15)
+    ipa = hf("h94/IP-Adapter", "models/ip-adapter_sd15.safetensors")
+    r = call("txt2img", req(gp(prompt="a cat", hooks={"ip_adapter": {"model": ipa, "image": FACE, "scale": 0.7}})))
+    keep(r, "ip_adapter")
+    r2 = call("txt2img", req(gp(prompt="a cat")))
+    print("ip_adapter unloaded afterwards:", r2["type"], flush=True)
+    keep(r2, "ip_adapter_off")
+elif CASE == "controllllite":
+    load(SDXL)
+    lllite = hf("kohya-ss/controlnet-lllite", "controllllite_v01032064e_sdxl_canny_anime.safetensors")
+    base = call("txt2img", req(gp(prompt="1girl, standing, full body, simple background", width=832, height=1216, steps=20)))
+    src = keep(base, "lllite_source")
+    canny = call("preprocess", {"preprocessor": "canny", "image_path": src, "output_dir": OUT, "args": {}})
+    keep(canny, "lllite_canny")
+    r = call("txt2img", req(gp(prompt="1girl, standing, full body, red dress, city street", width=832, height=1216, steps=20,
+                               hooks={"controllllite": {"model": lllite, "image": os.path.join(OUT, "lllite_canny.png"),
+                                                        "strength": 1.0, "start_percent": 0.0, "end_percent": 1.0}})))
+elif CASE == "fooocus_inpaint":
+    load(SDXL)
+    patch = hf("lllyasviel/fooocus_inpaint", "inpaint_v26.fooocus.patch")
+    head = hf("lllyasviel/fooocus_inpaint", "fooocus_inpaint_head.pth")
+    base = call("txt2img", req(gp(prompt="1girl, upper body, white shirt", width=832, height=1216, steps=20)))
+    src = keep(base, "fooocus_source")
+    r = call("img2img", req(gp(prompt="1girl, upper body, red scarf", width=832, height=1216, steps=20,
+                               img2img=i2i(src, mask_png((832, 1216)), 1.0),
+                               hooks={"fooocus_inpaint": {"model": patch, "head": head}})))
+elif CASE in ('model_keyword_composable_negpip', 'model_keyword_composable_img2imgalt'):
+    checkpoint = os.environ.get('SDFX_KEYWORD_CHECKPOINT', SD15)
+    adapter = os.environ.get('SDFX_KEYWORD_LORA', r'D:\stable-diffusion-webui-reForge\models\Lora\20_yui.safetensors')
+    size = int(os.environ.get('SDFX_KEYWORD_SIZE', '512'))
+    load(checkpoint)
+    mapping = os.path.join(OUT, 'keyword-composable-mappings')
+    saved = call('model_keyword', {'action': 'save', 'kind': 'checkpoint', 'model_path': checkpoint,
+                                  'mapping_dir': mapping, 'keywords': 'red|blue'})
+    assert saved.get('type') == 'result', saved
+    hooks = {'model_keyword': {'_mapping_dir': mapping, 'model_choice': 'iterate'}, 'composable_lora': {}}
+    params = gp(prompt='<lora:base:0.8> a ceramic teapot', width=size, height=size, steps=6,
+                seed=173, batch_size=2, n_iter=1, loras=[{'name': 'base', 'weight': .8}], hooks=hooks)
+    request = req(params); request['lora_paths'] = {'base': adapter}; request['manual_loras'] = []
+    operation = 'txt2img'
+    if CASE.endswith('negpip'):
+        params['negative_prompt'] = '(blurry:-1)'
+        hooks['negpip'] = {}
+    else:
+        baseline = call('txt2img', req(gp(prompt='a ceramic teapot', width=size, height=size, steps=6)))
+        src = keep(baseline, 'keyword_composable_alt_reference')
+        assert src and os.path.isfile(src), baseline
+        operation = 'img2img'
+        params['img2img'] = i2i(src)
+        hooks['img2imgalt'] = {'override_prompt': '<lora:inverse:0.6> a ceramic teapot', 'inversion_steps': 4}
+        params['loras'].append({'name': 'inverse', 'weight': .6})
+        request['lora_paths']['inverse'] = adapter
+    r = call(operation, request)
+    assert r.get('type') == 'result', r
+    images = r['result'].get('images', [])
+    assert len(images) == 2 and all(os.path.isfile(item['path']) for item in images), r
+    assert 'red' in images[0].get('effective_prompt', '') and 'blue' in images[1].get('effective_prompt', ''), r
+    print('PASS composable keyword integration:', [item['path'] for item in images], flush=True)
+elif CASE == "model_keyword_photomaker":
+    load(SDXL)
+    import hashlib
+    from huggingface_hub import hf_hub_download
+    pm = hf_hub_download('TencentARC/PhotoMaker', 'photomaker-v1.bin',
+                         revision='f68f8e6309bf213d28d68230abff0ccc92de9f30',
+                         local_dir=os.path.join(MODELS, 'TencentARC__PhotoMaker'))
+    model_digest = hashlib.sha256()
+    with open(pm, 'rb') as model_file:
+        for chunk in iter(lambda: model_file.read(1024 * 1024), b''):
+            model_digest.update(chunk)
+    assert model_digest.hexdigest() == '529d503fa378bfb3a74e3384ab2064d7269d59f0638324555d22067c31e275bc', 'PhotoMaker weight hash mismatch'
+    face = call("txt2img", req(gp(prompt="portrait photo of a woman, neutral background", width=768, height=768, steps=8)))
+    src = keep(face, "keyword_photomaker_reference")
+    assert src and os.path.isfile(src), face
+    mapping = os.path.join(OUT, 'keyword-photomaker-mappings')
+    saved = call('model_keyword', {'action': 'save', 'kind': 'checkpoint', 'model_path': SDXL,
+                                  'mapping_dir': mapping, 'keywords': 'red|blue'})
+    assert saved.get('type') == 'result', saved
+    r = call('txt2img', req(gp(prompt='a woman img, portrait, upper body', width=768, height=768,
+                               steps=8, batch_size=2, n_iter=1, seed=173,
+                               hooks={'model_keyword': {'_mapping_dir': mapping, 'model_choice': 'iterate'},
+                                      'photomaker': {'model': pm, 'images': [src], 'trigger_word': 'img',
+                                                     'start_merge_step': 3}})))
+    assert r.get('type') == 'result', r
+    images = r['result'].get('images', [])
+    assert len(images) == 2 and [item.get('effective_prompt') for item in images] == [
+        'red a woman img, portrait, upper body', 'blue a woman img, portrait, upper body'], r
+    print('PASS PhotoMaker heterogeneous keyword batch:', [item['path'] for item in images], flush=True)
+elif CASE == "model_keyword_photomaker_composable":
+    import hashlib
+    pm = os.environ['SDFX_PHOTOMAKER_MODEL']
+    adapter = os.environ['SDFX_KEYWORD_LORA']
+    cfg = float(os.environ.get('SDFX_PHOTOMAKER_CFG', '0.5'))
+    photo_size = int(os.environ.get('SDFX_PHOTOMAKER_SIZE', '768'))
+    photo_steps = int(os.environ.get('SDFX_PHOTOMAKER_STEPS', '8'))
+    signed = os.environ.get('SDFX_PHOTOMAKER_NEGPIP') == '1'
+    tiled = os.environ.get('SDFX_PHOTOMAKER_MULTIDIFFUSION') == '1'
+    photo_tile = int(os.environ.get('SDFX_PHOTOMAKER_TILE', '256'))
+    photo_overlap = int(os.environ.get('SDFX_PHOTOMAKER_TILE_OVERLAP', '64'))
+    digest = hashlib.sha256()
+    with open(pm, 'rb') as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(chunk)
+    assert digest.hexdigest() == '529d503fa378bfb3a74e3384ab2064d7269d59f0638324555d22067c31e275bc'
+    load(SDXL)
+    face = call('txt2img', req(gp(prompt='portrait photo of a woman, neutral background', width=photo_size, height=photo_size, steps=photo_steps, subseed=31337)))
+    src = keep(face, 'keyword_composable_photomaker_reference')
+    assert src and os.path.isfile(src), face
+    mapping = os.path.join(OUT, 'keyword-composable-photomaker-mappings')
+    saved = call('model_keyword', {'action': 'save', 'kind': 'checkpoint', 'model_path': SDXL,
+                                  'mapping_dir': mapping, 'keywords': 'red|blue'})
+    assert saved.get('type') == 'result', saved
+    params = gp(prompt='[portrait:photo:0.5] of a woman img <lora:base:0.8> AND a woman img, upper body' + (', (black hair:-1)' if signed else ''),
+                negative_prompt='lowres', width=photo_size, height=photo_size, steps=photo_steps, cfg_scale=cfg,
+                seed=173, subseed=31337, batch_size=2, n_iter=1, loras=[{'name': 'base', 'weight': .8}],
+                hooks={'model_keyword': {'_mapping_dir': mapping, 'model_choice': 'iterate'},
+                       'composable_lora': {}, **({'negpip': {}} if signed else {}),
+                       **({'multidiffusion': {'tile_width': photo_tile, 'tile_height': photo_tile, 'tile_overlap': photo_overlap}} if tiled else {}),
+                       'photomaker': {'model': pm, 'images': [src],
+                       'trigger_word': 'img', 'start_merge_step': min(3, photo_steps - 1)}})
+    request = req(params); request['lora_paths'] = {'base': adapter}; request['manual_loras'] = []
+    if os.environ.get('SDFX_PHOTOMAKER_CONTROLS') == '1':
+        import copy
+        controls = {}
+        for label, removed in (('photomaker_only', 'multidiffusion'), ('multidiffusion_only', 'photomaker')):
+            variant = copy.deepcopy(request)
+            variant['params']['hooks'].pop(removed, None)
+            result = call('txt2img', variant)
+            assert result.get('type') == 'result', (label, result)
+            items = result['result'].get('images', [])
+            assert len(items) == 2 and all(os.path.isfile(item['path']) for item in items), result
+            controls[label] = [item['path'] for item in items]
+        single = req(gp(prompt='portrait photo of a woman, neutral background', width=photo_size,
+                        height=photo_size, steps=photo_steps, subseed=31337,
+                        hooks={'multidiffusion': {'tile_width': photo_tile, 'tile_height': photo_tile,
+                                                  'tile_overlap': photo_overlap}}))
+        single_result = call('txt2img', single)
+        assert single_result.get('type') == 'result', single_result
+        single_items = single_result['result'].get('images', [])
+        assert len(single_items) == 1 and os.path.isfile(single_items[0]['path']), single_result
+        controls['ordinary_plain'] = [src]
+        controls['multidiffusion_plain'] = [single_items[0]['path']]
+        with open(os.path.join(OUT, 'controls.json'), 'x', encoding='utf8') as stream:
+            json.dump({'controls': controls, 'note': 'same prompt and seeds; img is a literal token when PhotoMaker is off'}, stream, indent=2)
+        print('PASS visual controls', controls, flush=True)
+        call('shutdown', {}, timeout=60)
+        proc.wait(120)
+        sys.exit(0)
+    r = call('txt2img', request)
+    assert r.get('type') == 'result', r
+    images = r['result'].get('images', [])
+    assert len(images) == 2 and all(os.path.isfile(item['path']) for item in images), r
+    assert 'red' in images[0].get('effective_prompt', '') and 'blue' in images[1].get('effective_prompt', ''), r
+    print('PASS PhotoMaker Composable keyword batch:', cfg, [item['path'] for item in images], flush=True)
+    from PIL import Image, ImageChops, ImageStat
+    checks = []
+    def compare(label, left_items, right_items):
+        assert len(left_items) == len(right_items)
+        for index, (left_item, right_item) in enumerate(zip(left_items, right_items)):
+            with Image.open(left_item['path']) as left, Image.open(right_item['path']) as right:
+                difference = ImageChops.difference(left.convert('RGB'), right.convert('RGB'))
+                checks.append({'name': label, 'index': index, 'left': left_item['path'], 'right': right_item['path'],
+                               'left_seed': left_item.get('seed'), 'right_seed': right_item.get('seed'),
+                               'left_prompt': left_item.get('effective_prompt'), 'right_prompt': right_item.get('effective_prompt'),
+                               'exact': difference.getbbox() is None, 'mean_absolute_rgb': sum(ImageStat.Stat(difference).mean) / 3})
+    if signed and os.environ.get('SDFX_PHOTOMAKER_NEGPIP_COMPARE') == '1':
+        import copy
+        unsigned = copy.deepcopy(request)
+        unsigned['params']['prompt'] = unsigned['params']['prompt'].replace(', (black hair:-1)', '')
+        unsigned['params']['hooks'].pop('negpip')
+        baseline = call('txt2img', unsigned)
+        assert baseline.get('type') == 'result', baseline
+        compare('signed-effect', images, baseline['result']['images'])
+        assert any(not item['exact'] for item in checks), 'signed term had no observable effect'
+        with open(os.path.join(OUT, 'signed-effect.json'), 'x', encoding='utf8') as stream:
+            json.dump(checks, stream, ensure_ascii=False, indent=2)
+        checks.clear()
+    if os.environ.get('SDFX_PHOTOMAKER_MERGE_EQ') == '1':
+        import copy
+        merged = copy.deepcopy(request)
+        merged['params']['prompt'] = params['prompt'].replace('woman', "<'woman'>")
+        merged['params']['negative_prompt'] = "<'lowres'>"
+        result = call('txt2img', merged)
+        assert result.get('type') == 'result', result
+        merged_images = result['result'].get('images', [])
+        assert len(merged_images) == len(images), result
+        for expression in merged_images:
+            assert os.path.isfile(expression['path']), expression
+            assert "<'woman'>" in expression.get('effective_prompt', ''), expression
+        compare('plain-vs-merge', images, merged_images)
+        if os.environ.get('SDFX_PHOTOMAKER_DIAGNOSTIC') == '1':
+            plain_repeat = call('txt2img', copy.deepcopy(request))
+            assert plain_repeat.get('type') == 'result', plain_repeat
+            merge_repeat = call('txt2img', copy.deepcopy(merged))
+            assert merge_repeat.get('type') == 'result', merge_repeat
+            compare('plain-repeat', images, plain_repeat['result']['images'])
+            compare('merge-repeat', merged_images, merge_repeat['result']['images'])
+    if os.environ.get('SDFX_PHOTOMAKER_INTERRUPT') == '1':
+        import copy
+        interrupted = copy.deepcopy(merged)
+        interrupted['params']['steps'] = 40
+        completed = []
+        before = len(lines)
+        worker = threading.Thread(target=lambda: completed.append(call('txt2img', interrupted)))
+        worker.start()
+        deadline = time.monotonic() + 300
+        with cv:
+            while not any(e.get('event') == 'progress' and e.get('step', 0) >= 1 for e in lines[before:]):
+                assert worker.is_alive() and time.monotonic() < deadline, 'PhotoMaker interruption never reached sampling'
+                cv.wait(.1)
+        decision = call('interrupt', {}, timeout=10)
+        assert decision['type'] == 'result', decision
+        worker.join(180)
+        assert not worker.is_alive() and completed and completed[0].get('code') == 'interrupted', completed
+        after_cancel = call('txt2img', copy.deepcopy(merged))
+        assert after_cancel.get('type') == 'result', after_cancel
+        compare('merge-after-interrupt', merged_images, after_cancel['result']['images'])
+    recovery = call('txt2img', req(gp(prompt='portrait photo of a woman, neutral background', width=photo_size, height=photo_size, steps=photo_steps, subseed=31337)))
+    assert recovery.get('type') == 'result', recovery
+    recovered_path = recovery['result']['images'][0]['path']
+    compare('disabled-recovery', [{'path': src}], [{'path': recovered_path}])
+    with open(os.path.join(OUT, 'comparison.json'), 'x', encoding='utf-8') as stream:
+        json.dump({'cfg': cfg, 'checks': checks}, stream, ensure_ascii=False, indent=2)
+    assert all(check['exact'] for check in checks), checks
+    if tiled:
+        trace_path = os.environ.get('SDFX_PHOTO_TRACE')
+        assert trace_path, 'tiled case requires an explicit trace path'
+        with open(trace_path, encoding='utf8') as stream:
+            tile_counts = [entry['data']['tile_count'] for entry in map(json.loads, stream)
+                           if entry['event'] == 'multi_tiles']
+        assert tile_counts and all(count > 1 for count in tile_counts), tile_counts
+        print('PASS actual MultiDiffusion tile counts:', len(tile_counts), min(tile_counts), max(tile_counts), flush=True)
+    if os.environ.get('SDFX_PHOTOMAKER_MERGE_EQ') == '1':
+        print('PASS PhotoMaker Composable Embedding Merge exact RGB:', cfg, [item['path'] for item in merged_images], flush=True)
+    print('PASS PhotoMaker Composable disabled recovery:', recovered_path, flush=True)
+elif CASE == "photomaker":
+    load(SDXL)
+    pm = hf("TencentARC/PhotoMaker", "photomaker-v1.bin")
+    r = call("txt2img", req(gp(prompt="a woman img, portrait, upper body", width=1024, height=1024, steps=20,
+                               hooks={"photomaker": {"model": pm, "images": [FACE], "trigger_word": "img",
+                                                     "start_merge_step": 10}})))
+elif CASE == "svd":
+    from huggingface_hub import snapshot_download
+    model = snapshot_download(os.environ.get("SDFX_SVD_REPO", "stabilityai/stable-video-diffusion-img2vid"),
+                              allow_patterns=["*.json", "*.txt", "*fp16.safetensors"],
+                              local_dir=os.path.join(MODELS, "svd"))
+    load(SD15)
+    r = call("img2vid", {"model": model, "image_path": FACE, "output_dir": OUT, "frames": 14, "steps": 20, "width": 1024,
+                         "height": 576, "decode_chunk_size": 2, "seed": 1})
+elif CASE == "zero123_object":
+    load(SD15)
+    obj = call("txt2img", req(gp(prompt="a single red sneaker, product photo, plain white background, centered, side view",
+                                  negative_prompt="person, text", width=512, height=512, steps=20)))
+    src = keep(obj, "z123_object")
+    views = []
+    for az in (0, 90, 180):
+        rv = call("novel_view", {"model": os.path.join(MODELS, "zero123"), "image_path": src, "output_dir": OUT,
+                                 "elevation": 0, "azimuth": az, "steps": 50, "cfg_scale": 3.0, "seed": 1})
+        views.append(keep(rv, f"z123_az{az}"))
+    r = rv
+elif CASE == "zero123":
+    model = os.path.join(MODELS, "zero123")
+    r = call("novel_view", {"model": model, "image_path": FACE, "output_dir": OUT, "elevation": 10, "azimuth": 60,
+                            "steps": 30, "seed": 1})
+elif CASE == "sched_sd15" or CASE == "sched_sdxl":
+    load(SD15 if CASE == "sched_sd15" else SDXL)
+    res = {}
+    for tag, p in (("cat", "a photo of a cat, studio"), ("dog", "a photo of a dog, studio"),
+                   ("edit", "a photo of a [cat:dog:0.5], studio"), ("alt", "a photo of a [cat|dog], studio"),
+                   ("hr", "a photo of a [cat:dog:1.5], studio")):
+        kw = dict(prompt=p, steps=20, seed=11)
+        if CASE == "sched_sdxl":
+            kw.update(width=832, height=832)
+        if tag == "hr":
+            kw["hires"] = dict(gp()["hires"], enabled=True, scale=1.25, second_pass_steps=10, denoising_strength=0.6)
+        r = call("txt2img", req(gp(**kw)))
+        assert r["type"] == "result", r
+        res[tag] = keep(r, f"{CASE}_{tag}")
+        print(tag, r["result"]["warnings"], flush=True)
+    from PIL import Image, ImageChops, ImageStat
+    def d(a, b):
+        return round(sum(ImageStat.Stat(ImageChops.difference(Image.open(res[a]).convert("RGB"), Image.open(res[b]).convert("RGB"))).mean) / 3, 2)
+    r = {"type": "result", "result": {"result": {"edit-cat": d("edit", "cat"), "edit-dog": d("edit", "dog"), "alt-cat": d("alt", "cat"), "alt-dog": d("alt", "dog")}}}
+elif CASE in ("ext_sd15", "ext_sdxl"):
+    load(SD15 if CASE == "ext_sd15" else SDXL)
+    size = dict(width=832, height=832) if CASE == "ext_sdxl" else {}
+    base = dict(prompt="a cozy cabin in a snowy forest, detailed", steps=20, seed=5, **size)
+    rb = call("txt2img", req(gp(**base)))
+    assert rb["type"] == "result", rb
+    b0 = keep(rb, f"{CASE}_base")
+    from PIL import Image, ImageChops, ImageStat
+    tests = {"vectorscope_cc": {"brightness": 1.5, "saturation": 1.5}, "vectorscope_cc#2": {"r": 2.0, "contrast": 2.0},
+             "color_grading": {"r": 0.0}, "color_grading#2": {"r": 0.5, "recenter_strength": 1.0},
+             "color_grading#3": {"recenter": False, "normalize": True}} if os.environ.get("ONLY_CG") else {"detail_daemon": {"amount": 0.4}, "vectorscope_cc": {"brightness": 1.5, "saturation": 1.5},
+             "latent_mirroring": {"max_step": 0.4}, "tiling": {"tile_x": True, "tile_y": False},
+             "anti_burn": {"skip_last": 2, "average": 3}, "resharpen": {"sharpness": 2.0},
+             "color_grading": {"r": 0.5, "normalize": True}, "cfg_schedule": {"start_cfg": 12, "end_cfg": 2},
+             "cads": {"noise_scale": 0.5}}
+    out = {}
+    for name, cfgv in tests.items():
+        r1 = call("txt2img", req(gp(hooks={name.split("#")[0]: cfgv}, **base)))
+        if r1["type"] != "result":
+            out[name] = "ERR " + r1.get("message", "")[:80]
+            continue
+        p = keep(r1, f"{CASE}_{name.replace('#', '_')}")
+        diff = sum(ImageStat.Stat(ImageChops.difference(Image.open(b0).convert("RGB"), Image.open(p).convert("RGB"))).mean) / 3
+        out[name] = round(diff, 2)
+        if r1["result"]["warnings"]:
+            out[name] = f"{out[name]} warn={r1['result']['warnings']}"
+    print(out, flush=True)
+    r = {"type": "result" if all(not str(v).startswith("ERR") for v in out.values()) else "error",
+         "result": {"result": out}, "message": str(out)}
+elif CASE in ("ad_sd15", "ad_sdxl"):
+    load(SD15 if CASE == "ad_sd15" else SDXL)
+    size = dict(width=832, height=1216) if CASE == "ad_sdxl" else dict(width=512, height=768)
+    base = dict(prompt="photo of a woman sitting on a bench in a park, medium shot", steps=20, seed=3, **size)
+    out = {}
+    for tag, hooks in (("off", {}), ("face", {"adetailer": {"units": [{"model": "face_yolov8n.pt"}]}}),
+                       ("two", {"adetailer": {"units": [{"model": "face_yolov8n.pt", "prompt": "[PROMPT], smiling"},
+                                                        {"model": "hand_yolov8n.pt"}]}}),
+                       ("cv", {"adetailer": {"units": [{"model": "opencv_face", "denoising_strength": 0.5}]}})):
+        t1 = time.time()
+        r1 = call("txt2img", req(gp(hooks=hooks, **base)))
+        out[tag] = (r1["type"], round(time.time() - t1, 1), (r1.get("result") or {}).get("warnings") or r1.get("message"))
+        if r1["type"] == "result":
+            keep(r1, f"{CASE}_{tag}")
+    print(out, flush=True)
+    r = {"type": "result" if all(v[0] == "result" for v in out.values()) else "error", "result": {"result": out},
+         "message": str(out)}
+else:
+    sys.exit(f"unknown case {CASE}")
+
+ok = r is not None and r.get("type") == "result"
+detail = (r.get("result", {}).get("caption") or r.get("result", {}).get("warnings") or r.get("result", {}).get("result") or "") \
+    if ok else (r or {}).get("message")
+saved = keep(r, CASE) if ok and CASE not in ("wd14", "blip", "model_keyword_photomaker", "model_keyword_photomaker_composable", "model_keyword_composable_negpip", "model_keyword_composable_img2imgalt") and not CASE.startswith(("sched", "ext_", "ad_", "image_")) else None
+print(f"{CASE:18s} {'OK ' if ok else 'ERR'} {time.time() - t0:7.1f}s {str(detail)[:400]} {saved or ''}", flush=True)
+with open(os.path.join(OUT, "results.tsv"), "a", encoding="utf-8") as fh:
+    row = [time.strftime("%H:%M:%S"), CASE, "OK" if ok else "ERR", f"{time.time() - t0:.1f}s",
+           str(detail).replace(chr(10), " ")[:120]]
+    fh.write(chr(9).join(row) + chr(10))
+call("shutdown", {}, timeout=60)
+proc.wait(120)
+sys.exit(0 if ok else 1)

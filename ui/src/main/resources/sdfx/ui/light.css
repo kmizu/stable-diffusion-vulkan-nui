@@ -1,0 +1,47 @@
+/* SDFX light theme: native Fluent-inspired color tokens + Modena base overrides. Rules live in app.css. */
+.root, .search-popup, .context-menu, .tooltip, .dialog-pane, .bootstrap {
+    -sdfx-bg: #f2f4f7;
+    -sdfx-chrome: #f8f9fb;
+    -sdfx-panel: #ffffff;
+    -sdfx-panel-2: #f4f6f9;
+    -sdfx-hover: #eaedf2;
+    -sdfx-canvas: #e6e9ef;
+    -sdfx-input: #ffffff;
+    -sdfx-track: #d4d9e2;
+    -sdfx-border: rgba(15, 23, 42, 0.10);
+    -sdfx-border-strong: rgba(15, 23, 42, 0.20);
+    -sdfx-text: #181a1f;
+    -sdfx-muted: #5b6270;
+    -sdfx-faint: #8a92a1;
+    -sdfx-accent: #0067c0;
+    -sdfx-accent-hover: #0078d4;
+    -sdfx-accent-soft: rgba(0, 103, 192, 0.11);
+    -sdfx-ok: #15803d;
+    -sdfx-warn: #b45309;
+    -sdfx-danger: #dc2626;
+    -sdfx-hires: #0284c7;
+    -sdfx-shadow: rgba(15, 23, 42, 0.16);
+
+    -fx-base: #f4f6f9;
+    -fx-background: #f2f4f7;
+    -fx-control-inner-background: #ffffff;
+    -fx-control-inner-background-alt: #f8fafc;
+    -fx-accent: #0067c0;
+    -fx-focus-color: #0067c0;
+    -fx-faint-focus-color: rgba(0, 103, 192, 0.18);
+    -fx-default-button: #0067c0;
+    -fx-selection-bar: #0067c0;
+    -fx-selection-bar-non-focused: #dbeafe;
+    -fx-text-base-color: #181a1f;
+    -fx-text-background-color: #181a1f;
+    -fx-text-inner-color: #181a1f;
+    -fx-mark-color: #181a1f;
+    -fx-box-border: rgba(15, 23, 42, 0.12);
+    -fx-text-box-border: rgba(15, 23, 42, 0.12);
+    -fx-outer-border: rgba(15, 23, 42, 0.12);
+    -fx-inner-border: transparent;
+    -fx-body-color: #ffffff;
+    -fx-color: #ffffff;
+}
+
+.model-browser-status { -fx-text-fill: #4a5362; }

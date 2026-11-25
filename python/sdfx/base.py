@@ -1,0 +1,827 @@
+"""Engine base class: request handlers shared by the real engine and the dry-run FakeEngine."""
+from __future__ import annotations
+
+import os
+import platform
+import sys
+from typing import Optional
+
+from . import ENGINE_VERSION, PROTOCOL_VERSION, models, schedulers
+from .params import (GenerationRequest, LoadModelRequest, ParamError, PreprocessRequest, UpscaleRequest, from_dict,
+                     parse_generation_request)
+from .protocol import (INVALID_PARAMS, MODEL_LOAD_FAILED, NO_MODEL, UNSUPPORTED, EngineError, JobContext)
+from .waifu2x import NAMES as WAIFU2X_UPSCALERS
+
+LATENT_UPSCALERS = ["Latent", "Latent (antialiased)", "Latent (bicubic)", "Latent (bicubic antialiased)",
+                    "Latent (nearest)", "Latent (nearest-exact)"]
+PIXEL_UPSCALERS = ["None", "Lanczos", "Nearest", "LDSR", *WAIFU2X_UPSCALERS]
+
+
+def ram_used_mb() -> float:
+    try:
+        import psutil  # type: ignore
+        return round(psutil.Process().memory_info().rss / (1024 * 1024), 1)
+    except Exception:
+        pass
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class PMC(ctypes.Structure):
+                _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
+                            ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
+                            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t), ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                            ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t)]
+            pmc = PMC()
+            pmc.cb = ctypes.sizeof(PMC)
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.GetCurrentProcess.restype = wintypes.HANDLE
+            psapi = ctypes.WinDLL("psapi", use_last_error=True)
+            psapi.GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.POINTER(PMC), wintypes.DWORD]
+            if psapi.GetProcessMemoryInfo(k32.GetCurrentProcess(), ctypes.byref(pmc), pmc.cb):
+                return round(pmc.WorkingSetSize / (1024 * 1024), 1)
+        except Exception:
+            return 0.0
+        return 0.0
+    try:
+        import resource
+        r = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return round(r / 1024.0 if sys.platform != "darwin" else r / (1024.0 * 1024.0), 1)
+    except Exception:
+        return 0.0
+
+
+class BaseEngine:
+    dry_run = False
+
+    def _model_keyword_index(self, kind, directory):
+        from pathlib import Path
+        from .model_keyword import MappingIndex
+        if kind not in ('checkpoint', 'lora') or not isinstance(directory, str) or not directory:
+            raise ValueError('model keyword kind and mapping directory are required')
+        names = ('model-keyword.txt', 'custom-mappings.txt') if kind == 'checkpoint' else ('lora-keyword.txt', 'lora-keyword-user.txt')
+        data = Path(__file__).parent / 'data' / 'model_keyword'
+        cache = getattr(self, '_model_keyword_indices', None)
+        if cache is None:
+            cache = self._model_keyword_indices = {}
+        user = (Path(directory) / names[1]).absolute()
+        local_default = Path(directory) / names[0]
+        default = local_default if kind == 'lora' and local_default.is_file() else data / names[0]
+        key = (kind, str(user), str(default.absolute()))
+        if key not in cache:
+            cache[key] = MappingIndex(default, user, allow_missing_default=(kind == 'lora'))
+        return cache[key]
+
+    def model_keyword(self, params, ctx):
+        from pathlib import Path
+        from .model_keyword import keyword_choices, mapping_action
+        if params.get('action') == 'install_upstream_lora_catalog':
+            from .model_keyword import install_upstream_lora_catalog
+            directory = params.get('mapping_dir')
+            if not isinstance(directory, str) or not directory:
+                raise EngineError(INVALID_PARAMS, 'mapping directory is required')
+            try:
+                return {'path': install_upstream_lora_catalog(directory, confirmed=params.get('confirmed'))}
+            except (ValueError, OSError) as exc:
+                raise EngineError(INVALID_PARAMS, f'Model keyword catalog: {exc}') from exc
+        kind = params.get('kind')
+        if kind not in ('checkpoint', 'lora'):
+            raise EngineError(INVALID_PARAMS, 'model keyword kind must be checkpoint or lora')
+        path, directory = params.get('model_path'), params.get('mapping_dir')
+        if not isinstance(path, str) or not path or not isinstance(directory, str) or not directory:
+            raise EngineError(INVALID_PARAMS, 'model path and mapping directory are required')
+        try:
+            index = self._model_keyword_index(kind, directory)
+            name = params.get('match_name')
+            if name is not None and (not isinstance(name, str) or not name):
+                raise ValueError('match name must be a nonempty string')
+            result = mapping_action(params.get('action', 'check'), path, index, params.get('keywords'), name)
+            result['default_catalog_available'] = index.paths[0].is_file()
+            if kind == 'lora' and result['source'] == 'default' and index.paths[0].parent == Path(directory):
+                result['source'] = 'user catalog'
+            result['choices'] = keyword_choices(kind, result['keywords'])
+            return result
+        except (ValueError, OSError) as exc:
+            raise EngineError(INVALID_PARAMS, f'Model keyword: {exc}') from exc
+
+    def model_keyword_plan(self, params, ctx):
+        with self._model_keyword_iteration.transaction():
+            return self._model_keyword_plan(params, ctx)
+
+    def generation_keyword_plan(self, gp, req, seed, ctx):
+        from .hooks import hook_config
+        from .model_keyword import (generation_batch_loras, generation_composable_loras, replay_prompts_for_batch,
+                                    batch_extra_networks, parse_lora_activation)
+        config = hook_config(gp.hooks, 'model_keyword', {})
+        if config is None:
+            return None, None
+        refine = hook_config(gp.hooks, 'img2img_hires_fix', {})
+        base = config.get('_base_prompt', gp.prompt)
+        try:
+            with self._model_keyword_iteration.transaction():
+                plan = self.model_keyword_plan(dict(checkpoint=(self.model or {}).get('path'),
+                    mapping_dir=config.get('_mapping_dir'), lora=config.get('_lora_path'),
+                    preview=base, prompts=[base] * gp.images_per_job, batch_size=gp.batch_size,
+                    choice_seed=seed, options=config), ctx)
+                manual = gp.loras if req.manual_loras is None else req.manual_loras
+                loras = [generation_batch_loras(batch, manual, req.lora_paths)
+                         for batch in plan['batches']]
+                if hook_config(gp.hooks, 'composable_lora', {}) is not None:
+                    extra = [gp.hires.prompt] + ([str(refine.get('prompt', ''))] if refine else [])
+                    alternate = hook_config(gp.hooks, 'img2imgalt', {}) or {}
+                    extra += [str(alternate.get('override_prompt', '')), str(alternate.get('override_negative', ''))]
+                    generation_composable_loras(plan['prompts'] + extra, manual, req.lora_paths)
+                if refine is not None and not str(refine.get('prompt', '')).strip():
+                    clean, networks = batch_extra_networks([plan['preview']])
+                    unsupported = set(networks) - {'lora', 'lyco'}
+                    if unsupported:
+                        raise ValueError('unsupported extra network types: ' + ', '.join(sorted(unsupported)))
+                    adapters = [dict(kind=kind, **parse_lora_activation(args)) for kind, entries in networks.items()
+                                for args in entries]
+                    plan['refinement_loras'] = generation_batch_loras({'adapters': adapters}, manual, req.lora_paths)
+                    plan['refinement_prompt'] = plan['preview']
+                    plan['refinement_clean_prompt'] = clean[0]
+                    if hook_config(gp.hooks, 'composable_lora', {}) is not None:
+                        generation_composable_loras(plan['prompts'] + [gp.hires.prompt, plan['preview']], manual, req.lora_paths)
+                plan['replay_prompts'] = (list(plan['prompts']) if hook_config(gp.hooks, 'composable_lora', {}) is not None else
+                    [prompt for start in range(0, len(plan['prompts']), gp.batch_size)
+                     for prompt in replay_prompts_for_batch(plan['prompts'][start:start + gp.batch_size])])
+                if config.get('_lora_path') and not plan['lora_catalog_available'] and ctx is not None:
+                    ctx.warn('Model Keyword LoRA catalog is not installed; only custom mappings were searched')
+                return plan, loras
+        except ValueError as exc:
+            raise EngineError(INVALID_PARAMS, f'Model keyword: {exc}') from exc
+
+    def _model_keyword_plan(self, params, ctx):
+        from pathlib import Path
+        """Plan keywords for already styled base prompts; Hires/negative prompts are not rewritten."""
+        import random
+        from .model_keyword import IterationState, KeywordPlanner, batch_extra_networks, parse_lora_activation, validate_batch_plan
+        try:
+            if ctx is not None:
+                ctx.check_interrupt()
+            directory, checkpoint = params.get('mapping_dir'), params.get('checkpoint')
+            if not isinstance(checkpoint, str) or not checkpoint:
+                raise ValueError('checkpoint is required')
+            options = params.get('options', {})
+            if not isinstance(options, dict):
+                raise ValueError('options must be an object')
+            prompts = params.get('prompts', [])
+            batch_size = params.get('batch_size', 1)
+            if (not isinstance(prompts, (list, tuple)) or not prompts or isinstance(batch_size, bool) or
+                    not isinstance(batch_size, int) or not 1 <= batch_size <= 16 or len(prompts) % batch_size):
+                raise ValueError('batch size must divide the number of prompts and be 1..16')
+            seed = params.get('choice_seed')
+            if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+                raise ValueError('choice_seed must be an integer')
+            lora = params.get('lora') or None
+            if lora is not None and not isinstance(lora, str):
+                raise ValueError('LoRA path must be a string')
+            checkpoint_index = self._model_keyword_index('checkpoint', directory)
+            lora_index = self._model_keyword_index('lora', directory)
+            iteration = getattr(self, '_model_keyword_iteration', None)
+            if iteration is None:
+                iteration = self._model_keyword_iteration = IterationState()
+            planner = KeywordPlanner(checkpoint_index, lora_index, iteration)
+            result = planner.plan(params.get('preview', ''), prompts, checkpoint,
+                                  lora, options, random.Random(seed))
+            if (result['lora'] and result['lora']['mapping_source'] == 'user catalog'
+                    and lora_index.paths[0].parent != Path(directory)):
+                result['lora']['mapping_source'] = 'default'
+            if ctx is not None:
+                ctx.check_interrupt()
+            batches = []
+            for start in range(0, len(result['prompts']), batch_size):
+                clean, networks = batch_extra_networks(result['prompts'][start:start + batch_size])
+                adapters = [dict(kind=kind, **parse_lora_activation(args))
+                            for kind, entries in networks.items() if kind in ('lora', 'lyco') for args in entries]
+                batches.append(dict(clean_prompts=clean, networks=networks, adapters=adapters))
+            result['batches'] = batches
+            validate_batch_plan(result, batch_size, len(prompts) // batch_size)
+            result['lora_catalog_available'] = lora_index.paths[0].is_file()
+            return result
+        except (ValueError, OSError) as exc:
+            raise EngineError(INVALID_PARAMS, f'Model keyword: {exc}') from exc
+
+    def __init__(self):
+        import time
+        from .model_keyword import IterationState
+        self.system_started_at = time.time()
+        self._model_keyword_iteration = IterationState()
+        self.model: Optional[dict] = None   # LoadedModel-shaped dict
+        self.load_opts = LoadModelRequest()
+
+    # -- info ---------------------------------------------------------------
+    def hello(self) -> dict:
+        return {
+            "protocol": PROTOCOL_VERSION, "engine_version": ENGINE_VERSION,
+            "python": platform.python_version(), "torch": None, "diffusers": None, "cuda": False,
+            "device": "cpu", "vram_mb": 0, "dry_run": self.dry_run, "features": self.features(),
+        }
+
+    def features(self) -> list[str]:
+        return ["clip_interrogator", "controlnet_preprocess_extras", "controlnet_fastload_data", "embedding_merge", "metadata_utils", "prevent_interrupt", *self._batch_features()]
+
+    def _batch_features(self) -> list[str]:
+        if self.dry_run:
+            return []
+        service = getattr(self, "_batch_interrogate_service", None)
+        if service is None:
+            return []
+        from .batch_interrogate_worker import BatchInterrogateService
+        if isinstance(service, BatchInterrogateService) and service.available():
+            return ["batch_interrogate_wd_v3_partial"]
+        return []
+
+    def temporal_lab(self, params: dict, ctx: JobContext) -> dict:
+        """Run an owned, serialized native frame-processing request."""
+        from . import temporal_lab
+        return temporal_lab.run(params, ctx)
+
+    def inpaint_difference_preview(self, params: dict, ctx: JobContext) -> dict:
+        try:
+            from .inpaint_difference import preview_request
+        except ImportError as exc:
+            raise EngineError(UNSUPPORTED, 'Inpaint Difference requires OpenCV, NumPy and Pillow') from exc
+        try:
+            return preview_request(params, ctx)
+        except (ValueError, OSError) as exc:
+            raise EngineError(INVALID_PARAMS, f'Inpaint Difference preview: {exc}') from exc
+
+    def difference_generation(self, params: dict, mode: str, ctx: JobContext):
+        try:
+            from .inpaint_difference import generation_request
+        except ImportError as exc:
+            raise EngineError(UNSUPPORTED, 'Inpaint Difference requires OpenCV, NumPy and Pillow') from exc
+        return generation_request(params, mode, ctx)
+
+    def _batch_service(self):
+        service = getattr(self, "_batch_interrogate_service", None)
+        if self.dry_run or service is None:
+            raise EngineError(UNSUPPORTED, "no trusted WD batch service is configured")
+        from .batch_interrogate_worker import BatchInterrogateService
+        if not isinstance(service, BatchInterrogateService):
+            raise EngineError(UNSUPPORTED, "no trusted WD batch service is configured")
+        return service
+
+    def batch_interrogate_prepare(self, params: dict, ctx: JobContext) -> dict:
+        return self._batch_service().prepare(self, params, ctx)
+
+    def batch_interrogate_execute(self, params: dict, ctx: JobContext) -> dict:
+        return self._batch_service().execute(self, params, ctx)
+
+    def preprocessors(self) -> list[str]:
+        return ["none"]
+
+    # -- listing -----------------------------------------------------------
+    def list_models(self, params: dict, ctx: JobContext) -> dict:
+        dirs = _str_list(params.get("dirs"), "dirs")
+        return {"models": models.scan_models(dirs)}
+
+    def list_files(self, params: dict, ctx: JobContext) -> dict:
+        kind = params.get("kind")
+        if kind not in models.FILE_KINDS:
+            raise EngineError(INVALID_PARAMS, f"kind must be one of {', '.join(models.FILE_KINDS)} (got {kind!r})")
+        return {"files": models.scan_files(kind, _str_list(params.get("dirs"), "dirs"))}
+
+    def list_samplers(self, params: dict, ctx: JobContext) -> dict:
+        return {"samplers": schedulers.sampler_list(check_backend=not self.dry_run), "schedulers": list(schedulers.SCHEDULES),
+                "upscalers": LATENT_UPSCALERS + PIXEL_UPSCALERS, "preprocessors": self.preprocessors()}
+
+    def unload(self, params: dict, ctx: JobContext) -> dict:
+        self.model = None
+        return {}
+
+    def on_oom(self) -> None:
+        pass
+
+    # extras: engines that cannot do them answer `unsupported`
+    def _no_extra(self, what: str):
+        raise EngineError(UNSUPPORTED, f"{what} is not available in this engine")
+
+    # -- model tools (CPU, safetensors; work without a loaded model) -----------------------------------------
+    def _model_tool(self, what: str, inputs: list, out: str, overwrite: bool, run):
+        import os
+        for p in inputs:
+            if not p or not os.path.isfile(p):
+                raise EngineError(INVALID_PARAMS, f"{what}: model not found: {p}")
+        if not out or not out.lower().endswith(".safetensors"):
+            raise EngineError(INVALID_PARAMS, f"{what}: output must be a .safetensors path")
+        if any(os.path.abspath(out) == os.path.abspath(p) for p in inputs):
+            raise EngineError(INVALID_PARAMS, f"{what}: output would overwrite an input model")
+        if os.path.exists(out) and not overwrite:
+            raise EngineError(INVALID_PARAMS, f"{what}: {os.path.basename(out)} already exists")
+        try:
+            return run()
+        except ImportError as e:
+            raise EngineError(UNSUPPORTED, f"{what} needs torch and safetensors: {e}")
+        except (ValueError, KeyError) as e:
+            raise EngineError(INVALID_PARAMS, f"{what}: {e}")
+        finally:
+            if os.path.exists(out + ".part"):
+                try:
+                    os.remove(out + ".part")
+                except OSError:
+                    pass
+
+    def embedding_merge(self, params: dict, ctx: JobContext) -> dict:
+        from .embedding_merge_service import run
+        return run(self, params, ctx)
+
+    def clip_interrogator(self, params: dict, ctx: JobContext) -> dict:
+        from . import clip_interrogator
+        if self.dry_run and params.get("operation", "prompt") not in ("models", "unload"):
+            raise EngineError(UNSUPPORTED, "CLIP Interrogator needs the real engine; dry-run has no CLIP or caption model")
+        return clip_interrogator.run(self, params, ctx)
+
+    def cn_animation(self, params: dict, ctx: JobContext) -> dict:
+        """SD-CN-Animation video-to-video helpers: decode, RAFT flow + occlusion, histogram match, encode."""
+        from . import cn_animation
+        return cn_animation.run(self, params, ctx)
+
+    def metadata_utils(self, params: dict, ctx: JobContext) -> dict:
+        from .metadata_utils import run
+        return run(params, ctx)
+
+    def chara_searcher(self, params: dict, ctx: JobContext) -> dict:
+        """Character Searcher data preparation (cut out, tag, embed) and query embeddings; see sdfx.chara_searcher."""
+        from .chara_searcher import run
+        # Every model runs on the CPU unless the request asks for "cuda": the GPU belongs to the loaded checkpoint.
+        return run(params, ctx)
+
+    def controlnet_fastload_data(self, params: dict, ctx: JobContext) -> dict:
+        from .controlnet_fastload import run_fastload_service
+        try:
+            return run_fastload_service(params, ctx)
+        except (ValueError, OSError) as error:
+            raise EngineError(INVALID_PARAMS, f'ControlNet Fastload: {error}') from error
+
+    def tokenize(self, params: dict, ctx: JobContext) -> dict:
+        if self.dry_run:
+            raise EngineError(UNSUPPORTED, "token inspection requires a real loaded model; dry-run has no tokenizer")
+        if self.model is None or getattr(self, "pipe", None) is None:
+            raise EngineError(NO_MODEL, "load a checkpoint before inspecting its tokenizer")
+        from .tokenizer_tool import inspect
+        return inspect(self.pipe, params, ctx)
+
+    def _with_embedding_encoder_access(self, operation):
+        offloaded = bool(getattr(self, "_offload", False))
+        if offloaded:
+            self._drop_hooks()
+        try:
+            if offloaded:
+                for attr in ("text_encoder", "text_encoder_2"):
+                    encoder = getattr(self.pipe, attr, None)
+                    if encoder is not None and encoder.get_input_embeddings().weight.is_meta:
+                        raise ValueError("offloaded text encoder could not be materialized")
+            return operation()
+        finally:
+            if offloaded and self.pipe is not None:
+                try:
+                    self._place(self.pipe)
+                except BaseException as exc:
+                    try:
+                        self._free()
+                    finally:
+                        self._embedding_reload_error = str(exc)
+                    raise EngineError(NO_MODEL,
+                        f"Embedding operation could not restore model offload; the checkpoint was unloaded; reload the checkpoint: {exc}") from exc
+
+    def embedding_editor(self, params: dict, ctx: JobContext) -> dict:
+        if self.dry_run:
+            raise EngineError(UNSUPPORTED, 'Embedding Editor requires a real loaded model')
+        if self.model is None or getattr(self, 'pipe', None) is None:
+            raise EngineError(NO_MODEL, 'load a checkpoint before editing embeddings')
+        from .embedding_editor_service import run_editor_service
+        try:
+            return run_editor_service(self, params, ctx)
+        except (ValueError, TypeError, OSError, PermissionError) as exc:
+            raise EngineError(INVALID_PARAMS, f'Embedding Editor: {exc}') from exc
+
+    def embedding_inspector(self, params: dict, ctx: JobContext) -> dict:
+        if self.dry_run:
+            raise EngineError(UNSUPPORTED, "Embedding Inspector requires a real loaded model")
+        if self.model is None or getattr(self, "pipe", None) is None:
+            raise EngineError(NO_MODEL, "load a checkpoint before inspecting embeddings")
+        from .embedding_inspector import run_inspector
+        from .resource_hashes import FileSnapshot
+        loaded = {}
+        for name, path in getattr(self, "loaded_embedding_files", {}).items():
+            snapshot = getattr(self, "embedding_snapshots", {}).get(name)
+            try:
+                valid = snapshot is not None and FileSnapshot.identity_of(path) == snapshot.identity
+            except OSError:
+                valid = False
+            loaded[name] = {"path": path, "owners": getattr(self, "embedding_token_owners", {}).get(name, {}),
+                            "metadata_valid": valid}
+        params = {**params, "_loaded_owners": getattr(self, "embedding_token_owners", {}), "_list_loaded": loaded}
+        try:
+            if params.get("operation") == "export":
+                if ctx is None:
+                    raise EngineError(INVALID_PARAMS, "Vector export requires a job context")
+                return ctx.publish(lambda: self._with_embedding_encoder_access(lambda: run_inspector(self.pipe, params)))
+            if params.get("operation") != "save":
+                def inspect():
+                    if ctx is not None:
+                        ctx.check_interrupt()
+                    result = run_inspector(self.pipe, params)
+                    if ctx is not None:
+                        ctx.check_interrupt()
+                    return result
+                return self._with_embedding_encoder_access(inspect)
+            if getattr(self, "_embedding_reload_error", None):
+                raise EngineError(INVALID_PARAMS, "Reload the checkpoint before saving another embedding after a refresh failure")
+            if ctx is None:
+                raise EngineError(INVALID_PARAMS, "Embedding save requires a job context")
+            def publish():
+                from .embedding_refresh import refresh_saved_embeddings, validate_saved_names
+                from .embedding_inspector import planned_output_paths
+                from .resource_hashes import FileSnapshot
+                targets = planned_output_paths(params)
+                validate_saved_names(self, targets)
+                def identity(path):
+                    try:
+                        return FileSnapshot.identity_of(path)
+                    except FileNotFoundError:
+                        return None
+                before = [identity(path) for path in targets]
+                try:
+                    result = run_inspector(self.pipe, params)
+                except BaseException as exc:
+                    try:
+                        changed = any(identity(path) != previous for path, previous in zip(targets, before))
+                    except OSError:
+                        changed = True
+                    if changed:
+                        self._embedding_reload_error = str(exc)
+                        raise EngineError(INVALID_PARAMS,
+                            f"Some embedding files may have been saved; reload the checkpoint before generating: {exc}") from exc
+                    raise
+                try:
+                    refresh_saved_embeddings(self, result["paths"])
+                except BaseException as exc:
+                    self._embedding_reload_error = str(exc)
+                    raise EngineError(INVALID_PARAMS,
+                        f"Embedding files were saved but live refresh failed; reload the checkpoint before generating: {exc}") from exc
+                result["reloaded"] = True
+                return result
+            return ctx.publish(lambda: self._with_embedding_encoder_access(publish))
+        except (ValueError, TypeError, OSError, PermissionError) as exc:
+            raise EngineError(INVALID_PARAMS, f"Embedding Inspector: {exc}") from exc
+
+    def aesthetic_embedding(self, params: dict, ctx: JobContext) -> dict:
+        """Aesthetic Gradients embeddings: {op: "list"} or {op: "create", images, name, [output_dir, overwrite]}."""
+        from . import aesthetic_gradients as ag
+        op = str(params.get("op", "create"))
+        if op == "list":
+            return {"embeddings": ag.list_embeddings(), "folders": [str(d) for d in ag.embedding_dirs()]}
+        if op != "create":
+            raise EngineError(INVALID_PARAMS, f"Aesthetic Gradients: unknown operation '{op}'")
+        if self.dry_run:
+            raise EngineError(UNSUPPORTED, "Aesthetic Gradients embeddings need CLIP ViT-L/14; dry-run does not run it")
+        name = str(params.get("name", "")).strip()
+        if not name or any(ch in name for ch in '\\/:*?"<>|') or name in (".", "..") or name.startswith("."):
+            raise EngineError(INVALID_PARAMS, "Aesthetic Gradients: name must be a plain file name")
+        images = params.get("images")
+        if isinstance(images, str):
+            images = [images]
+        if not images:
+            raise EngineError(INVALID_PARAMS, "Aesthetic Gradients: images (files or a folder) are required")
+        overwrite = params.get("overwrite", False)
+        if not isinstance(overwrite, bool):
+            raise EngineError(INVALID_PARAMS, "Aesthetic Gradients: overwrite must be a boolean")
+        from pathlib import Path
+        folder = Path(params.get("output_dir") or ag.embedding_dirs()[0])
+        output = folder / (name if name.lower().endswith(".pt") else name + ".pt")
+        if output.exists() and not overwrite:
+            raise EngineError(INVALID_PARAMS, f"Aesthetic Gradients: {output} exists (pass overwrite to replace it)")
+        ctx.check_interrupt()
+        dev = "cuda" if getattr(self, "cuda", False) else "cpu"
+        try:
+            return ag.create_embedding(images, output, device=dev, check_interrupt=ctx.check_interrupt,
+                                       overwrite=overwrite, publish=ctx.publish)
+        except ImportError as e:
+            raise EngineError(UNSUPPORTED, f"Aesthetic Gradients needs torch and transformers: {e}")
+        except (OSError, ValueError) as e:
+            raise EngineError(INVALID_PARAMS, f"Aesthetic Gradients: {e}")
+
+    def vae_tools(self, params: dict, ctx: JobContext) -> dict:
+        if self.dry_run:
+            raise EngineError(UNSUPPORTED, 'VAE Tools requires a real loaded VAE; dry-run cannot encode or decode latents')
+        if self.model is None or getattr(self, 'pipe', None) is None:
+            raise EngineError(NO_MODEL, 'load a checkpoint before using VAE Tools')
+        from .vae_tools import run
+        try:
+            return run(self, params, ctx)
+        except (ValueError, TypeError, OSError) as exc:
+            raise EngineError(INVALID_PARAMS, f'VAE Tools: {exc}') from exc
+
+    def image_tool(self, params: dict, ctx: JobContext) -> dict:
+        """Non-diffusion image tools (sdfx.image_tools): {tool, image_path, output_dir, ...tool params}."""
+        from . import image_tools
+        from .images import next_output_path, save_png
+        tool = str(params.get("tool", ""))
+        if tool not in image_tools.TOOLS:
+            raise EngineError(INVALID_PARAMS, f"unknown image tool '{tool}'")
+        src = params.get("image_path")
+        if not src:
+            raise EngineError(INVALID_PARAMS, "image_path is required")
+        from PIL import Image, ImageOps
+        with Image.open(src) as source:
+            oriented = ImageOps.exif_transpose(source)
+            img = oriented.convert("RGBA" if oriented.mode in ("RGBA", "LA", "P") else "RGB")
+        dev = "cuda" if getattr(self, "cuda", False) else "cpu"
+        try:
+            if tool == "waifu2x":
+                if self.dry_run:
+                    raise EngineError(UNSUPPORTED, "Waifu2x requires the real engine; dry-run does not execute neural upscaling")
+                ctx.check_interrupt()
+                out, extra = image_tools.run(tool, img, params, dev, check_interrupt=ctx.check_interrupt,
+                                            progress=lambda done, total: ctx.progress(done, total, 'waifu2x'))
+                ctx.check_interrupt()
+            elif tool in ("nsfw_checker", "aesthetic_score"):
+                ctx.check_interrupt()
+                out, extra = image_tools.run(tool, img, dict(params, _log=lambda line: ctx.log("info", line)), dev)
+            else:
+                out, extra = image_tools.run(tool, img if tool != "remove_background" else img.convert("RGB"), params, dev)
+        except ImportError as e:
+            raise EngineError(UNSUPPORTED, f"{tool} needs an optional package: {e}")
+        except (ValueError, FileNotFoundError) as e:
+            raise EngineError(INVALID_PARAMS, f"{tool}: {e}")
+        od = params.get("output_dir") or "."
+        res = {"path": save_png(out, next_output_path(od, tool)), "outputs": {}, "info": {}}
+        for k, v in extra.items():
+            if hasattr(v, "save"):
+                res["outputs"][k] = save_png(v, next_output_path(od, f"{tool}-{k}"))
+            else:
+                res["info"][k] = v
+        return res
+
+    def merge_models(self, params: dict, ctx: JobContext) -> dict:
+        from . import model_tools
+        a, b, c = params.get("model_a"), params.get("model_b"), params.get("model_c") or None
+        mode = str(params.get("mode", "Weight sum"))
+        out = str(params.get("output", ""))
+        inputs = [a, b] + ([c] if c and mode != "Weight sum" else [])
+        return self._model_tool("merge", inputs, out, bool(params.get("overwrite", False)), lambda: model_tools.merge(
+            a, b, out, c=c, mode=mode, alpha=float(params.get("alpha", 0.5)), beta=float(params.get("beta", 0.0)),
+            block_weights=str(params.get("block_weights", "") or ""), vae_source=str(params.get("vae_source", "merge")),
+            precision=str(params.get("precision", "fp16")),
+            progress=lambda i, n: ctx.progress(i, n, "merge"), check=ctx.check_interrupt))
+
+    def convert_model(self, params: dict, ctx: JobContext) -> dict:
+        from . import model_tools
+        src, out = params.get("model"), str(params.get("output", ""))
+        vae = params.get("bake_vae") or None
+        return self._model_tool("convert", [src] + ([vae] if vae else []), out, bool(params.get("overwrite", False)),
+                                lambda: model_tools.convert(
+            src, out, precision=str(params.get("precision", "fp16")), ema=str(params.get("ema", "no-ema")),
+            fix_clip=bool(params.get("fix_clip", True)), drop_junk=bool(params.get("drop_junk", True)), bake_vae=vae,
+            progress=lambda i, n: ctx.progress(i, n, "convert"), check=ctx.check_interrupt))
+
+    def restore_faces(self, params: dict, ctx: JobContext) -> dict:
+        self._no_extra("face restoration")
+
+    def caption(self, params: dict, ctx: JobContext) -> dict:
+        self._no_extra("captioning")
+
+    def run_code(self, params: dict, ctx: JobContext) -> dict:
+        self._no_extra("custom code")
+
+    def img2vid(self, params: dict, ctx: JobContext) -> dict:
+        self._no_extra("img2vid")
+
+    def novel_view(self, params: dict, ctx: JobContext) -> dict:
+        self._no_extra("novel view")
+
+    def animatediff_encode(self, params: dict, ctx: JobContext) -> dict:
+        """AnimateDiff frames -> GIF / WEBP / MP4 / WEBM (Pillow and ffmpeg only, no model needed)."""
+        from .animatediff import encode_request
+        return encode_request(params, ctx)
+
+    def memory(self, params: dict, ctx: JobContext) -> dict:
+        return {"allocated_mb": 0.0, "reserved_mb": 0.0, "total_mb": 0.0, "ram_used_mb": ram_used_mb()}
+
+    def system_status(self, params: dict, ctx: JobContext) -> dict:
+        from .system_info import snapshot
+        from .hardware_info import cached_profile
+        data = snapshot(self)
+        data['hardware_info'] = cached_profile(self)
+        return data
+
+    def system_info(self, params: dict, ctx: JobContext) -> dict:
+        from .system_info import snapshot, inventory
+        from .hardware_info import cached_profile
+        data = snapshot(self, full=True)
+        data['hardware_info'] = cached_profile(self)
+        if 'dirs' in params:
+            data['networks'] = inventory(self, params['dirs'], params.get('hashes', False), ctx)
+        return data
+
+    def vram_estimator(self, params: dict, ctx: JobContext) -> dict:
+        from .vram_estimator import dispatch
+        return dispatch(self, params, ctx)
+
+    def system_benchmark(self, params: dict, ctx: JobContext) -> dict:
+        from .system_info import benchmark
+        previous = getattr(self, '_benchmark_no_save', False)
+        self._benchmark_no_save = True
+        try:
+            return benchmark(self, params, ctx)
+        finally:
+            self._benchmark_no_save = previous
+
+    def system_submission_preview(self, params: dict, ctx: JobContext) -> dict:
+        from .system_info import submission_preview
+        return submission_preview(self, params)
+
+    def system_submit(self, params: dict, ctx: JobContext) -> dict:
+        from .system_info import submit
+        return submit(self, params)
+
+    # -- helpers -----------------------------------------------------------
+    def parse_load(self, params: dict) -> LoadModelRequest:
+        req = from_dict(LoadModelRequest, params, "params")
+        if not req.path:
+            raise EngineError(INVALID_PARAMS, "path is required")
+        if not os.path.exists(req.path):
+            raise EngineError(MODEL_LOAD_FAILED, f"model file not found: {req.path}")
+        if req.dtype not in ("fp16", "bf16", "fp32"):
+            raise EngineError(INVALID_PARAMS, f"dtype must be fp16|bf16|fp32 (got {req.dtype})")
+        from . import perf
+        perf.validate_load(req)
+        if req.vae_path and not os.path.exists(req.vae_path):
+            raise EngineError(MODEL_LOAD_FAILED, f"VAE file not found: {req.vae_path}")
+        return req
+
+    def parse_generation(self, params: dict, mode: str, ctx: JobContext) -> GenerationRequest:
+        try:
+            req = parse_generation_request(params)
+        except ParamError as e:
+            raise EngineError(INVALID_PARAMS, str(e))
+        gp = req.params
+        problems = gp.validate()
+        if problems:
+            raise EngineError(INVALID_PARAMS, "; ".join(problems))
+        from .hooks import hook_config
+        refine = hook_config(gp.hooks, 'img2img_hires_fix', {})
+        if refine is not None:
+            from .img2img_hires_fix import normalize, effective
+            config = normalize(refine)
+            candidate = effective(config, gp)
+            source_size = gp.hires.target_size(gp.width, gp.height) if gp.hires.enabled and gp.img2img is None else (gp.width, gp.height)
+            config.target(*source_size)
+            try:
+                schedulers.sampler_spec(candidate.sampler_name)
+                schedulers.resolve_schedule(candidate.sampler_name, candidate.scheduler)
+            except ValueError as error:
+                raise EngineError(INVALID_PARAMS, str(error))
+            if not self.sampler_supported(candidate.sampler_name):
+                raise EngineError(UNSUPPORTED, 'img2img Hires Fix sampler is not available')
+            if config.upscaler not in PIXEL_UPSCALERS:
+                self.check_model_upscaler(config.upscaler, req.upscaler_paths)
+        son = hook_config(gp.hooks, "sonar", {})
+        if son is not None:
+            from . import sonar
+            sonar.validate(son, gp, req, self)
+        latent = hook_config(gp.hooks, "latent_upscale", {})
+        if latent is not None:
+            from . import latent_upscale
+            latent_upscale.normalize(latent)
+            if mode != "img2img" or gp.img2img is None:
+                raise EngineError(INVALID_PARAMS, "Latent Upscale needs an img2img input image")
+            latent_upscale.full_steps(gp.steps, gp.img2img.denoising_strength)
+            if hook_config(gp.hooks, "img2imgalt", {}) is not None:
+                raise EngineError(UNSUPPORTED, "Latent Upscale cannot be combined with img2img Alternative inversion")
+        if mode == "img2img":
+            if gp.img2img is None:
+                raise EngineError(INVALID_PARAMS, "img2img params are required for img2img")
+            if not gp.img2img.init_image or not os.path.isfile(gp.img2img.init_image):
+                raise EngineError(INVALID_PARAMS, f"init image not found: {gp.img2img.init_image}")
+            if gp.img2img.mask is not None and not os.path.isfile(gp.img2img.mask):
+                raise EngineError(INVALID_PARAMS, f"mask image not found: {gp.img2img.mask}")
+            if gp.img2img.resize_mode not in (0, 1, 2):
+                raise EngineError(INVALID_PARAMS, f"resize_mode must be 0, 1 or 2 (got {gp.img2img.resize_mode})")
+            if gp.img2img.inpainting_fill not in (0, 1, 2, 3):
+                raise EngineError(INVALID_PARAMS, f"inpainting_fill must be 0..3 (got {gp.img2img.inpainting_fill})")
+        try:
+            schedulers.sampler_spec(gp.sampler_name)
+            schedulers.resolve_schedule(gp.sampler_name, gp.scheduler)
+            if gp.hires.enabled and gp.hires.sampler_name:
+                schedulers.sampler_spec(gp.hires.sampler_name)
+            if gp.hires.enabled and gp.hires.scheduler:
+                schedulers.resolve_schedule(gp.hires.sampler_name or gp.sampler_name, gp.hires.scheduler)
+        except ValueError as e:
+            raise EngineError(INVALID_PARAMS, str(e))
+        samplers = [gp.sampler_name] + ([gp.hires.sampler_name] if gp.hires.enabled and gp.hires.sampler_name else [])
+        for sn in samplers:
+            if not self.sampler_supported(sn):
+                raise EngineError(UNSUPPORTED, f"sampler '{sn}' is not available in this engine")
+        if gp.hires.enabled and mode == "txt2img":
+            up = gp.hires.upscaler
+            if up not in LATENT_UPSCALERS and up not in PIXEL_UPSCALERS:
+                self.check_model_upscaler(up, req.upscaler_paths)
+        for lr in gp.loras + (req.hires_loras or []) + (req.manual_loras or []) + (req.img2img_hires_loras or []):
+            if lr.name not in req.lora_paths:
+                raise EngineError(INVALID_PARAMS, f"no path for LoRA '{lr.name}' in lora_paths")
+            if not os.path.isfile(req.lora_paths[lr.name]):
+                raise EngineError(INVALID_PARAMS, f"LoRA file not found: {req.lora_paths[lr.name]}")
+        for u in gp.controlnet:
+            if not u.enabled:
+                continue
+            if u.resize_mode not in (0, 1, 2):
+                raise EngineError(INVALID_PARAMS, 'invalid ControlNet resize mode')
+            if u.source_compatible_resize and 'inpaint' in u.preprocessor:
+                raise EngineError(INVALID_PARAMS, 'source-compatible ControlNet inpaint resize requires mask support')
+            from . import controlnet as cn_mod
+            if u.control_mode not in cn_mod.CONTROL_MODES:
+                raise EngineError(INVALID_PARAMS, f"unknown ControlNet control mode '{u.control_mode}'")
+            if u.processor_res != -1 and not 64 <= u.processor_res <= 2048:
+                raise EngineError(INVALID_PARAMS, 'ControlNet processor resolution must be -1 or 64 to 2048')
+            if (u.processor_res != -1 or u.pixel_perfect) and u.preprocessor not in cn_mod.RESOLUTION_PREPROCESSORS:
+                raise EngineError(INVALID_PARAMS, f"processor resolution is not supported for preprocessor '{u.preprocessor}'")
+            path = req.controlnet_paths.get(u.model, u.model)
+            if u.model not in req.controlnet_paths and not os.path.exists(u.model):
+                raise EngineError(INVALID_PARAMS, f"no path for ControlNet model '{u.model}' in controlnet_paths")
+            if not os.path.exists(path):
+                raise EngineError(INVALID_PARAMS, f"ControlNet model not found: {path}")
+            if u.image and not os.path.isfile(u.image):
+                raise EngineError(INVALID_PARAMS, f"ControlNet image not found: {u.image}")
+            if not u.image and mode != "img2img":
+                raise EngineError(INVALID_PARAMS, f"ControlNet unit '{u.model}' has no image")
+            if u.preprocessor not in ("none", "") and u.preprocessor not in self.preprocessors():
+                ctx.warn(f"ControlNet preprocessor '{u.preprocessor}' is not available; using the image as-is")
+        from .prompt import unsupported_syntax_warnings
+        for index, t in enumerate((gp.prompt, gp.negative_prompt)):
+            if index == 0:
+                from .hooks import hook_config
+                if any(hook_config(gp.hooks, name, {}) is not None
+                       for name in ("neutral_prompt", "composable_lora")):
+                    continue
+            for w in unsupported_syntax_warnings(t):
+                ctx.warn(w)
+        if req.preview_method not in ("approx", "taesd", "none"):
+            ctx.warn(f"unknown preview_method '{req.preview_method}'; using approx")
+        if not req.output_dir:
+            raise EngineError(INVALID_PARAMS, "output_dir is required")
+        if mode == "img2img" and gp.hires.enabled:
+            ctx.warn("hires fix is ignored for img2img")
+        return req
+
+    def ensure_model(self, gp, ctx: JobContext) -> None:
+        """Auto-load params.checkpoint when it is an existing path that differs from the loaded model."""
+        ck = gp.checkpoint
+        if ck and os.path.isfile(ck):
+            if self.model is None or os.path.normcase(os.path.abspath(self.model["path"])) != os.path.normcase(os.path.abspath(ck)):
+                ctx.log("info", f"loading checkpoint {os.path.basename(ck)}")
+                opts = self.load_opts
+                self.load_model({"path": ck, "dtype": opts.dtype, "vram_mode": getattr(self, "vram_requested", opts.vram_mode),
+                                 "vae_path": opts.vae_path, "vae_tiling": opts.vae_tiling, "vae_slicing": opts.vae_slicing,
+                                 "fp8_storage": opts.fp8_storage,
+                                 "vae_auto": opts.vae_auto, "vae_fp16": opts.vae_fp16}, ctx)
+        if self.model is None:
+            raise EngineError(NO_MODEL, "no model loaded (send load_model first)")
+
+    def sampler_supported(self, name: str) -> bool:
+        return True
+
+    def check_model_upscaler(self, name: str, upscaler_paths: dict) -> None:
+        """Model upscalers (ESRGAN etc.) must have an existing file in upscaler_paths."""
+        if name not in upscaler_paths:
+            raise EngineError(INVALID_PARAMS, f"unknown upscaler '{name}'")
+        if not os.path.isfile(upscaler_paths[name]):
+            raise EngineError(INVALID_PARAMS, f"upscaler model not found: {upscaler_paths[name]}")
+
+    def parse_upscale(self, params: dict) -> UpscaleRequest:
+        req = from_dict(UpscaleRequest, params, "params")
+        if not req.image_path or not os.path.isfile(req.image_path):
+            raise EngineError(INVALID_PARAMS, f"image not found: {req.image_path}")
+        if not (0 < req.scale <= 16):
+            raise EngineError(INVALID_PARAMS, f"scale must be in (0, 16] (got {req.scale})")
+        if not req.output_dir:
+            raise EngineError(INVALID_PARAMS, "output_dir is required")
+        if req.upscaler not in PIXEL_UPSCALERS:
+            self.check_model_upscaler(req.upscaler, req.upscaler_paths)
+        return req
+
+    def parse_preprocess(self, params: dict) -> PreprocessRequest:
+        req = from_dict(PreprocessRequest, params, "params")
+        if not req.image_path or not os.path.isfile(req.image_path):
+            raise EngineError(INVALID_PARAMS, f"image not found: {req.image_path}")
+        if not req.output_dir:
+            raise EngineError(INVALID_PARAMS, "output_dir is required")
+        if req.preprocessor not in self.preprocessors():
+            raise EngineError(UNSUPPORTED, f"preprocessor '{req.preprocessor}' is not available")
+        return req
+
+
+def _str_list(v, name: str) -> list[str]:
+    if v is None:
+        return []
+    if isinstance(v, str):
+        return [v]
+    if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
+        raise EngineError(INVALID_PARAMS, f"{name} must be an array of strings")
+    return v

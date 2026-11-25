@@ -1,0 +1,341 @@
+package sdfx.ui.view
+
+import javafx.beans.property.*
+import javafx.collections.{FXCollections, ObservableList}
+import javafx.geometry.Insets
+import javafx.scene.control.*
+import javafx.scene.layout.{HBox, Priority, VBox}
+import javafx.stage.{DirectoryChooser, FileChooser, Stage}
+import sdfx.core.config.{ModelDirs, Settings}
+import sdfx.engine.EngineSelection
+import sdfx.ui.vm.{VramModes, WdSettingsState}
+
+import scala.jdk.CollectionConverters.*
+
+/** Settings editor. Returns the edited settings; the caller applies them. */
+final class SettingsDialog(owner: Stage, initial: Settings, initialTab: Int = 0, wdWorkerReported: Option[Boolean] = None,
+    localization: Option[sdfx.ui.i18n.LocalizationController] = None, vulkanDevices: Seq[String] = Nil):
+  private val kinds = Seq("Checkpoints", "VAE", "LoRA", "ControlNet", "Embeddings", "Upscalers", "Face restore", "SVD",
+    "Zero123", "PhotoMaker")
+  private val dirs: Map[String, ObservableList[String]] =
+    val d = initial.modelDirs
+    Seq(d.checkpoints, d.vae, d.lora, d.controlnet, d.embeddings, d.upscalers, d.faceRestore, d.svd, d.zero123, d.photomaker).zip(kinds).map((xs, k) => k -> FXCollections.observableArrayList(xs*)).toMap
+
+  private val outputDir = new SimpleStringProperty(initial.outputDir)
+  private val hiresOutputDir = new SimpleStringProperty(initial.hiresFixTweaks.outputDir)
+  private val hiresShowCfg = new SimpleBooleanProperty(initial.hiresFixTweaks.showCfg)
+  private val hiresShowBatchSeed = new SimpleBooleanProperty(initial.hiresFixTweaks.showBatchSeed)
+  private val hiresShowPromptModes = new SimpleBooleanProperty(initial.hiresFixTweaks.showPromptModes)
+  private val hiresShowRemove = new SimpleBooleanProperty(initial.hiresFixTweaks.showRemoveNetworks)
+  private val hiresShowStyles = new SimpleBooleanProperty(initial.hiresFixTweaks.showStyles)
+  private val hiresRadio = new SimpleBooleanProperty(initial.hiresFixTweaks.promptModeRadio)
+  private val hiresSaveTemplate = new SimpleBooleanProperty(initial.hiresFixTweaks.saveTemplate)
+  private val hiresRestoreTemplate = new SimpleBooleanProperty(initial.hiresFixTweaks.restoreTemplate)
+  private val hiresCheckpointLabels = new SimpleStringProperty(initial.hiresFixTweaks.checkpointLabels)
+  private val availableBackends = EngineSelection.availableBackends
+  private val backendChoices = (if availableBackends.size > 1 then Seq("auto") else Seq.empty) ++ availableBackends
+  private val vulkanDevice = new ComboBox[String](FXCollections.observableArrayList(
+    (Seq("auto") ++ vulkanDevices ++ initial.vulkanDevice).distinct*))
+  vulkanDevice.setEditable(true)
+  vulkanDevice.setValue(initial.vulkanDevice.getOrElse("auto"))
+  vulkanDevice.getEditor.setText(vulkanDevice.getValue)
+  vulkanDevice.setMaxWidth(Double.MaxValue)
+  private val pythonExe = new SimpleStringProperty(initial.pythonExe.getOrElse(""))
+  private val engineBackend = new SimpleStringProperty(
+    if backendChoices.contains(initial.engineBackend) then initial.engineBackend else backendChoices.headOption.getOrElse("auto"))
+  private val scalaTorchClasspath = new SimpleStringProperty(initial.scalaTorchClasspath.getOrElse(""))
+  private val scalaTorchModel = new SimpleStringProperty(initial.scalaTorchModel.getOrElse(""))
+  private val scalaTorchScheduler = new SimpleStringProperty(initial.scalaTorchScheduler.getOrElse(""))
+  private val scalaTorchJava = new SimpleStringProperty(initial.scalaTorchJava.getOrElse(""))
+  private val scalaTorchCudnnDir = new SimpleStringProperty(initial.scalaTorchCudnnDir.getOrElse(""))
+  private val scalaTorchVramLimitMb = new SimpleStringProperty(initial.scalaTorchVramLimitMb.map(_.toString).getOrElse(""))
+  private val scalaTorchUnetDevice = new SimpleStringProperty(initial.scalaTorchUnetDevice)
+  private val scalaTorchVaeDevice = new SimpleStringProperty(initial.scalaTorchVaeDevice)
+  private val scalaTorchUnetOffloadWeights = new SimpleBooleanProperty(initial.scalaTorchUnetOffloadWeights)
+  private val scalaTorchVaeOffloadWeights = new SimpleBooleanProperty(initial.scalaTorchVaeOffloadWeights)
+  private val dtype = new SimpleStringProperty(initial.dtype)
+  private val vramIndex = new SimpleIntegerProperty(VramModes.index(initial.vramMode).max(0))
+  private val vaeTiling = new SimpleBooleanProperty(initial.vaeTiling)
+  private val vaeSlicing = new SimpleBooleanProperty(initial.vaeSlicing)
+  private val fp8Storage = new SimpleBooleanProperty(initial.fp8Storage)
+  private val vaeAuto = new SimpleBooleanProperty(initial.vaeAuto)
+  private val vaeFp16 = new SimpleBooleanProperty(initial.vaeFp16)
+  private val previewEvery = new SimpleIntegerProperty(initial.previewEvery)
+  private val previewMethod = new SimpleStringProperty(initial.previewMethod)
+  private val hfOffline = new SimpleBooleanProperty(initial.hfOffline)
+  private val mcpEnabled = new SimpleBooleanProperty(initial.mcpHttpEnabled)
+  private val mcpPort = new SimpleIntegerProperty(initial.mcpHttpPort)
+  private val mcpToken = new SimpleStringProperty(initial.mcpToken.getOrElse(""))
+  private val theme = new SimpleStringProperty(initial.theme)
+  private val cardDefault = new SimpleStringProperty(initial.nsfwCardBlurDefault)
+  private val allowCode = new SimpleBooleanProperty(initial.allowCustomCode)
+  private val wdModel = new SimpleStringProperty(initial.wdV3Model.getOrElse(""))
+  private val wdTags = new SimpleStringProperty(initial.wdV3Tags.getOrElse(""))
+
+  // ---- model folders -----------------------------------------------------------------------------------
+  private val kindList = new ListView[String](FXCollections.observableArrayList(kinds*))
+  kindList.setPrefWidth(150)
+  kindList.getStyleClass.add("kind-list")
+  private val folderList = new ListView[String]()
+  folderList.setEditable(true)
+  folderList.setCellFactory(javafx.scene.control.cell.TextFieldListCell.forListView())
+  W.tip(folderList, "Folders searched for this model type (relative paths are relative to the app folder). Double click to edit.")
+  kindList.getSelectionModel.selectedItemProperty.addListener((_, _, k) => if k != null then folderList.setItems(dirs(k)))
+  kindList.getSelectionModel.select(0)
+
+  private def chooseDir(title: String): Option[String] =
+    val dc = new DirectoryChooser()
+    dc.setTitle(title)
+    Option(dc.showDialog(owner)).map(_.getAbsolutePath)
+
+  private def currentKind = Option(kindList.getSelectionModel.getSelectedItem).getOrElse(kinds.head)
+  private val addBtn = W.button("＋ Add folder…", "Add a folder for the selected model type")(
+    chooseDir("Add model folder").foreach(d => if !dirs(currentKind).contains(d) then dirs(currentKind).add(d))
+  )
+  private val removeBtn = W.button("－ Remove", "Remove the selected folder")(
+    Option(folderList.getSelectionModel.getSelectedIndex).filter(_ >= 0).foreach(i => folderList.getItems.remove(i.intValue))
+  )
+  private val a1111Btn = W.button("Add A1111/reForge install…", "Use the model folders of an existing A1111 / reForge / Forge install (read-only)", Seq("accent-button"))(
+    chooseDir("Select the A1111 / reForge folder").foreach { root =>
+      val d = currentDirs.withA1111(root)
+      Seq(d.checkpoints, d.vae, d.lora, d.controlnet, d.embeddings, d.upscalers, d.faceRestore, d.svd, d.zero123, d.photomaker).zip(kinds).foreach((xs, k) => dirs(k).setAll(xs*))
+    }
+  )
+
+  private def currentDirs: ModelDirs =
+    def l(k: String) = dirs(k).asScala.toSeq.map(_.trim).filter(_.nonEmpty)
+    ModelDirs(l("Checkpoints"), l("VAE"), l("LoRA"), l("ControlNet"), l("Embeddings"), l("Upscalers"), l("Face restore"),
+      l("SVD"), l("Zero123"), l("PhotoMaker"))
+
+  private val modelsTab =
+    val right = new VBox(8, folderList, W.hbox(6, addBtn, removeBtn))
+    VBox.setVgrow(folderList, Priority.ALWAYS)
+    val h = new HBox(10, kindList, right)
+    HBox.setHgrow(right, Priority.ALWAYS)
+    val v = new VBox(10, h, a1111Btn)
+    VBox.setVgrow(h, Priority.ALWAYS)
+    v.setPadding(new Insets(12))
+    new Tab("Model folders", v)
+
+  // ---- other tabs --------------------------------------------------------------------------------------
+  private def browseRow(p: StringProperty, dir: Boolean, title: String) =
+    val f = W.textField(p)
+    val b = W.iconButton("…", title) {
+      if dir then chooseDir(title).foreach(p.set)
+      else
+        val fc = new FileChooser()
+        fc.setTitle(title)
+        Option(fc.showOpenDialog(owner)).foreach(x => p.set(x.getAbsolutePath))
+    }
+    W.hbox(6, W.hgrow(f), b)
+
+  private def scalaTorchModelRow() =
+    val field=W.textField(scalaTorchModel)
+    val folder=W.button("Folder", "Choose a Diffusers model folder") {
+      chooseDir("Choose Diffusers model folder").foreach(scalaTorchModel.set)
+    }
+    val file=W.button("File", "Choose an SD1 safetensors checkpoint") {
+      val chooser=new FileChooser()
+      chooser.setTitle("Choose SD1 safetensors checkpoint")
+      chooser.getExtensionFilters.add(new FileChooser.ExtensionFilter("Safetensors", "*.safetensors"))
+      Option(chooser.showOpenDialog(owner)).foreach(x => scalaTorchModel.set(x.getAbsolutePath))
+    }
+    W.hbox(6,W.hgrow(field),folder,file)
+
+  private def page(f: W.Form): ScrollPane =
+    val v = new VBox(f.grid)
+    v.setPadding(new Insets(14))
+    val sp = new ScrollPane(v)
+    sp.setFitToWidth(true)
+    sp.setHbarPolicy(ScrollPane.ScrollBarPolicy.NEVER)
+    sp.getStyleClass.add("settings-scroll")
+    sp
+
+  private def sectionNote(title: String): Label = W.label(title, "settings-section-title")
+
+  private val generalTab = new Tab(
+    "General",
+    page(
+      W.form()
+        .add("Output folder", browseRow(outputDir, true, "Choose the output folder"), "Where generated images are saved (relative = inside the app folder)")
+        .add("Hires output folder", browseRow(hiresOutputDir, true, "Choose the Hires output folder"),
+          "Optional separate folder for Hires results. Empty uses Output folder. A non-default Output folder takes priority. Relative paths are inside the app folder.")
+        .add("Named NSFW previews default", W.combo(FXCollections.observableArrayList("Blur", "Hide", "Show"), cardDefault), "Saved default for a new app session; changing it does not change the current temporary mode.")
+        .add("Theme", W.combo(FXCollections.observableArrayList("dark", "light"), theme), "Color theme")
+        .add("Live preview", W.intSlider(previewEvery, 0, 20), "Send a preview image every N sampling steps (0 = off)")
+        .add("Preview method", W.combo(FXCollections.observableArrayList("approx", "taesd"), previewMethod), "approx: instant, rough colors · taesd: better quality, small extra cost")
+    )
+  )
+
+  private val engineForm =
+    val form = W.form()
+    if backendChoices.nonEmpty then form.add("Inference backend", W.combo(FXCollections.observableArrayList(backendChoices*), engineBackend),
+      "Available inference modules in this application")
+    if availableBackends.contains("vulkan") then
+      form.add("Vulkan GPU", vulkanDevice,
+        "Choose an adapter or type its name or ID (such as Vulkan0). Auto uses the worker default. Restart the engine to apply.")
+    if availableBackends.contains("scala-torch") then
+      form
+        .full(sectionNote("Native engine (scala-torch)"))
+        .add("scala-torch classpath", browseRow(scalaTorchClasspath, false, "Choose worker classpath file"), "Uses the packaged runtime when available; otherwise choose a manifest whose entries may be absolute or relative to this file")
+        .add("scala-torch model", scalaTorchModelRow(), "Diffusers model folder or SD1 safetensors checkpoint")
+        .add("scala-torch scheduler", browseRow(scalaTorchScheduler, false, "Choose scheduler JSON"), "Uses the selected model's scheduler/scheduler_config.json when empty")
+        .add("scala-torch Java", browseRow(scalaTorchJava, false, "Choose Java 25 executable (optional)"), "Uses the packaged Java 25 runtime when available, then NUI's current Java runtime")
+        .add("scala-torch cuDNN folder", browseRow(scalaTorchCudnnDir, true, "Choose the folder that holds cuDNN (cudnn64_9.dll)"),
+          "Optional, makes convolutions faster. Empty = searched in the CUDA Toolkit, the cuDNN installer's folder and Path. A PyTorch torch\\lib folder works")
+        .add("scala-torch VRAM limit (MB)", W.textField(scalaTorchVramLimitMb),
+          "Optional. The engine uses at most this much GPU memory; models that do not fit are partly kept in system memory (slower)")
+        .add("scala-torch U-Net device", W.combo(FXCollections.observableArrayList("auto", "cpu", "cuda", "cuda:0", "cuda:1"), scalaTorchUnetDevice), "U-Net compute device; cuda selects GPU 0")
+        .add("scala-torch VAE device", W.combo(FXCollections.observableArrayList("auto", "cpu", "cuda", "cuda:0", "cuda:1"), scalaTorchVaeDevice), "VAE encode/decode compute device; cuda selects GPU 0")
+        .full(W.check("Offload U-Net weights between CPU and CUDA", scalaTorchUnetOffloadWeights))
+        .full(W.check("Offload VAE weights between CPU and CUDA", scalaTorchVaeOffloadWeights))
+    if availableBackends.contains("python") then
+      form
+        .full(sectionNote("Python fallback"))
+        .add("Python", browseRow(pythonExe, false, "Choose python executable"), "Python interpreter for the engine (empty = app venv, then system Python)")
+    if !availableBackends.contains("vulkan") then
+      form
+        .full(sectionNote("Precision & memory"))
+        .add("Precision", W.combo(FXCollections.observableArrayList("fp16", "bf16", "fp32"), dtype), "Model weight precision (fp16 for most GPUs)")
+        .add("VRAM mode", W.indexCombo(VramModes.Modes.map(_._2), vramIndex), "GPU: everything stays on the GPU · Model offload: whole models move to the GPU when used · Sequential offload: layer by layer, slowest but lowest VRAM · Auto: choose from the free VRAM at model load")
+        .full(W.check("VAE tiling (decode large images in tiles to save VRAM)", vaeTiling))
+        .full(W.check("VAE slicing (decode a batch one image at a time to save VRAM)", vaeSlicing))
+        .full(W.check("Automatic VAE slicing / tiling when the decode would not fit the free VRAM", vaeAuto))
+        .full(W.check("fp16 VAE decode for SDXL (saves ~2.5 GB at 832x1216; falls back to fp32 on bad output)", vaeFp16))
+        .full(W.check("fp8 U-Net weights (half the U-Net VRAM, upcast per layer; GPU VRAM mode only)", fp8Storage))
+        .full(W.check("Offline mode (never download from Hugging Face)", hfOffline))
+    if availableBackends.contains("python") then
+      form.full(W.check("Allow custom code (the Custom code script runs Python in the engine; like A1111 --allow-code)", allowCode))
+    val backendHint = if availableBackends.contains("python") then "Python, precision and VRAM changes apply after an engine restart."
+      else "Precision and VRAM changes apply after an engine restart."
+    if !availableBackends.contains("vulkan") then form.full(W.label(backendHint, "hint"))
+    form
+
+  private val engineTab = new Tab("Engine", page(engineForm))
+
+  private val mcpTab = new Tab(
+    "MCP",
+    page(
+      W.form()
+        .full(W.check("Enable MCP HTTP server", mcpEnabled, "Let AI agents drive this app over MCP (HTTP)"))
+        .add("Port", W.intSpinner(mcpPort, 1024, 65535, 1, 110), "Local port of the MCP HTTP server")
+        .add("Token", W.textField(mcpToken, "optional bearer token"), "Clients must send this bearer token (recommended)")
+        .full(W.label("Applies immediately when you press OK.", "hint"))
+    )
+  )
+
+  private val wdTab =
+    val status = W.label(WdSettingsState.status(wdModel.get, wdTags.get), "hint")
+    status.setId("wd-v3-status")
+    val update = () => status.setText(WdSettingsState.status(wdModel.get, wdTags.get))
+    wdModel.addListener((_, _, _) => update())
+    wdTags.addListener((_, _, _) => update())
+    val note = W.label("Partial support: WD v3 only. Select local files and restart the engine, then use the WD v3 batch section in Img2Img. No models are downloaded.", "hint")
+    note.setWrapText(true)
+    val worker = W.label(WdSettingsState.workerStatus(wdWorkerReported), "hint")
+    worker.setId("wd-v3-worker-status")
+    worker.setWrapText(true)
+    val content = page(W.form()
+      .full(note)
+      .add("Model (.onnx)", browseRow(wdModel, false, "Choose local WD v3 model"), "Select the local WD v3 ONNX file")
+      .add("Tags (.csv)", browseRow(wdTags, false, "Choose local WD v3 tags"), "Select the matching local selected_tags.csv")
+      .full(status)
+      .full(worker))
+    val scroll = new ScrollPane(content)
+    scroll.setFitToWidth(true)
+    new Tab("WD v3 (partial)", scroll)
+
+  private val hiresTab = new Tab("Hires", page(W.form()
+    .full(W.label("Hidden controls retain their values. Display changes apply when settings are saved.", "hint"))
+    .full(W.check("Show Hires CFG", hiresShowCfg))
+    .full(W.check("Show Hires batches and seed", hiresShowBatchSeed))
+    .full(W.check("Show prompt modes", hiresShowPromptModes))
+    .full(W.check("Show removal of first-pass network tags", hiresShowRemove))
+    .full(W.check("Show Hires styles", hiresShowStyles))
+    .full(W.check("Use radio buttons for prompt modes (off = dropdown)", hiresRadio))
+    .full(W.check("Save Hires prompt templates in image metadata", hiresSaveTemplate))
+    .full(W.check("Restore matching Hires prompt templates from image metadata", hiresRestoreTemplate))
+    .add("Checkpoint labels", W.combo(FXCollections.observableArrayList(sdfx.ui.vm.CheckpointLabels.modes*), hiresCheckpointLabels),
+      "Changes displayed names only. Hires uses the first-pass checkpoint; duplicate filenames retain an identifier.")))
+  private val languagePane = new LanguageSettingsPane(owner, initial.localization, localization)
+  private val languageTab = new Tab("Language", languagePane.node)
+  languageTab.setId("settings-language-tab")
+  private val tabs = new TabPane(modelsTab, generalTab, engineTab, mcpTab, wdTab, hiresTab, languageTab)
+  tabs.setTabClosingPolicy(TabPane.TabClosingPolicy.UNAVAILABLE)
+  tabs.setPrefSize(780, 520)
+  tabs.getSelectionModel.select(initialTab.max(0).min(tabs.getTabs.size - 1))
+
+  /** Shows the dialog; Some(updated) when saved. */
+  def showAndWait(): Option[Settings] =
+    val d = new Dialog[ButtonType]()
+    d.initOwner(owner)
+    d.setTitle("Settings")
+    d.setHeaderText(null)
+    d.getDialogPane.setContent(tabs)
+    d.getDialogPane.getButtonTypes.addAll(ButtonType.CANCEL, ButtonType.OK)
+    d.getDialogPane.getStylesheets.setAll(owner.getScene.getStylesheets)
+    d.getDialogPane.getStyleClass.add("settings-dialog")
+    d.setResizable(true)
+    d.setOnShown(_ => Option(d.getDialogPane.getScene).flatMap(s => Option(s.getWindow)).collect {
+      case st: Stage =>
+        AppIcon.apply(st)
+        NativeWindowChrome.apply(st, initial.theme)
+    })
+    val r = d.showAndWait()
+    if r.isPresent && r.get == ButtonType.OK then
+      val engine = SettingsDialog.engineSettings(initial, availableBackends, vulkanDevice.getEditor.getText) {
+        initial.copy(
+          pythonExe = if availableBackends.contains("python") then Option(pythonExe.get).map(_.trim).filter(_.nonEmpty) else initial.pythonExe,
+          engineBackend = engineBackend.get,
+          scalaTorchClasspath = Option(scalaTorchClasspath.get).map(_.trim).filter(_.nonEmpty),
+          scalaTorchModel = Option(scalaTorchModel.get).map(_.trim).filter(_.nonEmpty),
+          scalaTorchScheduler = Option(scalaTorchScheduler.get).map(_.trim).filter(_.nonEmpty),
+          scalaTorchJava = Option(scalaTorchJava.get).map(_.trim).filter(_.nonEmpty),
+          scalaTorchCudnnDir = Option(scalaTorchCudnnDir.get).map(_.trim).filter(_.nonEmpty),
+          scalaTorchVramLimitMb = Option(scalaTorchVramLimitMb.get).map(_.trim).flatMap(_.toIntOption).filter(_ > 0),
+          scalaTorchUnetDevice = scalaTorchUnetDevice.get,
+          scalaTorchVaeDevice = scalaTorchVaeDevice.get,
+          scalaTorchUnetOffloadWeights = scalaTorchUnetOffloadWeights.get,
+          scalaTorchVaeOffloadWeights = scalaTorchVaeOffloadWeights.get,
+          dtype = dtype.get,
+          vramMode = VramModes.Modes(vramIndex.get.max(0).min(VramModes.Modes.size - 1))._1,
+          vaeTiling = vaeTiling.get,
+          vaeSlicing = vaeSlicing.get,
+          fp8Storage = fp8Storage.get,
+          vaeAuto = vaeAuto.get,
+          vaeFp16 = vaeFp16.get,
+          hfOffline = hfOffline.get
+        )
+      }
+      Some(
+        engine.copy(
+          modelDirs = currentDirs,
+          localization = languagePane.current,
+          outputDir = Option(outputDir.get).map(_.trim).filter(_.nonEmpty).getOrElse("outputs"),
+          hiresFixTweaks = initial.hiresFixTweaks.copy(outputDir = Option(hiresOutputDir.get).fold("")(_.trim),
+            showCfg = hiresShowCfg.get, showBatchSeed = hiresShowBatchSeed.get,
+            showPromptModes = hiresShowPromptModes.get, showRemoveNetworks = hiresShowRemove.get,
+            showStyles = hiresShowStyles.get, promptModeRadio = hiresRadio.get, checkpointLabels = hiresCheckpointLabels.get,
+            saveTemplate = hiresSaveTemplate.get, restoreTemplate = hiresRestoreTemplate.get),
+          previewEvery = previewEvery.get,
+          previewMethod = previewMethod.get,
+          mcpHttpEnabled = mcpEnabled.get,
+          mcpHttpPort = mcpPort.get,
+          mcpToken = Option(mcpToken.get).map(_.trim).filter(_.nonEmpty),
+          theme = theme.get,
+          nsfwCardBlurDefault = cardDefault.get,
+          allowCustomCode = if availableBackends.contains("python") then allowCode.get else initial.allowCustomCode,
+          wdV3Model = Option(wdModel.get).map(_.trim).filter(_.nonEmpty),
+          wdV3Tags = Option(wdTags.get).map(_.trim).filter(_.nonEmpty)
+        )
+      )
+    else
+      localization.foreach(_.setExtraDirs(initial.localization.extraDirs)) // folders added in the Language tab were not saved
+      None
+
+object SettingsDialog:
+  /** Only the adapter setting is editable on the Vulkan engine tab. */
+  private[ui] def engineSettings(initial: Settings, backends: Seq[String], device: String)(conventional: => Settings): Settings =
+    if backends == Seq("vulkan") then
+      initial.copy(vulkanDevice = Option(device).map(_.trim).filter(v => v.nonEmpty && !v.equalsIgnoreCase("auto")))
+    else conventional

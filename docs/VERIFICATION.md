@@ -1,0 +1,1396 @@
+# Real-model verification log
+
+## VRAM Estimator (2026-10-30)
+
+See [the dedicated verification record](vram-estimator-verification.md) for actual SD1.5/SDXL four-mode calibration and holdouts, native view and owned stop, bounded CUDA OOM/recovery, whole regression, file integrity validation and assembled-jar acceptance. Finite vanilla calibration is not a physical memory-capacity guarantee.
+
+
+## Partial WD v3 batch candidate (2026-10-27)
+
+The candidate was integrated from main for the next Windows release. This is a partial implementation of issue #7, not complete parity with the original batch interrogator. Unless specifically identified as packaged, the observations below apply to the tested worktree and machine.
+
+- Focused Python tests: 113 passed for the WD and batch components; a further 51 protocol, server, Temporal Lab and hardware regression tests passed. These are finite automated checks, not complete coverage.
+- Scala: `outputs/wd-release-integration.log` records core 2, engine 18 and UI 6 tests passed, followed by successful UI compilation. The Windows output-identity fix (`ff597ad`) passed 28 related tests. Settings and dimension layout screenshots were inspected.
+- Real worker CLI: one image per run through the actual local WD v3 CPU provider and real img2img generation, using `animekawa_v10` (SD1.5) and `waiIllustriousSDXL_v170` (SDXL). Both used Euler, 256×256, two steps, seed 12345 and an astronaut input. On an RTX 3090 with Python 3.10.11, torch 2.9.0+cu128 and Diffusers 0.32.2, both requests returned a completed row, produced a PNG and exited the worker with code 0. The operator inspected both images. The resulting SHA-256 values were `19b3c3bbde50138d6da52545c957b26b6302d49259ebd2359a290a6fd14f1c93` (SD1.5) and `b96a6a5d03bed7542b157af366c9f039d0c6e8860417a16528c0b793eb96022a` (SDXL). These small runs are functional smoke checks, not quality or performance benchmarks.
+- The reports record unchanged input, WD asset and checkpoint hashes before and after. Allocated/reserved VRAM after model unload was 9.1/22.0 MiB in each run; this is an observation from those processes, not a guarantee for all workloads. The local reports are `outputs/wd-real-sd15-j1h6n_4i/report.json` and `outputs/wd-real-sdxl-xp1hslhy/report.json`; output artifacts are not included in the release.
+
+- Native UI submission: actual `MainWindow` Generate → queue → worker → gallery completed for both `animekawa_v10` and `waiIllustriousSDXL_v170`, with two copies of the input image in each run, 256×320, two steps, seed 42 and DPM++ 2M. Both reported two outputs and the operator inspected the model output images. The folder chooser fields were injected by the helper rather than selected using an OS chooser. Input and checkpoint hashes were checked unchanged. Local reports and screenshots are in `outputs/native-submit/wd-submit-native-4476093102594237849` (SD1.5) and `outputs/native-submit/wd-submit-native-5909949968431557033` (SDXL).
+- Windows ZIP candidate: SHA-256 `057d0128942fbeb8979d4379688094d8963dff218d41c0323d9507432ef59451`; assembled JAR SHA-256 `8b0b7e075a5845797abfb2095e152b1015597cbfa6e3a2183276a112925309c6`. The extracted executable launched and generated a dry-run image with external Java absent; its screenshot was inspected. The first helper's report encountered a PowerShell `Count` reporting error after the actual launch/generation; the helper was corrected. The same extracted EXE subsequently generated a real 256x256 SD1.5 image (animekawa_v10, Euler, two steps, seed 12345), displayed it in the gallery and exited with code 0. Both the image and screenshot were inspected. JAVA_HOME was absent and Java executable directories were removed from PATH. The extracted JAR hash and all tracked Python source hashes matched the release checkout. Evidence is retained under outputs/package-check/package check 794c802061bd4f298a57eeaa81e88fc8. An initial autogen check had no selected last_model and correctly returned no_model; the successful run explicitly selected the checkpoint.
+
+The worker result includes the effective prompts and WD provenance, and the native gallery can show the effective prompt; this worker does **not** embed that prompt or WD provenance in generated PNG metadata. The only configured backend is the explicitly selected, fixed local WD v3 candidate; weights and tag files are external. CPU WD inference cannot necessarily be interrupted inside the native ONNX call.
+
+## Full pass (2026-10-26 06:32:11 – 07:13:39)
+
+One script run, final code, one log, stages in order. Each stage starts its own engine process(es); the run as a whole
+covers every plugin and every test suite. Errors in the log: 0.
+
+| Stage | What runs | Result |
+|---|---|---|
+| E | engine requests, one fresh engine per item: GFPGAN, CodeFormer, face-restore hook, BLIP, WD14, LDSR, Marigold depth / normal, recolor / tile / blur, custom code, ControlNet canny, IP-Adapter, ControlNet-LLLite, Fooocus inpaint, PhotoMaker v1, SVD, Zero123 | 19 / 19 |
+| H15 | every hook plugin on SD1.5 (incl. SAG with DPM++, Revision skip-with-warning) | 20 / 20 |
+| HXL | hook plugins on SDXL (incl. Revision, SAG skip-with-warning) | 17 / 17 |
+| V | Revision with / without on animagine-xl-3.1 and waiIllustriousSDXL_v170, same seed | 10 / 10 images |
+| S | every AlwaysOn plugin through the Scala path (`RealAlwaysOnCheck`: Plugin.process -> JobQueue -> engine -> GPU); random_resolutions -> 576x448 | 18 / 18 |
+| M | every Script / Extras plugin through the jar (`McpMain` stdio -> JobQueue -> engine -> GPU) | 17 / 17 |
+| T | sbt test (core 200, engine 60, plugins 83, mcp 39, ui 62 = 444), smoke, pytest without torch (197 passed, 10 skipped) and with torch (209 passed) | all passed |
+
+## Earlier per-item runs
+
+
+Date: 2026-10-26, 02:18–02:55 (re-runs of sag, revision, custom_code, photomaker, fooocus_inpaint, zero123 at 02:40–02:55), NVIDIA RTX 3090, final code (after all fixes), python `.venv-smoke`
+(torch 2.9 / diffusers 0.32.2), models: `animekawa_v10` (SD1.5), `waiIllustriousSDXL_v170` (SDXL).
+
+How it was run (all on the same day and code, but **not** one process):
+
+- **E** — engine level: `python -m sdfx`, one fresh engine process per item, driven over the JSON Lines protocol.
+  Results appended to `results.tsv` (time, item, OK/ERR, duration).
+- **H15 / HXL** — hook plugins: one engine process per model, every hook case as one txt2img/img2img call
+  (SD1.5 run 17/17 + 3/3, SDXL run 13/13 + 3/3).
+- **S** — Scala path for AlwaysOn plugins (02:55, `mcp/Test/runMain sdfx.mcp.RealAlwaysOnCheck`): each plugin's
+  `process` builds the hooks, then JobQueue -> Generator -> Python engine -> GPU on SD1.5; 18/18 OK, output size and
+  infotext keys printed per plugin (random_resolutions produced 576x448 from its list). Model-file plugins
+  (ip_adapter, controllllite, fooocus_inpaint, photomaker) are covered by E.
+- **R** — re-runs at 02:49–02:53 with the final code: depth/normal Marigold, ip_adapter (unloaded afterwards),
+  controllllite, photomaker, svd (14 frames, 1024x576 GIF) — all OK.
+- **M** — whole app: `java -cp target/stablediffusion-fx.jar sdfx.mcp.McpMain` (stdio MCP) → Scala JobQueue and
+  plugins → Python engine → GPU, one `run_script` call per plugin (17/17), outputs checked visually.
+
+Every row below passed. "by design" notes are the documented fallbacks, also observed in the runs.
+
+| Plugin id | Run | Evidence |
+|---|---|---|
+| xyz_grid | M | 4-cell CFG x Steps grid with labels |
+| prompt_matrix | M | 5 images (4 combinations + grid) |
+| prompts_from_file | M | 2 images, per-line `--steps` / `--seed` applied |
+| loopback | M | 3 images (2 loops + grid) |
+| sd_upscale | M | 1024x1024 merged result |
+| outpaint | M | expanded canvas inpainted |
+| outpaint_mk2 | M | expanded canvas inpainted |
+| img2img_alt | M, H15, HXL | DDIM inversion then sampling |
+| svd | E 116.3 s, M 44.4 s | 14-frame and 8-frame GIF + first frame PNG |
+| zero123 | E 27.4 s, M 12.2 s | Zero123-XL; azimuth 0 = input, 90/180 rotate the object |
+| custom_code | E 0.0 s | `run_code` with SDFX_ALLOW_CODE=1 returned `result` and an image; refused over MCP by design |
+| upscale_extras | M | 2x Lanczos |
+| face_restore_extras | M | GFPGAN v1.4 |
+| caption | E (BLIP 5.4 s, WD14 2.1 s), M | "a girl with long white hair and black eyes" / Danbooru tags; .txt written |
+| flipped_copies | M | 2 copies |
+| split_oversized | M | 1 piece (square input) |
+| autosized_crop | M | 64-divisible crop |
+| focal_crop | M | 384x512 crop |
+| face_restore | E (GFPGAN 2.7 s, CodeFormer 2.8 s, hook 11.4 s) | faces restored |
+| reference | H15, HXL | reference-only attention |
+| revision | HXL 13.6 s (re-run 02:44 after aligning with forge: positive pooled replaced, negative pooled zeroed) + probe | animagine-xl-3.1: "ignore prompt" reproduces the red sneaker reference, with "a shoe" the shoe turns into the referenced red/white sneaker; Illustrious-based models barely use the pooled vector (weak effect); SD1.5 warns and skips by design |
+| ip_adapter | E 31.1 s | ip-adapter_sd15; unloaded on the next call |
+| controllllite | E 27.6 s | SDXL canny anime LLLite follows the edge map |
+| photomaker | E 25.0 s | PhotoMaker v1 (SDXL) |
+| fooocus_inpaint | E 36.6 s | inpaint_v26 patch + head, masked area repainted |
+| freeu | H15, HXL | |
+| dynamic_thresholding | H15, HXL | CFG 15 with mimic 7 |
+| apg | H15, HXL | |
+| mahiro | H15, HXL | |
+| rescale_cfg | H15, HXL | |
+| pag | H15, HXL | |
+| sag | H15 (`sag_dpm`) | SD1.5 + DPM++ 2M; Euler a and SDXL warn and skip by design |
+| hypertile | H15, HXL | 1024x1024 |
+| kohya_hrfix | H15, HXL | 1024² (SD1.5), 1536² (SDXL) |
+| multidiffusion | H15 (both methods), HXL | 1024x512 / 1664x832 |
+| model_sampling | H15, HXL | eps override |
+| latent_modifier | H15, HXL | |
+| random_resolutions | S | 576x448 picked from "640x384, 384x640, 576x448"; infotext "Random resolution" |
+| soft_inpainting | H15, HXL | differential-diffusion blend + composite |
+| neveroom | H15, HXL | sliced attention / tiled VAE |
+| Core: ControlNet | E 15.3 s | control_v11p_sd15_canny fp16 |
+| Core: LDSR | E 109.0 s | 2x upscale (first run downloads the model) |
+| Core: Marigold | E (depth 11.9 s, normal 10.1 s) | |
+| Core: recolor / tile / blur preprocessors | E | |
+
+## Image-tool handoff verification (Codex, 2026-10-26)
+
+Tested with RTX 3090, `python/.venv-smoke`, the existing SD1.5 `animekawa_v10` and SDXL
+`waiIllustriousSDXL_v170` checkpoints. The source prompt was a woman in a red jacket in a park, seed 7,
+16 steps, DPM++ 2M. Source sizes were 512x768 and 832x1216 respectively. This verifies these tools;
+it does not establish completion or full upstream feature parity for the remaining extension index.
+
+| Tool / plugin | Real-engine evidence (both models) | App/MCP evidence (SD1.5) |
+|---|---|---|
+| pixel_art | 16-colour pixelated output, ordered dithering, original dimensions | 1 saved image |
+| color_enhance | stronger chroma at strength 0.5; visually compared with source | 1 saved image |
+| fsr_upscale | 1024x1536 / 1664x2432 Lanczos + CAS output | 1 saved image |
+| person_mask | inverse mask covers 78.89% / 87.73%; person protected in background inpaint | 1 saved image |
+| remove_background | person segmentation and rembg isnet-anime; nontrivial RGBA alpha | 2 saved images (cutout + mask) |
+| depthmap2mask | DPT nearest-range mask covers 38.49% / 43.87%; masked inpainting succeeds | 2 saved images (edited + mask) |
+| inpaint_background | person-mask inpainting changes park to mountains and retains the person | 2 saved images (edited + mask) |
+
+The non-neural tools run on CPU; diffusion, YOLO and DPT used CUDA. rembg uses the providers available in its
+ONNX Runtime installation; no claim of CUDA acceleration for rembg. Only the isnet-anime and person-segmentation
+background-removal choices were exercised, not every offered rembg model or alpha-matting option.
+
+Reproduce from the repository root (one model per engine process):
+
+```powershell
+python scripts/dev/gpu_check.py python/.venv-smoke/Scripts/python.exe outputs/verify-image-tools image_sd15
+python scripts/dev/gpu_check.py python/.venv-smoke/Scripts/python.exe outputs/verify-image-tools image_sdxl
+```
+
+Each case generates a source, runs seven tool configurations and two inpainting calls, checks sizes and rejects
+empty/full masks or alpha, then writes `outputs/verify-image-tools/image_sd15.json` or `image_sdxl.json` and
+`results.tsv`. The PNGs and review sheets in that directory were inspected visually. They are local, gitignored
+artifacts; rerun the commands to reproduce them in another checkout. Inspect RGBA on a contrasting background:
+discarding its alpha when making a thumbnail shows the original RGB background.
+
+The app path used the rebuilt `target/stablediffusion-fx.jar`, Java 21, and temporary settings pointing at the GPU
+venv and existing checkpoints, then:
+
+```powershell
+python scripts/dev/mcp_scripts.py "C:\Program Files\Java\jdk-21\bin\java.exe" pixel_art,color_enhance,fsr_upscale,person_mask,remove_background,depthmap2mask,inpaint_background
+```
+
+Result: 7/7 succeeded. Temporary `config/settings.json` was removed after the run. The script now exits nonzero
+on a failed/empty selection instead of relying on its printed summary.
+
+Regression fixes demonstrated with failing tests before the fixes, then passing tests:
+
+- A uint32 generation seed above INT_MAX failed at OpenCV `setRNGSeed`; normalize to a signed 32-bit seed.
+- Pixel art's "original size" option cropped 65x49 to 64x48; restore the exact source dimensions.
+- `BaseEngine.image_tool` opened an RGB source twice and left the first handle open; decode inside a context manager.
+- Background inpainting discarded its auxiliary person-mask path without deleting it; release auxiliary outputs.
+
+Independent review found no critical/important issue. A minor remaining test gap is an explicit EXIF-orientation
+fixture for the image-tool loader; the current closure fixture is an ordinary RGB PNG.
+
+Final automated checks for this wave: Scala **474 passed**; GPU Python venv **257 passed**; torch-free venv
+**221 passed, 15 skipped**. `ui/assembly` produced the runnable jar. `scripts/extensions_matrix.py` still reports
+**83 done / 219 todo / 51 not applicable**; no new target was promoted by this verification-only wave.
+
+## Seamless tile inpainting (Codex, 2026-10-26)
+
+`seamless_tile` is a Scala img2img Script reimplemented from the documented behavior of
+`brick2face/seamless-tile-inpainting`: circular half-image offset, central seam mask, transient inpainting, and
+optional inverse offset. Controls cover Horizontal, Vertical, Both, mask width, blur, and restoring the layout.
+There is no new Python hook or dependency. It does not enable circular padding or claim exact edge equality.
+
+Actual Java 21 jar/MCP runs used the RTX 3090 and both `animekawa_v10` (SD1.5) and `waiIllustriousSDXL_v170` (SDXL).
+Each model completed four cases: Both/Horizontal/Vertical restored, plus Both without restoring. Inputs were
+512x512, seed 11, 20 steps, DPM++ 2M, mask width 96, blur 4, denoising strength 0.85. Stone-pavement and SD1.5 grass
+textures were inspected as repeated 2x2 tiles. These are ordinary checkpoints, not dedicated inpainting models.
+
+| Model / texture | Opposite-edge mean absolute RGB difference (0..255) |
+|---|---|
+| SDXL stone | input x=43.96 / y=31.46; Horizontal x=4.26; Vertical y=7.30; Both x=7.27 / y=9.88 |
+| SD1.5 grass | input x=8.36 / y=5.55; Horizontal x=6.28; Vertical y=4.38; Both x=5.44 / y=6.82 |
+| SD1.5 stone | input x=6.57 / y=4.39; Horizontal x=44.20; Vertical y=64.99; Both x=10.07 / y=64.07 |
+
+The last row is a failed improvement, retained as a limitation rather than omitted: this anime checkpoint can
+introduce new high-frequency edges in stone textures. Seam quality is model/prompt dependent; the upstream workflow
+recommends an inpainting model. Both-direction joins can retain minor seams. Lower boundary difference alone does
+not prove a good texture; all repeated previews were inspected as well. No dedicated inpainting checkpoint was
+downloaded or validated in this wave.
+
+Local, gitignored evidence: `outputs/verify-seamless/{sd15,sdxl,sd15-grass}.json`, corresponding `.jpg` comparison
+sheets, `*-metrics.json` measurements, and individual full-resolution 2x2 PNGs. Reproduction:
+
+```powershell
+# Configure the real GPU venv/checkpoints with scripts/dev/write_settings.py, as for the previous app check.
+python scripts/dev/mcp_scripts.py "C:\Program Files\Java\jdk-21\bin\java.exe" seamless_tile
+# Copy outputs/mcp-script-results.json before starting the next run.
+# Set SDFX_CHECKPOINT=waiIllustriousSDXL_v170 for SDXL; SDFX_TEST_PROMPT overrides the texture prompt.
+python/.venv-smoke/Scripts/python.exe scripts/dev/tile_review.py outputs/verify-seamless/sd15.json
+```
+
+The JavaFX form was captured in a separate dry-run home (`outputs/verify-seamless/ui-home`) and inspected in
+`ui.png` / `ui-panel.png`; all four controls and the description fit. Existing user UI state was not changed.
+
+Six Scala tests cover directional offsets, odd-size inverse, central band bounds, registration, batching and actual
+seeds, request flags, original arrangement, no-init rejection, cancellation and failure cleanup, and preserving
+engine infotext. Missing implementation and a wrong batch seed were observed before fixes. Review then found that
+rebuilding infotext discarded model/VAE/LoRA facts and actual variation seeds; a failing regression confirmed it,
+and final saving now preserves the engine's existing infotext. The review's cleanup test gaps were also covered.
+The final rebuilt jar completed another 4/4 SD1.5 app run; all four saved PNGs retained `Model hash` and the seamless
+settings in their `parameters` text (`outputs/verify-seamless/sd15-final.json`).
+
+Final checks: **480 Scala tests passed**, Python GPU venv **261 passed**, torch-free venv **225 passed / 15 skipped**.
+`ui/assembly` succeeded after the metadata fix. Coverage is now **84 done / 218 todo / 51 not applicable**;
+the 218 entries correspond to 153 distinct unfinished targets.
+
+The required licence refresh exposed an existing collector defect: transient GitHub failures could replace known
+MIT/AGPL notices with "no license file published". `scripts/third_party.py` now retries failed requests, distinguishes
+actual HTTP 404, aborts a persistent retrieval error before rewriting the table, and keeps archived text linked
+when upstream removes a licence file. Four tests passed after first demonstrating the incorrect behavior.
+Independent collector review found no important issue; explicit timeout-retry and whole-file unchanged-on-error
+fixtures remain minor test gaps. The new tile plugin's upstream AGPL-3.0 text is bundled under `licenses/`.
+The final live refresh succeeded for 109 projects; the existing SuperMerger and close-confirmation licences were
+retained, and two previously mislabelled MIT notices were restored. No fetched licence text was removed.
+
+## Weight Gradient (Codex, 2026-10-26)
+
+`weight_gradient` is an opt-in AlwaysOn plugin. Pure Python syntax rendering feeds the existing embedding scheduler;
+both positive and negative prompts support `{words : first-last step : first-last[-return] weight : curve}`.
+The interval and curve are optional (empty interval means the whole pass). Modes `a/e/ei/eo/c/ci/co` reproduce the
+upstream README's linear, exponential and circular numeric examples to four decimal places. Fractions floor to
+sampling steps; explicit percentages are also accepted. Escaped/malformed tags remain literal; balanced emphasis
+and A1111 editing/alternation inside the words compose with the gradient.
+
+Only the README was used: `DingoBite/weight_gradient`, file `readme.md`, blob
+`addaac1a522d33fcf896b29c04e84fe129d68cef`. The repository's licence endpoint returned 404. No upstream source code
+was read/copied; there is no new dependency.
+
+Gradient clocks restart in each pass and use actual img2img sampling steps. Plain img2img Alternative uses the full
+sampling count; masked/inpainting-model requests that fall back to normal img2img use its shorter count. Hires
+re-encodes inherited prompts if its sampling count differs. A1111 editing retains its separate hires-offset rules.
+Second-order samplers keep the same conditioning for both model evaluations of a logical inference step.
+PhotoMaker's separate text-only encoding path rejects gradient tags explicitly instead of silently ignoring them.
+
+Real-model checks used RTX 3090, SD1.5 `animekawa_v10` at 512x768 and SDXL `waiIllustriousSDXL_v170` at 832x832,
+seed 11, 16 steps. Fifteen images per model include normal weights, constant tags, fixed endpoints, exponential and
+return ramps, negative prompt ramp, hires (7 steps at 1.25x), img2img (strength 0.5), Alternative, Heun references,
+and a disabled-hook baseline after switching samplers. Reports/PNGs are local under
+`outputs/verify-weight-gradient/final/`, named `weight_sd15*` and `weight_sdxl*`.
+
+| Pixel MAE comparison | SD1.5 | SDXL |
+|---|---:|---:|
+| Constant tag vs equivalent ordinary weight, DPM++ 2M | 0 | 0 |
+| Constant tag vs equivalent ordinary weight, Heun | 0 | 0 |
+| Disabled afterward vs original DPM++ 2M baseline | 0 | 0 |
+| Exponential ramp vs fixed starting weight | 2.80 | 5.02 |
+| Exponential ramp vs fixed ending weight | 27.82 | 61.35 |
+| Heun ramp vs fixed starting weight | 3.61 | 6.60 |
+
+All responses completed without engine warnings; comparison sheets were inspected. Early weights can dominate
+composition (the SDXL low initial scarf weight produced a park without the person). A changing weight does not
+guarantee a particular intermediate subject or preserve identity; the constant controls distinguish normal model
+behavior from scheduling. The short six-step inversion Alternative diagnostic showed visibly stronger contrast
+on SDXL; its default-inversion comparison is recorded separately rather than treated as an aesthetic success.
+The focused default-inversion run (`outputs/verify-weight-gradient/alternative/weight_alt_sdxl.json`) reproduced
+the same oversaturation with ordinary fixed weights and the new hook disabled. A side-by-side image was inspected;
+this was an existing Alternative-path quality issue, not a claimed improvement by Weight Gradient. The following
+repair section records the subsequent amplitude fix and its remaining limits.
+
+The real Scala AppServices path (Plugin.process -> JobQueue -> Generator -> engine -> GPU) completed 1/1 on each
+model with the hook active and `Weight Gradient: True` in output infotext, recorded in
+`outputs/verify-weight-gradient/app-check.txt`. This was a direct app-service check, not an MCP protocol check.
+The rebuilt jar's form/help/compatibility note were inspected via an isolated dry-run home; final UI run exited 0.
+
+Reproduce engine checks:
+
+```powershell
+python scripts/dev/gpu_check.py python/.venv-smoke/Scripts/python.exe outputs/verify-weight-gradient/final weight_sd15
+python scripts/dev/gpu_check.py python/.venv-smoke/Scripts/python.exe outputs/verify-weight-gradient/final weight_sdxl
+```
+
+Independent review found two P2 timing bugs (Alternative count and second-order callbacks). Five regression failures
+were observed, then fixed; tests cover real installed Euler, Heun, DPM2, DPM2 ancestral and DPM++ SDE timestep arrays.
+Additional tests cover positive/negative schedules, pooled conditioning and CFG/PAG batch layout, inherited hires
+steps, feature advertisements and PhotoMaker rejection. Full suites: **481 Scala passed**, **300 Python GPU-venv
+passed**, **247 Python torch-free passed / 16 skipped**. `ui/assembly` succeeded. These tests complement, rather than
+replace, the real-model image checks.
+The refreshed extension ledger reports **85 done / 217 todo (152 targets) / 51 not applicable**. After promotion,
+BuiltinsSuite's 18 tests passed, including the check that every done entry names a registered plugin. Live notice
+collection completed for 110 projects and added the new reimplementation attribution without losing existing text.
+
+## img2img Alternative amplitude and replay repair (Codex, 2026-10-26)
+
+The quality follow-up used controlled sampler/CFG comparisons and direct latent probes. Reducing CFG alone did
+not resolve the observed excessive contrast. DDIMInverseScheduler's generic pixel clipping default was another
+real configuration bug (a valid latent 2.5 was reduced to about 0.962 instead of 2.405 after two zero-noise steps),
+but it was **not the cause in this loaded model**, whose scheduler already supplied `clip_sample=False`.
+
+The recovered SDXL inverse state had std 0.85673; `_img2imgalt` forced it to 1.0 after every blend. This amplified
+the recovered signal and also changed pure seeded random noise when Randomness=1. The repair preserves inverse
+amplitude and blends with `((1-r)*inverse + r*random) / sqrt((1-r)^2+r^2)`. It preserves both endpoints instead of
+estimating a new global normalization from the batch. No recolouring, CFG cap or sampler-default change was added.
+
+| Same SDXL portrait | Lightness std (LAB L) | Near-white RGB samples | Near-black RGB samples |
+|---|---:|---:|---:|
+| Source | 24.25 | 1.11% | 1.61% |
+| Before: DPM++ 2M, CFG6 / Decode CFG1 | 34.91 | 14.19% | 28.67% |
+| After: identical settings | 30.34 | 4.51% | 14.16% |
+| After: matched DDIM, CFG1 / Decode CFG1 | 24.64 | 1.06% | 1.71% |
+
+Metrics count RGB samples >=0.98 or <=0.02, not entire clipped pixels. Images and all grid cases were inspected;
+the matched reconstruction is close in colour/contrast, not pixel-identical. High CFG, different samplers and
+coarse inversion can still change contrast/composition. This remains a DDIM approximation; it does not implement
+the parent's legacy Euler/sigma-adjustment inversion option.
+
+Separate fixes make Decode CFG0 and 0.5 meaningful (unconditional/interpolated rather than treated as 1), keep SDXL
+pooled conditioning/time-id batch layout correct, and explicitly disable pixel-range clipping for all inverse
+configurations. The app now saves `Decode prompt`, `Decode negative prompt` and the effective `Decode steps`,
+including zero-means-sampling-steps fallback. Help text explains approximate inversion and randomness endpoints.
+
+Evidence and reproduction (all artifacts local/gitignored under `outputs/`):
+
+```powershell
+python scripts/dev/gpu_check.py python/.venv-smoke/Scripts/python.exe outputs/verify-alternative-final alt_quality_sdxl
+python scripts/dev/gpu_check.py python/.venv-smoke/Scripts/python.exe outputs/verify-alternative-final alt_quality_sd15
+```
+
+Each model completed a source plus 12 comparisons: DPM++/Euler/DDIM, Decode CFG0/.5/1/2/6 and Randomness=1.
+Both Randomness=1 outputs had **zero pixel MAE** from ordinary txt2img with the same seed and matching parameters,
+with variation strength zero. JSON reports are `verify-alternative-final/alt_quality_{sd15,sdxl}.json`; comparison
+images include `comparison.jpg`, `sd15-grid.jpg` and `sdxl-grid.jpg`. Original failing grids are retained under
+`verify-alternative-diagnosis`; runtime-only normalization/endpoint probes are under `verify-alternative-latents`.
+`scripts/dev/alt_latent_probe.py` explicitly forces normalized/raw variants to keep that comparison reproducible
+after the production fix.
+
+The rebuilt Java 21 jar -> MCP -> Scala Script -> Python engine path completed **1/1 per model** with the default
+50 decode steps. `verify-alternative-final/app-{sd15,sdxl}.json` records paths; both PNGs were inspected and contain
+the new replay keys/effective decode count. Temporary app settings were restored/removed. The updated form was
+captured in a separate dry-run home (`ui.png`/`ui-panel.png`) and inspected; the process exited 0.
+
+Analytic tests first showed six clipping/CFG failures and three amplitude/endpoint failures, then **14/14 passed**.
+The Scala replay test failed with missing `Decode prompt` before its fix, then BuiltinsSuite **18/18 passed**.
+Full Python: **314 passed** in the GPU venv, **247 passed / 17 skipped** without torch. `ui/assembly` succeeded.
+Independent review found no important production defect; its stale docstring finding was corrected. No new
+dependency, source licence or extension target was added; the ledger remains **85 done / 217 todo / 51 na**.
+
+## NegPiP (Codex, 2026-10-26)
+
+`python/sdfx/negpip.py` and `NegPipPlugin.scala` implement the CLIP path of hako-mikan/sd-webui-negpip (AGPL-3.0;
+inspected source blob `33c9b138272bfb855612bdcec5488a72f03d384b`). Negative-weight segments are removed from the
+base prompt and independently encoded with their absolute weight. Content/EOS context is appended; attention keys
+remain positive, while the value projection output (including bias) is negated. SDXL pooled vectors come from the
+cleaned base prompt. Added padding is excluded from softmax. A private sign channel travels with CFG/PAG and
+scheduled tensors and is removed before native attention. Native processors/parameter paths stay intact; forward
+wrappers and temporary hooks are restored in finally, including inversion in img2img Alternative.
+
+Reproduce each real-model run separately:
+
+```text
+python/.venv-smoke/Scripts/python.exe scripts/dev/gpu_check.py python/.venv-smoke/Scripts/python.exe outputs/verify-negpip-sd15 negpip_sd15
+python/.venv-smoke/Scripts/python.exe scripts/dev/gpu_check.py python/.venv-smoke/Scripts/python.exe outputs/verify-negpip-sdxl negpip_sdxl
+```
+
+Both completed 15 variants (16 images including batch size 2): ordinary baseline, enabled without negative weights,
+ordinary signed weighting, NegPiP -1/-2, negative branch, editing onset, Weight Gradient crossing zero, batch, PAG,
+hires, CFG1, img2img, Alternative and restored baseline. All had no warnings. JSON reports and inspected grids
+are in those output folders. Enabled without negative weights and restored baseline both had **zero pixel MAE**
+against the ordinary baseline on both models. NegPiP differed from ordinary signed weighting and from its other
+strength. These are behavioral and isolation checks, not proof of a reliable concept classifier or exact upstream
+pixel parity. The SD1.5 -1 case visibly lightened black hair; -2 broke the subject. SDXL -1 changed style and -2
+removed the subject. This model-dependent strength limit is described in the form; no clamping/recolouring was added.
+
+`RealAlwaysOnCheck ... negpip` completed **1/1 on each model** through AppServices -> plugin -> queue -> generator ->
+real Python engine. It asserted hook and replay infotext; saved PNGs were inspected. This is the app-service path,
+not an MCP transport check. Logs: `outputs/negpip-app-{sd15,sdxl}.log`. The isolated dry-run UI exited 0 and its
+expanded form was inspected (`outputs/verify-negpip-ui/ui-panel.png`).
+
+Tests cover extraction/escaping/BREAK, branch isolation/token cropping/pooled vectors, schedule padding/crossings,
+post-projection bias, unequal CFG signs, fused projections, existing masks, no-op identity, modifier metadata and
+cleanup after processor exceptions. Missing-module RED preceded implementation; final full Python **323 passed**,
+torch-free **250 passed / 23 skipped**. Full Scala **482 passed**, including opt-in/replay and registry checks;
+`ui/assembly` succeeded. Independent review found
+no important defect; an extra CPU experiment used actual IPAdapterAttnProcessor2_0 with tuple context and verified
+finite results plus exact baseline restoration. SD2, actual ControlNet/IP-Adapter weights combined with offload,
+and newer upstream LLM architectures were not GPU-verified. PhotoMaker's text-only path rejects negative terms.
+
+No new dependency. The ledger is **86 done / 216 todo (151 targets) / 51 na**; the overall goal remains unfinished.
+
+## Neutral Prompt foundation only (Codex, 2026-10-26)
+
+`python/sdfx/neutral_prompt.py` contains the MIT-adapted parser/expression tree and per-image denoised-x0
+composition for AND / AND_PERP / AND_SALT / AND_TOPK, nested groups, signed weights and mean/std CFG rescale.
+**It is not connected to generation.** No plugin, feature advertisement, runtime compatibility, UI or real-model
+success is claimed. The target remains todo; the plan lists the remaining scheduler/conditioning and image gates.
+
+Initial missing-module RED preceded implementation. Eighteen targeted tests pass: ordinary editing and escaped
+keywords, nested/group weights, non-finite rejection, nesting bound, independent batch projections, saliency
+softmax selection, upstream inclusive kthvalue threshold, once-only weights, rescale and degenerate tensors.
+Extreme nonzero normal scales and tiny nonzero std each reproduced a failure before their numerical repairs.
+Max-scaled projection avoids norm underflow/overflow; standardizing before rescaling avoids an overflowing std ratio.
+
+Direct CPU comparison of six expression trees and 20 random prediction sets each (seed 231, C=4/H=W=8) matched the
+upstream visitor composition within 2e-5 relative/absolute tolerance (maximum absolute error 7.63e-6), recorded in
+`outputs/neutral-reference-parity.log`. Independent review also compared 169 parser cases and 100 random trees;
+its only finding was the now-fixed tiny-std clamp. Source blob IDs are in the implementation plan. No exact pixel
+equivalence is implied by these finite synthetic checks.
+
+After the final numerical edit, full Python **341 passed**, torch-free **260 passed / 31 skipped**. Scala/runtime
+files were unchanged in this foundation wave, so the previous 482 Scala tests and jar remain the last such checks;
+they do not validate a Neutral Prompt runtime. Notice collection completed for 112 projects, adding the MIT source
+and original licence text while preserving all prior notices. Ledger unchanged at **86 done / 216 todo / 51 na**.
+
+## Neutral Prompt runtime stage 1 (Codex, 2026-10-26; still todo)
+
+`neutral_runtime.py` and Engine leaf encoding/adjustment/install now connect the expression tree to real UNet
+predictions through raw `hooks.neutral_prompt`. Each leaf is evaluated on the same input/timestep with its own
+text/pooled conditioning and schedule. The negative prompt remains unconditional conditioning. Composition uses
+denoised-x0 differences; at rescale=0 it avoids subtracting/reconstructing a large common x0 baseline, which loses
+float32 precision near the end of sampling. Ordinary single prompts at rescale=0 bypass the runtime entirely.
+
+Per-stage CPU tests compare native x0 conversion for DDIM, Euler/ancestral/LMS, Heun, DPM2/ancestral, DPM++ SDE,
+DPM++ multi/single and UniPC, with epsilon/v/sample predictions where supported. LCM boundary output is checked
+separately. Zero-SNR v-prediction and infinite-sigma limits are finite; undefined zero-SNR epsilon fails clearly.
+Inverse DDIM uses the input's earlier noise level, reproduced failing against native before its correction.
+This does not implement Alternative: its initial zero-noise composition rule remains unresolved and guarded.
+Detail Daemon's per-row timestep change was another review finding; it is explicitly guarded pending integration.
+
+```text
+python/.venv-smoke/Scripts/python.exe scripts/dev/gpu_check.py python/.venv-smoke/Scripts/python.exe outputs/verify-neutral-runtime-sd15 neutral_sd15
+python/.venv-smoke/Scripts/python.exe scripts/dev/gpu_check.py python/.venv-smoke/Scripts/python.exe outputs/verify-neutral-runtime-sdxl neutral_sdxl
+```
+
+Each model completed 18 variants / 19 images: baseline/no-op/restored, AND/PERP/SALT/TOPK, nested negative group,
+CFG rescale .7, editing, batch 2, CFG1, hires/img2img, Euler, Heun editing, NegPiP and Weight Gradient leaves. All
+had no warnings. JSON reports and inspected grids are in the corresponding folders. No-op and restored baseline
+both have **zero pixel MAE** on each model. SD1.5/SDXL SALT/TOPK cases visibly added the red scarf; effects/style
+depend on model, operator and weight. No upstream pixel parity or reliable semantic isolation is claimed.
+
+Runtime tests cover branch encoding/schedules, ordinary no-op, trailing leaf weights, CFG0/.5/1, XL time IDs/pooled
+batch duplication, cleanup after exceptions, logical-stage callbacks, pending-combination rejection and large-shared-
+baseline precision. Independent review additionally checked 32 CFG/batch/rescale combinations against the reference
+composition and found the two issues described above. All 41 runtime tests pass. Final full Python **382 passed**
+(four known torchsde Brownian endpoint-rounding warnings); torch-free **260 passed / 32 skipped**. No Scala source
+or jar changed in this stage. Source/dependencies were already attributed; no additional licence refresh was needed.
+
+**Unfinished:** Scala plugin/form/formatter/replay and actual app-service/UI checks; ControlNet/PAG, PhotoMaker,
+IP-Adapter/Reference/ControlLLLite, CADS/SAG, CFG Schedule/APG/Mahiro/Latent Modifier/Dynamic Thresholding/Detail Daemon,
+and Alternative combinations. Active composed prompts reject these explicitly in `neutral_runtime.validate`
+rather than silently using first-leaf residuals/conditioning. Those restrictions are temporary unfinished work,
+not a narrower definition of success. Ledger remains **86 done / 216 todo / 51 na**, target `neutral_prompt` todo.
+
+## Neutral Prompt UI and Alternative (Codex, 2026-10-26; remaining combinations still todo)
+
+The registered Scala plugin now exposes enable, CFG rescale, syntax/nesting/cost help and an optional formatter
+with all four keywords and signed weights. Saved PNGs contain the effective combined prompt plus `Neutral Prompt`
+and `CFG Rescale phi`. Reprocessing saved settings does not append an existing formatter suffix twice, including
+when the original main prompt is empty. Missing-class RED preceded the plugin; the empty-prompt replay regression
+failed before its fix. The rebuilt expanded form was visually inspected; screenshot process exited 0:
+`outputs/verify-neutral-ui/ui-panel.png` and `form-crop.png`.
+
+Actual `RealAlwaysOnCheck ... neutral_prompt` passed **1/1 per SD1.5/SDXL** through plugin -> AppServices -> queue ->
+generator -> Python/GPU. Assertions check formatted prompt, hook and both replay keys; saved images inspected
+(`outputs/verify-neutral-app-{sd15,sdxl}`). This is app-service verification, not an MCP transport test.
+
+Alternative now encodes each composed decode leaf at the inversion step count, with a separate batch-1 schedule.
+Generation retains its own schedule/batch. Wrapper cleanup covers exceptions. Ordinary decode overrides keep the
+legacy encoding route when Neutral performs no composition: review found and fixed an accidental embedding-
+adjustment change on that no-op path, with a weights-free Revision-like regression.
+
+DDIM inversion can start at exactly zero noise, where direct division by the x0 prediction coefficient is undefined.
+The chosen startup rule extends the positive-noise composition: PERP/TOPK preserve their homogeneous noise deltas;
+SALT uses centered absolute activations and higher centered moments when the first term ties. Equal multisets or
+float64-indistinguishable moments retain original ordering. Rescale's limit projects the delta onto constant and
+centered-image components; constant images use noise-space rescale. Numerical-limit tests and the actual inverse
+loop with constant analytic predictions cover CFG0/.5/1/2 and phi0/.7. This is an explicit app design for its DDIM
+approximation, not a claim of exact upstream img2img Alternative parity. Review's SALT tie counterexample now passes.
+
+```text
+python/.venv-smoke/Scripts/python.exe scripts/dev/gpu_check.py python/.venv-smoke/Scripts/python.exe outputs/verify-neutral-alt-sd15 neutral_alt_sd15
+python/.venv-smoke/Scripts/python.exe scripts/dev/gpu_check.py python/.venv-smoke/Scripts/python.exe outputs/verify-neutral-alt-sdxl neutral_alt_sdxl
+```
+
+Each completed 12 variants without warnings, covering four operators, decode CFG0/.5/1, rescale, editing, NegPiP and
+50 decode steps. JSON reports/grids in these folders were inspected. Both models have **zero pixel MAE** for
+baseline/no-op, baseline/restored and ordinary Alternative/Neutral-enabled no-op. The startup limit is validated
+analytically/native, separately from those particular model configurations. Scarf effects/style vary by operator
+and model; these finite checks do not prove reliable semantic isolation.
+
+Final full Scala **483 passed**, Python **396 passed** (four known torchsde endpoint-rounding warnings), torch-free
+**260 passed / 32 skipped**. Jar built; runtime module 55 tests. Source/dependency licences were already collected.
+Still unfinished: ControlNet/PAG, PhotoMaker, IP-Adapter/Reference/ControlLLLite, CADS/SAG and guidance/timestep
+modifiers in `neutral_runtime.validate`. Their guards remain explicit; target stays todo and ledger **86/216/51**.
+
+## Neutral Prompt with PAG and ControlNet (Codex, 2026-10-26; remaining modifiers still todo)
+
+PAG now composes each leaf's ordinary and perturbed predictions separately relative to ordinary unconditional
+conditioning. Native PAG/adaptive scale is applied after composition. Neutral's phi modifies the CFG result while
+preserving the difference between unrescaled composed ordinary/perturbed results. Non-CFG PAG uses four internal
+groups (negative, positive, perturbed-negative, perturbed-positive) to satisfy the real PAG processor's half split;
+the pipeline receives its normal two groups. CFG PAG retains native three groups. Extra XL pooled/time IDs follow
+the same layout. Review caught scale=0 requesting PAG groups despite native PAG being inactive; the regression
+failed first, then passed after using actual native batch layout to detect activation.
+
+`neutral_controlnet.py` records native ControlNet input/scale/image state each step. Each leaf gets recomputed text/
+pooled/time-ID-conditioned residuals, replacing first-leaf residuals. Scale windows and multiple images/models stay
+native. Guess-mode conditional-only residuals get zero negative padding. PAG ordinary/perturbed positive groups
+share positive ControlNet residuals because PAG perturbs UNet attention. Capture is suspended while replaying and
+restored even after errors; hooks are removed on cleanup. Parameters/processors are not replaced.
+
+```text
+python/.venv-smoke/Scripts/python.exe scripts/dev/gpu_check.py python/.venv-smoke/Scripts/python.exe outputs/verify-neutral-pag-sd15 neutral_pag_sd15
+python/.venv-smoke/Scripts/python.exe scripts/dev/gpu_check.py python/.venv-smoke/Scripts/python.exe outputs/verify-neutral-pag-sdxl neutral_pag_sdxl
+python/.venv-smoke/Scripts/python.exe scripts/dev/gpu_check.py python/.venv-smoke/Scripts/python.exe outputs/verify-neutral-cn-sd15 neutral_cn_sd15
+python/.venv-smoke/Scripts/python.exe scripts/dev/gpu_check.py python/.venv-smoke/Scripts/python.exe outputs/verify-neutral-cn-sdxl neutral_cn_sdxl
+```
+
+PAG: 12 cases per model, including PERP/SALT/TOPK, phi .7, CFG1, batches, Heun editing, adaptive scale and NegPiP.
+ControlNet: 13 cases per model, including multiple-model/window scales, CFG1/batch, editing, phi, NegPiP and joint
+PAG (CFG on/off). All completed without warnings; no-op and after-disable restoration have **zero pixel MAE**
+against native PAG/ControlNet baselines. JSON reports and grids in these output folders were inspected. Semantic
+effects vary: canny constraints can retain source geometry strongly. No universal concept-isolation claim.
+The scale-zero regression also passed four live cases per model (`neutral_pag_zero_{sd15,sdxl}`), including CFG1;
+composed baseline/no-active-PAG and restored outputs are pixel-identical. Reports: `outputs/verify-neutral-pag-zero-*`.
+
+Models are external verification assets, not bundled: SD1.5 `comfyanonymous/ControlNet-v1-1_fp16_safetensors`,
+`control_v11p_sd15_canny_fp16.safetensors` (SHA256 `8932b66e15aae835b3490dbf989f56c253104cee08a88bf21283762f557c9f10`);
+SDXL `diffusers/controlnet-canny-sdxl-1.0`, `diffusion_pytorch_model.fp16.safetensors` (SHA256
+`b2e7d3921058a442cc80430d1ec8847f42599c705e2451c95e77cf4dcf8d6c25`). Source manifests/bytes are retained under
+`outputs/controlnet-models`. The first SD1.5 attempt incorrectly treated A1111 keys as a diffusers directory;
+correcting the test's single-file input resolved loading. No production loader change/random initialization.
+
+Independent review used real PAG processors in 24 CFG/batch/phi/operator cases and a small real ControlNetModel
+with deliberately nonzero residual layers; branch recomputation matched direct computation in ordinary/guess mode.
+Guess mode is CPU-verified, not an extra real-checkpoint GUI-mode claim; the existing app UI has no explicit guess
+toggle. Runtime/ControlNet tests **99 passed**. Full Python **440 passed**, torch-free **260 passed / 33 skipped**;
+four existing torchsde endpoint warnings remain. Full Scala **483 passed**, jar built. The form's compatibility
+help now lists ControlNet/PAG support. No new dependency/source licence; existing diffusers attribution covers it.
+
+Still pending: PhotoMaker, IP-Adapter/Reference/ControlLLLite, CADS/SAG and guidance/timestep modifiers; explicit
+guards remain for these. `neutral_prompt` is still todo, total ledger **86 done / 216 todo / 51 na**.
+
+## Neutral Prompt with IP-Adapter (Codex, 2026-10-26; remaining image/modifier integrations still todo)
+
+`neutral_ip.py` obtains native positive/negative image features at batch 1 with gradients disabled, reuses them
+in the native pipeline, and supplies canonical image features to every internal CFG/PAG text branch. This covers
+Plus hidden-state negatives (blank-image encoding, not fabricated zeros). Multiple adapter tensor/token dimensions
+remain intact. Image encoding happens once per pass; text leaves reuse the resulting image condition.
+
+Derived pipelines now receive the shared base image encoder/feature extractor after adapter load/unload. Offload
+hooks are removed before components change, and placement rebuilt afterwards. PAG cleanup snapshots processors
+after IP setup, preserving loaded IP projections on success or error. Alternative also prepares/passes image
+conditions before inversion, for plain and composed prompts and the entire Decode CFG slider. It previously could
+miss required image conditions on repeated runs with an adapter already loaded.
+
+Lifecycle regressions first failed, then passed: missing paths preserve an existing adapter; failed loads request
+native cleanup; same-path image-encoder changes invalidate the cache; freeing/reloading a checkpoint clears the
+loaded-adapter record. Review additionally found SD1.5 native unload retaining an old crop. With the app's disabled
+safety checker, registering a new encoder now rebuilds the native-style CLIP extractor at its configured image
+size. A real tiny CLIP 16->32 forward failed before the fix and passes after it. This is not a claim about arbitrary
+non-CLIP encoder/normalization formats.
+
+```text
+python/.venv-smoke/Scripts/python.exe scripts/dev/gpu_check.py python/.venv-smoke/Scripts/python.exe outputs/verify-neutral-ip-sd15 neutral_ip_sd15
+python/.venv-smoke/Scripts/python.exe scripts/dev/gpu_check.py python/.venv-smoke/Scripts/python.exe outputs/verify-neutral-ip-sdxl neutral_ip_sdxl
+python/.venv-smoke/Scripts/python.exe scripts/dev/gpu_check.py python/.venv-smoke/Scripts/python.exe outputs/verify-neutral-ip-reload-sd15 neutral_ip_reload_sd15
+python/.venv-smoke/Scripts/python.exe scripts/dev/gpu_check.py python/.venv-smoke/Scripts/python.exe outputs/verify-neutral-ip-reload-sdxl neutral_ip_reload_sdxl
+```
+
+Main matrix: 21 cases each on SD1.5/SDXL, including basic/Plus, PERP/SALT/TOPK, rescale, CFG1/batch, repeated PAG,
+Heun editing, hires/img2img, ControlNet, Alternative and reload of basic after Plus. All completed with no warnings.
+Five comparison pairs are **zero pixel MAE** per model: native IP/no-op, native IP/restored, original no-IP/unloaded,
+PAG/repeated PAG, and ordinary Alternative/Neutral no-op Alternative. Grids/JSON reports were inspected. The SDXL
+basic-IP native baseline itself produces a strong style/contrast shift on waiIllustriousSDXL_v170 at scale .6;
+no-op equality isolates it from Neutral composition. It remains a checkpoint/adapter pairing-quality limitation.
+
+Focused lifecycle matrix: six cases each, including same-checkpoint reload with IP loaded, repeated PAG, NegPiP
+and unload. SD1.5 runs in **model_offload**, SDXL in **GPU** mode. Reload/baseline, repeated PAG and unloaded/no-IP
+all match exactly. SDXL/sequential offload was not tested here. Current-stage results are backend JSONL checks;
+the earlier app-service check still covers the unchanged plugin request/replay path, not every new combination.
+
+Models are external assets from `h94/IP-Adapter`: `models/ip-adapter_sd15.safetensors`,
+`models/ip-adapter-plus_sd15.safetensors`, `sdxl_models/ip-adapter_sdxl.safetensors`, and
+`sdxl_models/ip-adapter-plus_sdxl_vit-h.safetensors`. Basic uses the native H/G encoder defaults; Plus uses the
+H encoder under `models/image_encoder`. Bytes, URLs and SHA256s are retained in each main folder's
+`adapter-sources.json`. They are not bundled into the application.
+
+Independent review compared a real small UNet with native IP projection/processors across 16 CFG/batch/PAG/phi
+cases (maximum error 1.91e-6) and actual Plus resampling across four cases (maximum 9.54e-7). Its cache/extractor
+findings were fixed. All 27 IP tests pass. Final full Python **467 passed** (four known torchsde endpoint warnings),
+torch-free **260 passed / 34 skipped**; full Scala **483 passed**, jar built. No new dependencies/source licences.
+At that stage, guarded combinations still included PhotoMaker, Reference/ControlLLLite, CADS/SAG and guidance/timestep modifiers;
+target stays todo and the extension ledger remains **86/216/51**.
+
+## Neutral Prompt — Reference / ControlLLLite integration (2026-10-26)
+
+`ReferenceOnlyHook` and `ControlLLLiteHook` now have a managed per-branch lifecycle. Runtime activates LLLite's
+step window before Reference writes a bank using that leaf's text/pooled/image conditioning. It writes through
+the saved UNet forward, without recursively composing prompts, and clears the bank after every branch, including
+failures. Reference uses the scheduler's actual input noise level (including intermediate solver stages and inverse
+DDIM), and its positive fidelity mask follows the actual CFG/PAG layout. Native PAG identity groups are preserved.
+Separate spatial key/value projections retain LLLite image conditioning for the reference tokens; combined-context
+normalization still precedes projection. Both guards have been removed; the other pending guards remain.
+
+Installation helpers register cleanup before installation, covering partially installed hooks. Alternative inversion
+sets them up against the initialized inverse scheduler, and the forward latent pass now retains the init image for
+LLLite's optional image fallback. Ordinary/no-composition prompts keep the existing root-hook path.
+
+Main backend JSONL matrices: `outputs/verify-neutral-reference-sd15/neutral_reference_sd15.json` (15 cases) and
+`outputs/verify-neutral-reference-sdxl/neutral_reference_sdxl.json` (21). They cover Reference, PERP/SALT/TOPK,
+rescale, CFG1/batching, editing/Heun, PAG, img2img and Alternative; SDXL adds real LLLite windowed conditioning,
+Reference+LLLite+PAG, CFG1/batching and Alternative with interpolated decode CFG. All returned no result warnings.
+Three SD1.5 and four SDXL comparisons are **zero pixel MAE**: native Reference/no-op, composed prompt/Reference
+weight zero, disabled/restored, and native LLLite/no-op on SDXL. Contact sheets and images were inspected.
+
+Focused pass checks add three SD1.5 and five SDXL cases in `outputs/verify-neutral-reference-passes-{sd15,sdxl}`:
+Reference hires at 640x960/1024x1024, joint Reference+LLLite hires, and Alternative using the init-image fallback
+instead of an explicit LLLite image. They returned no result warnings, and baseline/restored are pixel-identical
+in both folders. Their contact sheet was inspected; the four-step SD1.5 hires example is soft. To reproduce, set
+`SDFX_REFERENCE_FOCUS=passes` and use the same commands with the focused output directories.
+
+Visual limits: on waiIllustriousSDXL_v170, the existing native Reference path itself strongly changes saturation
+and contrast. The short Alternative cases are especially posterized. Composition, inverse editing and PAG can
+amplify these changes; the equality checks establish restoration/no-op behavior, not a quality improvement.
+SD1.5's CFG1 cases also produce a looser painted style. These runs use GPU mode and four-channel SD1.5/SDXL
+checkpoints; sequential offload, native nine-channel inpainting checkpoints and GPU cancellation are not tested
+in this wave. Exception cleanup is covered by CPU tests. Current checks use the backend JSONL path; the earlier
+app-service checks cover the unchanged formatter/request/replay path.
+
+LLLite verification weights: `kohya-ss/controlnet-lllite/controllllite_v01032064e_sdxl_canny_anime.safetensors`,
+SHA256 `d51729ea113eee127b6ddf6db08a4e926fe42ac976e977de68fd354d3157635a`.
+The source URL/path/hash are retained in `adapter-sources.json`; weights remain external ignored assets. No new
+dependency or source licence was added.
+
+Independent read-only review found no material wiring defects. Full Python **508 passed** (four existing torchsde
+endpoint warnings); torch-free **260 passed / 35 skipped**. Reference tests: **41 passed**, including native attention
+comparisons, real PAG processors, inverse hook setup/cleanup and partial installation failures. Full Scala **483
+passed**, jar rebuilt. JUnit reports: `outputs/verify-reference-integration{,-no-torch}.xml`. At that stage, guards were
+PhotoMaker, CADS/SAG, CFG Schedule/APG/Mahiro/Latent Modifier/Dynamic Thresholding/Detail Daemon. The target is
+still todo and the ledger remains **86/216/51**.
+
+```text
+python/.venv-smoke/Scripts/python.exe scripts/dev/gpu_check.py python/.venv-smoke/Scripts/python.exe outputs/verify-neutral-reference-sd15 neutral_reference_sd15
+python/.venv-smoke/Scripts/python.exe scripts/dev/gpu_check.py python/.venv-smoke/Scripts/python.exe outputs/verify-neutral-reference-sdxl neutral_reference_sdxl
+```
+
+## Neutral Prompt — CFG Schedule / CADS integration (2026-10-26)
+
+`neutral_sampling.Controller` owns fresh per-pass state, including Alternative inversion against the actual inverse
+scheduler. CFG Schedule uses the existing curve/progress contract, then composition/phi use that effective CFG.
+Runtime reconstructs the fixed-CFG pipeline output while retaining the raw PAG conditional/perturbed difference.
+The existing CFG-off ignore rule remains. CADS perturbs each positive leaf once before CFG/PAG copies and image
+conditioning. Same-shaped negative contexts share random draws; each leaf retains its own input and metadata.
+Pooled embeddings are left unchanged, as in the existing CADS implementation. Scheduled/encoded tensors are not
+mutated. The two legacy root hooks are skipped only when composition is active.
+
+Review found that sharing a whole transformed negative tensor could replace another leaf's signs/padding; it now
+shares only random noise. Additional RED/GREEN tests found the ordinary CADS root hook also perturbed NegPiP's
+private channel. Shared `cads_context` now preserves those signs and zero padding in both paths. Unmarked legacy
+noise math is unchanged. Independent read-only review approved these corrections.
+
+Backend matrices: `outputs/verify-neutral-sampling-{sd15,sdxl}/neutral_sampling_{sd15,sdxl}.json`, **23 cases each**.
+They cover native/no-op, constant/zero/varying CFG, phi, CADS positive/negative noise and repeats, PAG, CFG1/batch,
+editing/Heun, NegPiP, Reference, hires, img2img and Alternative. Each model has seven pixel-identical comparison
+pairs: native CADS/no-op, native CFG Schedule/no-op, composed/constant CFG, composed/CADS gamma1, repeated CADS,
+zero CFG/zero schedule, and disabled/restored. Metadata focus matrices add **five cases each** in
+`outputs/verify-neutral-sampling-metadata-{sd15,sdxl}`: signed ordinary CADS, Neutral no-op, repeat and restoration,
+with three exact pairs each. All **56 cases** returned no result warnings; all **20 comparison pairs** have zero
+pixel MAE. Main and metadata contact sheets were inspected.
+
+Visual limits: CADS can strongly change style/content; the native and composed SDXL cases can introduce manga
+panels and generated text. The short Alternative cases and four-step hires settings have their own strong/soft
+style changes. CFG0 intentionally loses positive guidance. Finite equality checks establish numerical no-op,
+repeatability and restoration properties, rather than a general quality improvement. These are GPU-mode backend
+checks; offload modes, GPU interruption and every cross-product of image adapters were not retested here.
+
+Current Python suite: **550 passed**, four existing torchsde endpoint warnings; torch-free **260 passed / 36 skipped**.
+`test_neutral_sampling.py`: **42 passed**, including exact native noise, metadata preservation, per-branch context
+preparation, CFG/phi/PAG math and the real inverse loop at zero noise. JUnit reports:
+`outputs/verify-neutral-sampling-{tests,no-torch}.xml`. No new dependencies, weights or source licences.
+
+At that stage, ordinary CADS/CFG Schedule still needed a native PAG batch repair; the composed controller already
+used explicit groups. PhotoMaker, SAG, APG, Mahiro, Latent Modifier,
+Dynamic Thresholding and Detail Daemon remain guarded. The extension ledger remains **86/216/51**, target todo.
+The next-task CPU probe (`outputs/neutral-ordinary-pag-probe.json`) confirms a three-group CFG Schedule mismatch
+(actual 11, expected 5), default CADS changing the negative context, and different CADS contexts in PAG's two
+positive copies. Those ordinary-PAG issues are repaired in the next section; the main matrices above exercise composed PAG.
+
+Scala full regression initially exposed a test-only race in pending-queue cancellation. It now waits for the first
+JobStarted and holds that worker until pending/cancel/clear checks finish, with unconditional latch/listener cleanup.
+Targeted queue tests: **14 passed**. Final full Scala: **483 passed**, jar rebuilt. No product queue code changed.
+
+```text
+python/.venv-smoke/Scripts/python.exe scripts/dev/gpu_check.py python/.venv-smoke/Scripts/python.exe outputs/verify-neutral-sampling-sd15 neutral_sampling_sd15
+python/.venv-smoke/Scripts/python.exe scripts/dev/gpu_check.py python/.venv-smoke/Scripts/python.exe outputs/verify-neutral-sampling-sdxl neutral_sampling_sdxl
+```
+
+Set `SDFX_SAMPLING_FOCUS=metadata` and use the metadata output directories for the focused checks.
+
+## Ordinary CADS / CFG Schedule with PAG (2026-10-26)
+
+Repaired the two ordinary root hooks identified by the preceding CPU probe. Both now read the native pipeline's
+PAG activity lazily, after `__call__` initializes scale/layers. CFG Schedule handles `[u,c,p]` by moving c and p
+together: native guidance becomes `u + g_t*(c-u) + pag_scale*(c-p)`. Its constant-CFG case is an exact no-op,
+including fp16. CADS handles `[u,c,p]` or CFG-off `[p,p]`, perturbs each canonical positive context once and copies
+it for PAG. Default negative conditioning and NegPiP signs/padding survive. Inactive PAG retains the previous
+non-PAG draw layout; composed prompts still use their controller instead of these hooks.
+
+Independent read-only review checked installed diffusers 0.32.2's PAG staging/property and found no material issue.
+`test_sampling_pag.py`: **56 passed**, including batches 1/2, CFG/PAG off/on, tuple/object output, zero/constant CFG,
+real native PAGMixin activity after install, empty applied layers/scale zero, gamma1, metadata and draw identity.
+Full Python: **606 passed**, four existing torchsde warnings. Torch-free: **260 passed / 37 skipped**. Reports:
+`outputs/verify-ordinary-pag-{tests,no-torch}.xml`. No Scala/UI changes or fresh Scala build in this Python-only wave.
+
+Real GPU backend matrices: `outputs/verify-sampling-pag-{sd15,sdxl}/sampling_pag_{sd15,sdxl}.json`, **24 cases each**.
+They cover ordinary/no-op/composed PAG, variable/constant CFG, CADS/repeat, joint use, batch, CFG1, signed NegPiP,
+zero/adaptive PAG, Heun, hires, img2img, Alternative and disabled restoration. All returned no result warnings.
+Six within-run pairs per model are pixel-identical: PAG/constant CFG, ordinary/no-op CADS, ordinary/no-op CFG
+Schedule, repeated CADS, zero-PAG/non-PAG joint use, baseline/restored. Non-PAG CADS and variable CFG Schedule also
+match their previous-wave images exactly. Total **48 cases / 16 exact comparisons**; contact sheets inspected.
+Historical comparisons require the prior `outputs/verify-neutral-sampling-*` assets and are recorded when present.
+
+Visual limits remain: CADS materially changes style/content. On waiIllustriousSDXL_v170, joint CADS/high initial
+CFG can produce off-prompt objects, including in the PAG-disabled comparison. The repair establishes correct
+grouping/formulas and preservation properties; it does not establish universal prompt fidelity. Short-step hires
+can be soft. These are GPU-mode backend checks; other guidance modifiers and offload modes were not retested here.
+
+No new dependency, model or source licence. Remaining Neutral guards are PhotoMaker, SAG, APG/Mahiro, Latent
+Modifier, Dynamic Thresholding and Detail Daemon. The target stays todo and the ledger remains **86/216/51**.
+
+```text
+python/.venv-smoke/Scripts/python.exe scripts/dev/gpu_check.py python/.venv-smoke/Scripts/python.exe outputs/verify-sampling-pag-sd15 sampling_pag_sd15
+python/.venv-smoke/Scripts/python.exe scripts/dev/gpu_check.py python/.venv-smoke/Scripts/python.exe outputs/verify-sampling-pag-sdxl sampling_pag_sdxl
+```
+
+## Neutral Prompt acceptance and ledger promotion (2026-10-26)
+
+An independent original-scope audit found no missing standalone feature. The upstream README specifies the
+alternative operators, CFG rescale and nesting; the initial local Runtime task explicitly allows unsupported
+combinations when clearly reported. Later agent-added notes making every cross-plugin combination a promotion
+prerequisite are superseded by the explicit acceptance clarification at the top of the plan. All original core,
+model, UI, attribution and cleanup gates remain. PhotoMaker, SAG, APG, Mahiro, Latent Modifier, Dynamic Thresholding
+and Detail Daemon stay guarded/disclosed as compatibility backlog; their combinations are not claimed implemented.
+
+Fresh final checks:
+
+- `RealAlwaysOnCheck ... neutral_prompt`: **1/1 on SD1.5 and 1/1 on SDXL**, via actual plugin/AppServices/queue/
+  generator/Python/GPU. New images under `outputs/verify-neutral-final-app-{sd15,sdxl}` were inspected. Saved PNG
+  assertions independently confirm the effective prompt, Neutral hook and CFG-rescale replay fields; audit JSON
+  and app contact sheet are under `outputs/verify-neutral-final-ui`.
+- Current native form snapshot exited 0 in an isolated home: `outputs/verify-neutral-final-ui/ui.png`,
+  `ui-panel.png`, `form-crop.png`. Enable, rescale, operator/weight formatter and cost help were inspected.
+- Two protocol INTERRUPTED tests now directly verify Reference-bank cleanup and forward restoration before the
+  first branch and between branches. Seven RED/GREEN cases also ensure unsupported combinations reject before
+  special-pipeline/adapter setup. The existing validation was moved earlier to avoid loading extra weights first.
+- Final full Python **615 passed**, four existing torchsde warnings; torch-free **260 passed / 37 skipped**.
+  Reports: `outputs/verify-neutral-closeout-{tests,no-torch}.xml`. Full Scala **483 passed** after ledger generation;
+  jar assembly checked successfully. The final early-guard timing change has independent code review and CPU
+  regression coverage; it does not change successful-path conditioning/math.
+- Canonical third-party description refreshed; live collector completed **112 projects**, retaining MIT text and
+  correcting the stale runtime-pending description. No licence wording changed.
+
+Only index entry 73 changes: `done:neutral_prompt`. Totals are **87 done / 215 todo / 51 NA**, with 150 distinct
+pending targets. The overall 353-entry objective remains active. Next implementations are Prompt Fusion and other
+independent entries; remaining compatibility work stays visible rather than silently weakening accepted requests.
+
+## Parallel native extension wave: Prompt Fusion, Tokenizer, intermediate capture (2026-10-26)
+
+Three isolated implementation branches and independent reviews were integrated by the parent. Only the parent
+ran real models and sbt. Sources and pinned revisions are in each implementation plan and third-party notices.
+
+- **Prompt Fusion:** `scripts/dev/prompt_fusion_check.py` passed 20 actual-generation cases and six structured
+  rejection cases per model, SD1.5 `animekawa_v10` and SDXL `waiIllustriousSDXL_v170`. Exact RGB equality holds for
+  ordinary enabled/disabled prompts, variable/function expansion, constant curves and the final restored baseline.
+  Active linear/Bezier/Catmull/means/alternation/contextual attention and geometry change conditioning; negative
+  prompts, long conditioning, two-image batches, Heun, hires and img2img complete. SDXL includes pooled embeddings.
+  Reports, raw protocol journals, images and visually inspected contact sheets: `outputs/verify-fusion-{sd15,sdxl}`.
+  PhotoMaker, signed NegPiP and Alternative inversion with active Fusion syntax remain explicit unsupported
+  combinations. Nonfinite positions/attention reject as invalid parameters. These are bounded core-feature
+  checks, not proof of every cross-extension combination or artistic quality.
+- **Intermediate capture:** `scripts/dev/save_intermediate_check.py` completed 12 real-generation cases per model:
+  baseline, all three capture subjects, disabled, batch/iterations, hires, img2img, Heun and GIF/WebM/MP4. All
+  enabled/disabled final RGB images exactly match baseline. Cadence, combined hires clock, PNG metadata and typed
+  auxiliaries were checked; contact sheets were inspected. Artifacts: `outputs/verify-intermediate-{sd15,sdxl}`.
+  A real ffmpeg check subsequently found and fixed GIF coarse-palette color loss with adaptive palette generation.
+  The independent post-fix nine-case CPU check executes both direct exports and generated Windows recipes:
+  decoded parity is exact, interpolation creates new frames, endpoints/holds/duration and one/two-frame fallback
+  pass, and cancellation removes staging/partial videos. Report/reproducer/videos:
+  `.worktrees/save-intermediate/outputs/verify-intermediate-ffmpeg/`. Separate actual HEVC/AV1 checks with uniform
+  and odd mixed-size inputs passed all four cases (six decoded frames, 3 s, 96x64 or padded 102x78 canvas;
+  RGB error 1.56–2.87/255): `.worktrees/tokenizer/outputs/verify-intermediate-codecs/`. These codec checks use
+  synthetic CPU frames, separately from the real-model captures. Sampling is unchanged by the palette-only fix.
+- **Native app service and replay:** `RealAlwaysOnCheck` passed **2/2 plugins per model** in
+  `outputs/verify-wave-native-{sd15,sdxl}`. Active Fusion grammar, PNG saved/full-parameter metadata and serialized
+  replay give equal pixels. Intermediate batch 2 x iteration 2 keeps four final gallery images; captured PNGs and
+  manifests survive queue temp cleanup. A serialized outside-root hook destination is replaced by configured
+  outputs, the sentinel stays absent, and historical gallery scans omit root intermediates. Gallery regression
+  retains unrelated nested directories with the same name. Evidence lives in each `native-alwayson-evidence`.
+- **Tokenizer and forms:** `RealTokenizerCheck` passed on both actual loaded models and vocabularies through
+  AppServices and native Inspect/Copy controls. Unicode IDs match cached CLIP reference IDs; SDXL has both streams.
+  Text/ID mode, prompt import, table/decoded text, tab persistence, invalid-ID recovery, clipboard restoration and
+  resizing/scrolling pass. Literal special tokens are classified by the real vocabulary. Help/input shrink and
+  table visibility were repaired after screenshot inspection. Native expanded Fusion/intermediate video forms
+  are captured with all controls readable. Reports/screenshots: `outputs/verify-tokenizer-{sd15,sdxl}-ui`.
+- **Integration tests:** full torch-enabled Python **707 passed / 1 skipped**, six torchsde floating endpoint
+  warnings; full torch-free Python **306 passed / 60 skipped**. Logs: `outputs/parallel-wave-python-final.log` and
+  `outputs/parallel-wave-notorch.log`. The skipped integration checks require opt-in cached vocabularies/ffmpeg or
+  unavailable torch; actual vocabularies and ffmpeg have the separate acceptance evidence above.
+  Full Scala **491 passed**, and assembly succeeded after the final native resize-pulse check and gallery repair:
+  `outputs/parallel-wave-scala-final.log`. The final native screenshots include the real 1280x800 compact viewport
+  and 1600x1000 expanded viewport (scene excludes window decorations).
+- **Notices:** authenticated collector completed **116 projects**, adding the MIT Fusion source notice, Unlicense
+  recorder attribution, no-license tokenizer clean-reimplementation attribution and external ffmpeg build-dependent
+  licensing overview. No FFmpeg executable is bundled. Existing license content was preserved with repository LF.
+
+Ledger entries 43, 72 and 87 are now done: **90 done / 212 todo / 51 NA**, 147 distinct pending targets.
+The overall 353-entry objective remains active. Next planned target: `composable_lora`.
+
+## Grid Numbers and Latent Upscale native acceptance (2026-10-26)
+
+These two independent branches are accepted; the larger Composable LoRA implementation remains pending.
+
+- **Grid Numbers:** parent observed missing-renderer RED, then visible-Z-subgrid mapping RED (eight sources were
+  incorrectly listed for four visible tiles). After correction, core5/plugin48/engine15 targeted tests and MCP
+  compile passed. Genuine Java2D renderer contact sheet was inspected, including half-transparent panels, Unicode,
+  long labels and tiny images: `.worktrees/grid-numbers/outputs/grid-numbers-render-check/`.
+  `RealGridNumbersCheck` passed on SD1.5 and SDXL. Ordinary batch2 x iteration2 yields four unchanged final images
+  plus one numbered grid; disabled yields no grid. Full-parameter replay uses newly assigned source filenames,
+  source SHA-256 hashes remain unchanged, and XYZ 2x2x2 yields eight sources/three grids with effective axis values
+  and visible row-major mappings. Actual numbered batch/XYZ images were inspected. Reports and model logs:
+  `.worktrees/grid-numbers/outputs/verify-grid-{sd15,sdxl}/grid-numbers-evidence/report.json` and
+  `outputs/grid-numbers-{sd15,sdxl}-native.log` in that worktree. No Python generation hook or dependency.
+- **Grid PNG import:** independent review found native Restore discarded display extras. Parent observed RED for
+  the missing form-restorer, then28 UI/state tests passed after repair. Both boolean flags, including false,
+  now load into the actual checkbox properties and the next JobBuilder values. Both-false retains imported
+  settings but creates no annotations/grid. No hidden GenerationVM extra workaround.
+- **Latent Upscale:** `scripts/dev/latent_upscale_check.py --full` passed **21 cases per actual model**, covering all
+  seven interpolation modes, six schedules, batch2, masked/full-resolution paths and no-hook/disabled restoration.
+  All active cases execute exactly seven denoising steps at strength0.4 (ordinary baseline executes two).
+  VAE traces confirm ordinary unmasked source encoding at512/768 before target640/960; masked full-resolution
+  mode deliberately retains native crop preparation. Disabled/restored RGB hashes match baseline independently
+  of metadata. Source/output comparison sheets were inspected. Reports, PNGs and raw events:
+  `outputs/verify-latent-{sd15,sdxl}`. Four-/nine-channel inpaint handling also has actual random tiny-diffusers CPU
+  coverage, distinct from the real checkpoint checks (which use the native four-channel mask path).
+- **Latent numerical validation:** independent review reproduced raw OverflowError for strength1e-308 and5e-324.
+  Guarding before division now returns `INVALID_PARAMS`; the exact10,000-entry boundary remains valid. Tests
+  observed RED/GREEN, and independent rerun passed19 focused checks. Zero strength and invalid 4-D interpolation
+  names have explicit errors. No learned model or new package was needed.
+- **Actual native services and forms:** `RealLatentUpscaleCheck` passed on both real models. Script execution,
+  persisted JSON params and infotext+script replay produce equal RGB hashes; isolated homes do not alter user
+  settings. Reports: `outputs/verify-latent-native-{sd15,sdxl}/native-replay-report.json`.
+  Extended `RealTokenizerCheck` passed both models, exercising public Restore/Send-to, grid false/true values,
+  native latent controls, Txt2img→Img2img redirection and Inpaint→Inpaint restoration. Target forms are explicitly
+  reset before each final SDXL Restore assertion to exclude stale-state false positives. Root inspected expanded
+  Grid Numbers and the selected latent Script card; snapshots preserve the actual dark card background.
+  Artifacts: `outputs/verify-wave2-native-ui-{sd15,sdxl}`; batched logs `outputs/next-wave-native-app.log`, strengthened
+  final SDXL log `outputs/next-wave-native-ui-final.log`. Plugin tabs intentionally share img2img eligibility with
+  Inpaint through `Mode.Inpaint.pluginTab`; registry/form regression checks this actual API boundary.
+- **Aggregate Python:** torch731 passed/1skipped, eight existing torchsde/Swig warnings; torch-free312 passed/74skipped.
+  Logs: `outputs/next-wave-python.log`, `outputs/next-wave-notorch.log`. Swig also prints an interpreter-exit
+  deprecation warning. These checks do not imply untested third-party adapter combinations are supported.
+  Full Scala **514 passed**, and jar assembly succeeded: `outputs/next-wave-scala-final.log`.
+- **Sources/notices:** fresh authenticated collector completed118 projects, adding feynlee/latent-upscale MIT
+  attribution (clean implementation, sourceb9f75f4) and AlUlkesh/sd_grid_add_image_number Unlicense attribution
+  (native Java2D reimplementation, source693a8a7). No copied unlicensed source or additional dependency.
+
+Only indices88 and189 are promoted: **92 done / 210 todo / 51 NA**, 145 distinct pending targets. The overall
+353-entry goal is still active. Composable LoRA core formats, controllers, adapter mapping and real-model/UI gates
+remain in progress; none is counted as complete by this wave.
+
+## Composable LoRA and native System Info acceptance (2026-10-26)
+
+- **Scope and source:** Composable LoRA/LyCORIS sourcea03d40e (AGPL-3.0) includes all seven controls, AND branch
+  scoping, negative encoder/denoiser behavior including its single-branch exception, source step/alternation/ramp
+  grammar, pure math and gated Python commands, plots and all LoRA/LoCon/CP/LoHa/LoKr/full/IA3 algebra families.
+  System Info source006f08f (MIT) supplies the retained fixed benchmark prompts; the native diagnostics, inventory,
+  benchmark/history, status API, opt-in metadata and preview/submit implementation are standalone. Each plan
+  distinguishes source behaviors, native adaptations and compatibility limits.
+- **Independent review and repairs:** legacy SGM root-convolution mapping, sparse LoRA residuals, full-factor LoKr
+  alpha normalization and base/hires weight/single-branch scope were reproduced and repaired with CPU regressions.
+  Global hires totals also reach prepare-step commands. Independent frozen review passed36 CPU cases. A later
+  trace-lifecycle gap was reproduced and repaired: JSON now persists under the native output root, typed protocol
+  decoding preserves/logs it, and temporary plot cleanup leaves no orphan. Independent fix review passed20 cases.
+  Source postprocess appends the plot as an image; the native implementation does so after generation
+  postprocessing. No new diagnostic-image protocol was imposed.
+- **Actual adapter mapping:** parent loaded both real checkpoints and mapped six actual files. SD1.5 20_yui and
+  slimegirl11 each264modules; SDXL alraune986modules, SeifukuKh03/BNSeifukuKh03 and LoKr788each. Report
+  `outputs/verify-clora-mapping/report.json`, reproduced by ignored `outputs/clora-mapping-preflight.py`.
+  This preflight checks actual model graphs and tensor-family loading, not forward execution or artistic quality.
+- **Actual generation:** `scripts/dev/composable_lora_check.py --allow-code` passed **31 SD1.5 /33SDXL cases**, plus
+  four structured compatibility errors per model. Cases cover ordinary/disabled/no-adapter and zero-weight AND
+  equality, branch isolation, negative settings, separate TE/UNet weights, source controllers/escaped hash/Python
+  function, batch2, Heun, hires restart/global clocks, img2img, Fusion and Neutral. Real SDXL LoCon and LoKr generated
+  successfully. No-adapter/restored baselines exactly match RGB pixels. Reports, raw protocol journals, traces,
+  plots and visually inspected sheets: `outputs/verify-clora-{sd15,sdxl}`. Trained LoHa/full/IA3/CP files were not
+  available; their actual tensor algebra has CPU module/tiny-pipeline coverage, not claimed trained-model GPU
+  evidence. Multi-branch high-CFG examples can oversaturate; AND does not impose spatial separation. Source math
+  and baseline invariants are verified, not universal artistic quality.
+- **Native LoRA queue and replay:** `RealComposableLoraCheck` passed both real models. Native preparation preserves
+  placement/step tags and resolves each adapter once. JSON/PNG replay gives identical source RGB; plotcount2 and
+  two persistent UUID JSON traces retain actual evaluations after temporary-image cleanup. Request `.tmp` is empty
+  and source/no-adapter/after-adapter baselines match. Logs/report paths:
+  `outputs/verify-clora-native-{sd15,sdxl}/native-composable-report.json`, `outputs/clora-native-final.log`.
+  An obsolete positive-AND warning was found in actual native logs and fixed; final helpers assert its absence.
+  Disabled/no-hook and unsupported negative-AND warnings remain. The native six checkbox values restore from
+  PNG Restore/Send-to with explicit true/false replacement; expanded form inspected in
+  `outputs/verify-clora-native-ui`. Other grid/latent restoration still passes the shared entry points.
+- **Native System Info:** actual SD1.5 and SDXL runs passed full loaded-model snapshots, live GPU-memory samples,
+  hidden-tab polling stop, native quick/turbo256 benchmark, local fingerprint history, actual interrupt, and PNG
+  metadata opt-in with exact RGB equality/restoration. Raw status stays responsive during the queued worker.
+  Benchmarks decode actual images but suppress PNG-save I/O with a scoped finally-restored internal flag. Actual
+  tiny CPU sampling separately verifies normal saving resumes afterward. A Windows diagnostic subprocess pipe
+  deadlock was reproduced and fixed using bounded temporary output files.
+  Reports/screenshots: `.worktrees/core-system-info/outputs/verify-system-info-sd15` and
+  `outputs/verify-system-info-sdxl`; logs `outputs/system-info-native-sd15.log`, `outputs/system-info-native-final.log`.
+  Final screenshot helper follows native window startup/model loading and waits for Ready/report refresh, avoiding
+  the earlier helper-only stale Starting header. Score rows lead the benchmark table; actual component dtypes and
+  JVM/JavaFX versions are reported. Real high-batch presets/OOM stress were not run; preset/stop logic has CPU
+  coverage. Quick scores are single-machine workload measurements, not general performance claims.
+- **No external submission:** preview is tested without Submit; transport is mocked in CPU tests. No cloud packet
+  was sent, server receipt is not verified, and legacy UDP cannot acknowledge receipt. Identity/hostname are
+  explicit choices, metadata selection is opt-in, and refresh/benchmark do not send data. Local JSON export is a
+  separate feature rather than a claimed replacement for legacy submission.
+- **Aggregate:** full Python795 passed/1skipped (eight torchsde/Swig warnings plus interpreter-exit Swig warning),
+  torch-free353 passed/78skipped, full Scala522 passed and assembly succeeded. Logs:
+  `outputs/composable-system-{python,notorch,scala-final}.log`. The trace-retention test has an isolated AppHome so it
+  does not advance another naming test's file counter. Fresh authenticated collector completed120projects, adding
+  the retained AGPL and MIT notices; no driver binary or new Python package was bundled.
+
+Only indices78 and90 are promoted: **94 done /208todo /51NA**, 143 distinct pending targets. Styles Editor's two
+source entries remain pending while native data preservation/editing acceptance continues. The overall353-entry
+goal is active.
+
+### Native Styles Editor and Extended Style Saver (2026-10-26)
+
+Both source entries163/248 are independently implemented as `core:styles-editor`. The native editor covers
+CSV edits/autosave, unchanged-record bytes and foreign columns, duplicate/reorder/filter/replace/notes, category
+creation/moves/live merging, conflict rejection, changed-only600-second backups/24 retention and authenticated
+AES-Crypt v2 restore/export. Extended presets retain UUID-distinct same-name rows and apply exactly prompts,
+size, checkpoint and VAE while preserving sampler/steps/seed/ControlNet drafts. See the owned plan for source pins.
+
+- Targeted core37 passed, including category mirror restoration, reordered unsaved identity, foreign `text`
+  columns, duplicate normalized-header rejection and unnamed payload preservation. Eight JDK encrypted payloads
+  independently decrypted byte-for-byte with unchanged external pyAesCrypt; the committed external ciphertext
+  also decrypts correctly. Reference code/packages stayed in ignored outputs; there is no product crypto package.
+- Final real native runs both passed with clean process exit: `outputs/styles-native-models-clean.log`;
+  `outputs/verify-styles-{sd15,sdxl}/styles-editor-report.json`. Each exercises actual controls/dialogs/autosave,
+  live prompt-style dropdowns, clipboard keys, categories/encrypted backup recovery, extended filters/six-field
+  Apply and exact RGB equality between named styles and explicit expanded prompts. Both reports have no skips.
+  These four-step384 conditioning comparisons are not aesthetic-quality benchmarks. Whole1280x800 screenshots
+  were inspected; details remain scrollable and controls wrap at the minimum viewport.
+- An earlier manual-helper exit failed when an advertised clipboard format returned null. That attempt cannot
+  establish restoration of the user's original clipboard. Helpers now preflight every advertised format and skip
+  mutations if preservation is unavailable; independent cleanup always attempts clipboard/window/services/JavaFX
+  shutdown. Two regression tests pass. Final runs restore their captured clipboard successfully. No clipboard
+  contents are written to logs/artifacts. Tokenizer's manual helper shares the same protection.
+- Initial Styles integration passed Scala541 and assembly (`outputs/styles-scala-final.log`); the combined final
+  aggregate below supersedes this checkpoint. No Python product source was changed by Styles itself.
+  Attribution retains Apache-2.0 notices for Styles-Editor and the interoperability reference; the unlicensed
+  ExtendedStyleSaver behavior is independently implemented without copied code.
+- Independent final UI review found and repaired blank-VAE engine/UI mismatch, overlapping asynchronous preset
+  Apply and failed-autosave draft loss. Blank/whitespace VAE now means Automatic consistently. A single-flight
+  guard covers model/VAE loading and rejects reentrant native/direct Apply. Failed writes preserve exact proposed
+  CSV in a separate recovery file before navigation; if recovery also fails, details/navigation lock while Retry
+  Save remains available. A real file blocker plus external-edit conflict produced RED, then native GREEN compared
+  the entire retained CSV after retry. Peer review approved the follow-up. Real SD1.5/SDXL integrated runs in
+  `outputs/native-tools-scala-final.log` both passed nine checks with normal exits; the final UI-only double-failure
+  lock adds a tenth check in `outputs/verify-styles-final-cpu` and changes no model/generation path.
+
+Only indices163/248 are promoted: **96 done /206todo /51NA**,142 distinct pending targets. Image comparison and
+VAE Tools remain pending their own integrated acceptance. The overall353-entry goal remains active.
+
+### Native Image Comparison and VAE Tools (2026-10-26)
+
+- **Image Comparison (index286):** independently implemented from pinned MIT source4354eda. Core6/UI3 tests
+  and native helper pass on existing SD1.5/SDXL images. Actual keyboard/mouse wipe, direction/opacity/swap,
+  shared zoom/pan, source buttons/history, metadata diffs, safe export and CtrlAlt send were exercised. Every
+  source byte stays unchanged and exported pixels match. Delayed loads retain newer draft/Clear; image-pair
+  changes retain zoom/pan; live previews send their current pixels without stale file paths or metadata.
+  Independent reviewers approved these three repairs. Comparison starts no engine and does not claim new model
+  inference. Formats are limited by JVM image readers. Compact/expanded screenshots intentionally follow a bad-file
+  test: the error remains visible while the last pair is retained. Report: `outputs/verify-image-comparison`.
+- **VAE Tools (index352):** clean implementation of unlicensed source47fe6db, not copied code. Both real model
+  families pass19 Full/Approx NN report cases, then20 with revision-pinned optional pretrained TAESD/TAESDXL.
+  L grayscale PNG is an exact serialized tensor container. RGBA/CMYK quantize over[-10,10], TIFF retains CMYK
+  channels and JPEG100 adds loss. Sixteen-channel packing has codec coverage, not SD3 inference coverage.
+  Full/TAESD encode and decode; Approx NN/cheap previews use their documented smaller resolutions.
+- Real generation RGB is identical with the recovery catcher enabled/disabled; injected final decode failure
+  produces durable recovery data and an explicitly Broken approximate preview, then ordinary generation restores.
+  Raw safetensors stores the exact failed `vae_decoder_input` tensor/dtype. The RGBA recovery PNG is a quantized
+  diffusion-coordinate approximation. CPU tiny-VAE tests compare10000 fp16 and10000 fp32 values bit-for-bit;
+  standard scaling/inverse arithmetic occurs in fp32 before VAE casting. Batch errors remain per-item, hashing
+  streams after file bounds, and portable PNG metadata includes selected VAE/scaling provenance.
+- Both integrated native/AppServices/MCP model runs pass actual L/RGBA/CMYK JPEG controls, original-mode file
+  handling, batching, validation/recovery, tiling restoration, decoded-file preview identity/every pixel and
+  viewport scrolling. The earlier helper URL assertion was repaired to compare actual file identity and pixels
+  after JavaFX loading; no preview correctness check was removed. Production catch scoping and test JSON implicit
+  argument compile errors were fixed before acceptance. Integrated log: `outputs/native-tools-integrated-ui.log`;
+  reports/screenshots: `outputs/verify-vae-native-{sd15,sdxl}`.
+- Real Python matrices and TAESD reports: `.worktrees/vae-tools/outputs/verify-vae-{tools,taesd}-{sd15,sdxl}`.
+  Optional pretrained MIT weights were cached through the explicitly enabled download path, never bundled.
+  Local preexisting Approx NN files were hashed and safely loaded; there is no separate asset-license/digest
+  claim beyond upstream release provenance. Actual external-selected-VAE reconstruction quality was not measured.
+  Independent fix review ran7 CPU regressions and approved exact recovery, bounds and provenance repairs.
+- Integrated Python829 passed/1skipped (eight warnings plus interpreter-exit Swig warning); torch-free360 passed/
+  81skipped (including collection skips, recorded in JUnit). Logs: `outputs/native-tools-{python,notorch}.log`. Native tool outputs/recovery stay out of final
+  image gallery scans; no parent Web UI import/launch or model-source write is involved.
+- Final aggregate verification also exposed an existing engine-start failure ordering race: the start promise
+  could fail while the supervisor still reported Starting. A latch-controlled test reproduced it deterministically;
+  failure state/bookkeeping now publish before promise completion, with listeners outside the lock afterward.
+  Epoch/stopped/retry handling is retained. The original fatal-error test remains intact; no sleep was added.
+  The full protocol test now includes the additive recovery-directory key/default, and the MCP fake engine has
+  an explicit real-VAE refusal so the raw-file passthrough assertion remains strict.
+- Release check: focused deterministic startup regression passed, full Scala555 passed and assembly succeeded
+  (`outputs/native-tools-release-check.log`). The final Styles native CPU helper passes all10 checks on the
+  integrated source. The authenticated notice collector completed126 projects; Apache/MIT texts are retained
+  verbatim. Code whitespace checks exclude verbatim license archives and the hash-verified CRLF crypto fixture.
+
+Indices163/248/286/352 are the combined native wave: **98 done /204todo /51NA**,140 distinct pending targets.
+The overall353-entry goal remains unfinished.
+
+## Runtime interruption protection and compact hardware metadata (2026-10-26)
+
+This wave is integrated and its final acceptance passed; indices309/320 are promoted below.
+
+- Index320, `core:prevent-interrupt`: independent rewrite of light-and-ray/sd-webui-prevent-interruption at
+  ea22bc0de11875f3889f09c8e6ed7b879f321d05 (no upstream license grant; no code/assets copied). The actual reader
+  owns defaultOff/revision state and atomically admits interruption/restart. Native GUI/MCP display caches cannot
+  bypass protection. Running cancellation, footer/Esc/SystemInfo and explicit restart share admission; pending-only
+  clearing, shutdown and health recovery stay separate. Five-second frontend convergence and new-process reset
+  match the source. Native has no skip or Web UI reload operation, so neither was invented.
+- Actual reader regressions cover blocked active/queued cancellation with no side effects, strict bool validation,
+  responsive controls while the worker is busy, and ordinary Off behavior. Native process/queue tests cover private
+  owner identities, stale handles, delayed admission, queued work behind unrelated active work, no false forced
+  restart, stop-wins, empty capture, and global cancellation of standalone benchmarks. MCP confirms truthful blocked
+  responses, separate pending clearing and no deferred transport cancellation after unlock.
+- Final independent review reproduced two more failures: detached remembered-model startup reuse and request-ID
+  order differing from actual wire order. Fixes give explicit restart a fresh lifecycle epoch, guard late model/state
+  bookkeeping, and capture wire admission order without serializing expensive JSON under the pipe lock. Both
+  deterministic tests passed in the73-test focused native regression; MCP4 passed afterward
+  (`outputs/prevent-final-ordering-{red,green}.log`). Independent repair review found no further material issue.
+- Prior actual GUI/engine/MCP acceptance passed CPU5checks, SD1.5 and SDXL4checks each, including protected
+  in-progress generation completing and Off stopping SystemInfo's own nonqueue benchmark. Reports are in
+  `outputs/verify-prevent-cpu`, `outputs/verify-prevent-sd15-retry`, `outputs/verify-prevent-sdxl`.
+  The initial interrupted real run had no terminal report and is not counted. Root inspected actual lighthouse
+  outputs. The final helper additionally waits for actual loaded preview pixels before taking the screenshot.
+- Index309, `core:hardware-info`: independent rewrite of light-and-ray/sd-webui-hardware-info-in-metadata at
+  784a0dd8521108815aff007d7a4807ac6f98d251 (no upstream code copied). Source compact normalization, per-image batch
+  timing/reset, remark, Extras whole-operation timing and two informational paste notices are implemented.
+  Native adaptations are explicit opt-in, actual active device, per-operation settings snapshots, and offline
+  metadata restoration. Queue wait/model preloading and final file publication are outside timing boundaries.
+- Hardware records are typed and associated with each result/seed, remove only reserved stale imported facts,
+  preserve foreign PNG metadata and refuse input aliases. No kernel/RNG hook or second preparation pass is added.
+  A review-found passive lookup race now uses a bounded nonstarting status request bound to the captured process;
+  stale completion cannot migrate facts into a replacement process. Ownership/cache7tests and actual native CPU
+  acceptance passed (`.worktrees/hardware-info/outputs/hardware-status-native-final-green.log`).
+- Hardware actual SD1.5 and SDXL native controls each passed5checks, including four records across batch2/iterations2,
+  exact enabled/off pixel parity, literal Japanese/multiline remark persistence, independent SystemInfo selection,
+  img2img, hires, actual Extras, original-byte preservation, bounded equal/unknown/different device notices and
+  final gallery isolation. Reports/screenshots: `.worktrees/hardware-info/outputs/verify-hardware-native-{sd15,sdxl}`;
+  log `hardware-real-parent.log`. Root inspected the cards and actual generated images. Four-step results establish
+  metadata neutrality/routing, not image quality. Missing declared psutil==7.0.0 in the no-Torch acceptance venv was
+  installed; the unknown-profile assertion was retained. No driver/model source is modified or bundled.
+
+Final integrated evidence:
+
+- Full Scala **596 passed**, assembly successful (`outputs/control-metadata-release.log`). Jar SHA256:
+  `C27F6F7D99CDFBD9D5A520F043FC8012A92E68294F535464DEB121C0193DCA16`.
+- Full Python **867 passed/1 skipped**,8 warnings (`outputs/control-metadata-python-cpu.log` and JUnit), with
+  CUDA hidden for the tiny CPU pipeline fixtures. The first run omitted that environment and exposed19 fixture
+  device mismatches plus5 legacy partial-request fixture failures; it was not accepted. Three WeightGradient test
+  stubs now use real GenerationRequest defaults. Production validation and existing assertions remain unchanged.
+  NoTorch **397 passed/82 skipped**, including collection skips (`outputs/control-metadata-notorch.log`/JUnit).
+- All six final native runs passed sequentially through the integrated main source
+  (`outputs/control-metadata-native-final.log`): protection CPU5checks/SD1.5+SDXL4checks each, hardware CPU+SD1.5+
+  SDXL5checks each. Read actual reports/screenshots in `outputs/verify-control-final-{cpu,sd15,sdxl}` and
+  `outputs/verify-hardware-final-{cpu,sd15,sdxl}`. Protection screenshots now wait for loaded completed preview pixels;
+  root inspected final visible image/footer and final hardware metadata card/output. Every run shut down cleanly.
+- Independent source/integration review approved preservation of Styles/VAE/Comparison/Tokenizer, ExtendedStyle,
+  grid/latent/Composable restore, SystemInfo lifecycle, private cancellation ownership and metadata routing.
+  Notice collector completed128projects (`outputs/control-metadata-notices.log`); original license/crypto fixture
+  bytes were preserved. Code whitespace checks exclude those verbatim archives.
+
+Result: **100 done /202todo /51NA**,138 distinct pending targets. The overall353-entry objective remains active.
+
+### Post-promotion ledger consistency correction
+
+The preceding596-test run occurred before ledger promotion. A subsequent full regression in the isolated API
+payload worktree exposed one BuiltinsSuite failure: `hardware_info` was recorded as a normal plugin although
+its implementation is a global native System Info/settings feature. Its complete source behavior and model/UI
+acceptance remain valid. The ledger now uses `core:hardware-info`, consistent with other native core features;
+no dummy plugin was introduced and the registry assertion was not relaxed. Protocol/module names stay unchanged.
+The existing20-case BuiltinsSuite passed after regeneration (`.worktrees/hardware-ledger-fix/outputs/hardware-core-ledger-green.log`,
+2026-10-26 23:50:22). Totals remain100done/202todo/51NA. This is a ledger/documentation correction with no
+generation/runtime code change. Future promotion must rerun the ledger/registry check after regenerating status.
+
+## Native API payload inspector (2026-10-27)
+
+Index253 `core:api-payload` independently reimplements huchenlei/sd-webui-api-payload-display at
+`2d3332d94ffac0943bd35a1943924ed4650c6e63`. The MIT notice retains Chenlei Hu's2023 copyright. The separately
+copyrighted vendored tree's interactions are independently reimplemented; Vera Lobacheva's2017 MIT license is
+also preserved from summerstyle/jsonTreeViewer license pin `6abfcc1202396af12e2806d129bcae0e75b37365`. No upstream
+JavaScript/CSS is copied. Both license Git blobs match the pinned originals, SHA256 respectively
+`990b5c560b655fb8623874940f1ac02cd21c3c76c714c997dff0ec3fa8c744fb` and
+`0e6f8814a1368da259cdca5d218c422fcb278b3579651c55079d774799ae7692`. The130-project notice table can be regenerated
+with `python scripts/third_party.py --use-archived-licenses`; this checks the two pinned files and reuses older
+archived license labels, rather than claiming a fresh network review of every older project.
+
+The actual typed generation body is serialized once at EngineClient's dispatch boundary. A private body copy
+goes to transport; optional observation cannot change it or cause another prepare/seed draw. UI, MCP and direct
+generation retain honest origins, per-subrequest identity, submitted forms/options and independent lifecycle.
+Capture-time model reports are snapshots; actually reported completion facts remain separate. Pending queued-job
+cancellation before preparation has an absent body; cancellation during observation may retain its prepared body.
+Later job failure cannot rewrite an earlier successful subrequest.
+
+Image diagnostics use an explicit whitelist and capture before temporary-mask cleanup, off FX. Init-image
+contents are always omitted, even with opt-in enabled. Source reads are bounded16MiB, dimensions8192 per side /
+32million pixels before raster decode, PNG output4MiB and the final image document16MiB. Store limits are50captures,
+8MiB body,24MiB per entry and32MiB total, including retained identity/documents/warnings. Oversized identities
+are rejected with a count; optional documents are dropped visibly before an in-limit exact body. No full capture
+event enters the general FX queue: the dedicated store/pane path coalesces delivery and reads current state.
+
+The shared inspector has collapsed per-mode entries, mode/All history, separate body/context/image selection,
+literal typed tree, recursive/mark/path and accessible actions, bounded warning details, explicit exact Copy and
+three-second feedback. Raw preview is at most64KiB UTF-8. Structural admission limits100000 lexical tokens/depth512;
+derived paths, labels and aggregate path bytes are separately bounded. Tree publication uses1000-row FX slices,
+at most10000 attached items and depth128 with explicit Root/Back/continuation; source JSON remains exact-copyable.
+Only the global image preference persists, and affects future submissions. Opening the viewer starts no engine.
+
+Final production code was `475220b9e417dbba2245e52ffe53409facd9cbfd` before documentation/ledger promotion.
+Test-only commit `1360a17` subsequently strengthened the explicit closed/open/closed inspector comparison;
+the final native runs below use that helper with unchanged production code and jar.
+Root-owned evidence is in `.worktrees/api-payload-integration/outputs`:
+
+- Full Scala **725 passed**: core266, engine151, plugins132, MCP45 and UI131. Assembly succeeded.
+  `api-payload-release-gates.log` records the terminal test/assembly results and all subsequent native runs.
+  The separate2-case deferred-FX regression also passed; it is included in the725, not counted twice.
+- Full Python **867 passed/1 skipped**, with `CUDA_VISIBLE_DEVICES=-1` verified to hide CUDA for CPU fixture tests;
+  **397 passed/82 skipped** without torch. Logs/JUnit: `api-payload-python-cpu-final.*` and
+  `api-payload-python-notorch.*`. The API wave changes no Python inference/tests. An initial empty environment
+  value failed to hide CUDA in this shell, exposing19 CPU-fixture device mismatches; that run is not a pass.
+- Final actual native runs all terminated normally: offline pane smoke, CPU **18checks**, SD1.5 animekawa_v10
+  **14checks**, and SDXL waiIllustriousSDXL_v170 **14checks**. Reports and screens are in
+  `verify-api-pane-release` and `verify-api-native-{cpu,sd15,sdxl}-final`, with terminal log
+  `api-payload-native-final.log`. Native Generate/Queue, identical repeats,
+  transient/final selected scripts, inactive/active AlwaysOn forms, queued form edits, old-mode completion, hires,
+  img2img, Inpaint, temporary mask cleanup, mask SHA/decoded pixels and independent documents are checked.
+  CPU additionally checks actual second-subrequest failure, enclosing-script failure, pending cancellation and
+  over64KiB raw preview/full Copy. Actual stdio equality is independently pinned by the fake-engine request echo
+  suites; the manual inspector capture is not described as independent transport sniffing.
+- Both trained models retain exact fixed-seed body/RGB parity with the inspector closed before baseline, open
+  during the repeat and closed after use, including image-preference changes.
+  These3-step256/384px checks establish neutrality/routing, not image quality. Root inspected all20 trained-model
+  outputs; the low-step SDXL outputs are abstract/striped, and are not presented as a quality benchmark.
+- Actual Copy passed for body/context/image documents and restored the formats captured in each final run.
+  CPU also passed untruncated long Copy. The helper preflights every advertised format and skips mutation if any
+  cannot be safely restored. This does not retroactively establish restoration of the earlier Styles-run clipboard.
+- Native screenshots await settled sizes and assert saved PNG dimensions. Main model helper images are exactly
+ 1280x800 or1600x1000 scene pixels. Warning-heavy offline checks name both outer window and actual client sizes
+  (1280x800 window /1264x761 client;1600x1000 window /1584x961 client). Earlier immediate-resize screenshots had
+  stale dimensions; they are superseded by these release checks. JavaFX21 emitted nonfatal CSS-lookup warnings
+  during the final hide/reopen cycle; root inspected the resulting tree/path/mark screen and verified its controls.
+- Jar SHA256: `6D7C76AEF2F0534214C0F0838BDAA29B10435C0431F175E7EF699749E93E6C8B`.
+  The assembled file is `.worktrees/api-payload-integration/target/stablediffusion-fx.jar`.
+
+Independent component reviews and a whole-feature audit approved the implementation after deterministic
+RED/GREEN fixes for capture/store accounting, ordered callbacks, cancellation admission, tree frontier/path/FX
+budgets, latest input, warning-heavy layout and the general FX-event bridge. Reports include
+`api-payload-whole-integration-{audit,rereview}.md`. No source scope was replaced by a smaller UI-only feature.
+Post-promotion registry consistency passed **20 tests** after regenerating the ledger
+(`api-payload-promoted-registry.log`,2026-10-27 00:41:58). The controller's complete decision record is
+[`2026-10-26-core-api-payload-decisions.md`](superpowers/plans/2026-10-26-core-api-payload-decisions.md).
+
+Result: **101 done /201 todo /51 not applicable**,137 distinct pending targets. The overall353-entry goal remains active.
+
+## Native Config Presets and Preset Utilities (2026-10-27)
+
+This wave implements separate native profiles for index 30 `core:config-presets` and index 31
+`core:preset-utilities` on canonical product source
+`d6248d4c71f5b00e1e6398871d5470ca22034715` in `.worktrees/core-config-presets`.
+The earlier `7b340bc7d0cf650d572baeb444136a203e5c0abc` is the CPU/model/assembly checkpoint below; the
+integrated I1/I2 correction changes only seven owned files, with source identity diff 0 from the reviewed fixes.
+Config keeps separate Txt2Img and Img2Img source collections (Inpaint applies to its own form from the latter),
+selected-field overlay and Reapply. Utilities has one shared collection, Quick/Detailed save and independently
+selected Stackable/current-versus-component-default apply. The UI owns one native pane; save, inspect, reload and
+apply edit form properties without launching generation. The source audit, manifest and complete read-only trees are
+in the main repository's `outputs/next-core-presets-audit*`; the corrected full ID inventory is
+`outputs/native-config-presets-field-map.md`. The binding and raw-value rules are in
+[`native-presets-compatibility.md`](native-presets-compatibility.md).
+
+Source 30 is pinned at `Zyin055/Config-Presets@e252e60288b1104a45ea12106d92a8d145364fa1` (MIT). Its complete
+first-use 14 Txt2Img and four Img2Img defaults, including each `None` entry, are embedded in source order with exact
+semantic scalar values; the original 4K preset retains 768x432 and hires scale 5. The MIT notice is archived as
+`licenses/Zyin055__Config-Presets.txt` (1,085 bytes, SHA-256
+`c19b98789c10ffe53568c46f4daae8a49024a02715cf2d4f05de04aa05d3a5f9`). Source 31 is pinned at
+`Gerschel/sd_web_ui_preset_utils@e301734567f37ac53c6225aec3a5c9858b357e7e`; its tracked tree has no licence.
+Its behaviour was independently implemented; no code, prose, assets or default JSON from it is bundled. The
+notice validation at `.worktrees/config-presets-notices/outputs/presets-notices-validation.json` records 132 projects,
+both new rows and all 130 earlier rows byte-for-byte unchanged; `presets-notices-review.md` approves that notice
+delta. This static notice review does not by itself approve the product.
+
+Independent source review covered the UI's full Task 5B scope and its six R1–R6 fixes (final reviewed
+`10b1b72`, integrated source eight-file hash `c85b313`), the core 5D metadata/diagnostic work (reviewed
+`5e9d2cb`, exact integrated hash `e5e4687`), and the manual helper's test-only fixture correction (`f4f9cc3`,
+independently approved; final helper in `7b340bc`). The full and fix-round UI reviews are
+`.worktrees/config-presets-pane/outputs/presets-pane-{full-review,rereview-round1}.md`. The earlier native run passed
+**32 checks** in 37 seconds at 05:39:11; report and 20 inspected PNGs are under
+`outputs/verify-native-presets-pane-review-round1-third/` in that worktree. The UI review verifies original 4K
+widget save/reload, actual invalid/hidden spinners, Quick/Detailed/Stackable, Cancel and pre-click overwrite/removal
+review, 210 paged omissions and nine warnings, separate tracked/checked/saved/available flags and Extra's source
+default false versus native initial true. It also exercises long Prompt/alias bounds, Additional component binding,
+corrupt/missing library and Restore, and Reload preset tools without engine restart.
+
+After the two whole-wave integration fixes, the combined Pane checkpoint `6d64075` passed **219 UI tests**
+(06:15:37) and **36 actual native checks** in 31 seconds (06:16:08). Its log is
+`.worktrees/config-presets-pane/outputs/presets-wave-fixes-native.log`; report and 20 screenshot paths are in
+`outputs/verify-native-presets-wave-fixes/native-presets-pane-report.json` in that worktree. All prior 32 workflows
+remain, with actual built-in Refiner/Flux selector and Reapply warnings, imported unknown keys surviving native
+Reload, the last of 210 opaque Apply warnings reachable after Select/Reapply/Reload, and numeric/label Config and
+Utilities source choices applying to real Img2Img and Inpaint controls. The scoped re-review read this log, report
+and helper assertions; it did not claim to reopen all 20 new screenshots.
+
+Canonical regression evidence in `.worktrees/core-config-presets/outputs` follows. The `7b340bc` checkpoint rows
+precede the two cross-integration fixes described below; corrected product source is `d6248d4`.
+
+| Gate | Result | Evidence |
+|---|---|---|
+| Full Scala at `7b340bc` | **956 passed**: core 410, UI 215, engine 154, MCP 45, plugins 132; 92 s, 05:44:28 | `presets-integrated-full-cpu.log` |
+| Assembly at `7b340bc` | **passed**, 2 s, 05:44:30; checkpoint jar SHA-256 `E643B96A04C8BA8A2B7401B58F7B41E35AB73B835D3E0E15871650F1CF289ED8` | same log; `target/stablediffusion-fx.jar` at that checkpoint |
+| Corrected canonical full Scala | **964 passed**: core 414, UI 219, engine 154, MCP 45, plugins 132; 88 s, 06:18:48 | `presets-final-source-regression.log` |
+| Corrected assembly | **passed**, 2 s, 06:18:51; verified jar SHA-256 `0520F97B4C0EF429C67993C2D3F0089AB291E55A9E60F99398CF4B4AC45AE33C` | same log; `target/stablediffusion-fx.jar` |
+| Python GPU venv with process-local `CUDA_VISIBLE_DEVICES=-1` | **867 passed, 1 skipped, 8 warnings**, 34.54 s | `presets-python-full-cpu-corrected.log` |
+| Python no-torch venv | **397 passed, 82 skipped**, 10.81 s | `presets-python-no-torch-corrected.log` |
+| Native CPU, final helper | **16 checks passed**, 30 s, 05:54:06; `passed_cpu_scope` | `presets-integrated-cpu-sd15-final.log`; `verify-native-presets-cpu-final/native-presets-report.json` |
+| Native SD1.5 `animekawa_v10` | **19 checks passed**, 34 s, 05:54:40; `passed_real_model_scope`; trained `sd15-canny` ControlNet active | same log; `verify-native-presets-sd15-final/native-presets-report.json` |
+| Native SDXL `waiIllustriousSDXL_v170` | **19 checks passed**, 61 s, 05:56:18; `passed_real_model_scope`; trained `sdxl-canny` ControlNet active | `presets-integrated-sdxl-final.log`; `verify-native-presets-sdxl-final/native-presets-report.json` |
+| Checkpoint jar on Java 21 | **passed**, isolated dry-run screenshot, exit 0; root inspected Ready status and collapsed Settings presets | `presets-java21-jar-smoke.log`; `verify-native-presets-java21/main.png` |
+| Corrected jar on Java 21.0.3 | **passed**, isolated dry-run screenshot, exit 0; root inspected the 1484x881 `main.png` and 610x3086 full panel | `presets-final-java21-jar-smoke.log`; `presets-final-java21-version.log`; `verify-native-presets-java21-final/` |
+| Post-promotion registry and native coverage | **20/20 BuiltinsSuite** in 3 s, 06:23:26; **4/4 NativePresetsCoverageSuite** in 6 s, 06:23:31 | `presets-postpromotion-checks.log` |
+
+The Java 21 smokes used `-Xmx2g`, `--dry-run --screenshot main.png --exit-after 6`, isolated homes and copied
+Python packages, without a venv or user state. The final run used Java 21.0.3+7-LTS-152 and the corrected jar.
+Root verified its `main.png` is byte-identical to the earlier personally inspected Ready/dry-run screen (SHA-256
+`0025abfb17ab131ad977db5e1bdd0069e8ff7a828ed3d0a31011bf39691649a0`). The old `E643B96A...` hash
+remains checkpoint history; `0520F97B...` is the current assembled artifact.
+
+The first whole-wave source-scope review at `outputs/presets-wave-integration-review.md` assessed the `7b340bc`
+checkpoint against published main and returned **CHANGES REQUIRED**, with two Important integration findings and no
+Critical finding. I1: a preset's retained opaque source fields (including the built-in SDXL Refiner enable and Flux
+distilled CFG keys) survive storage but are absent from Select/Reapply warnings after import or reload. I2: fixed
+Config/Utilities resize and masked-content values can become Text atoms while actual native Choice controls require
+Integer atoms, so valid source values fail Apply. These routes were not exercised by the native-capture parity checks
+above. Root accepted both findings for tests-first correction. I1 now adds one generic `opaque-unapplied` warning
+per retained source key without reading/remapping its raw value or changing typed apply atomicity. Focused pure
+tests passed 19/19 and controller tests 24/24 after failing RED cases. I2 now emits an Integer for actual
+Integer-backed choices or a pinned Text label for Text-backed choices, and checks declared membership rather than
+guessing a runtime position. Compatibility tests passed 47/47 and the actual NativePresetFields schema suite 3/3
+after failing RED cases. The combined native 36-check run above exercises both source paths. The companion
+`outputs/presets-wave-integration-rereview-round1.md` **APPROVES the source-first checkpoint**, closes I1/I2 and
+reports no new Important/Critical finding. It accepts the existing CPU/SD1.5/SDXL evidence for unchanged native
+capture/model paths; those older runs did not exercise source enum import. Corrected full regression, rebuilt jar and
+Java 21 smoke are recorded above.
+The reviewer also found a classification error in this document set's 421-ID appendix; the seven built-in Config
+common routes per mode are now marked Conditional adapter, with source scope and 421 rows preserved.
+
+At the presets checkpoint the Python source was unchanged from `4701ccc` (root diff 0). The correct repository invocation is
+`python -m pytest` without a `tests` argument. Earlier wrong-invocation logs and the first partial SD1.5 helper
+failure are retained as diagnostics, not counted as product failures or passes: two queued jobs shared a display
+name, so the helper mapped the second to the first. The `f4f9cc3` fixture fix uses unique names plus selected and
+admitted Script IDs, without a product change. An earlier CPU 16-check pass predates that fixture correction;
+the final 30-second run above is authoritative.
+
+The CPU/SD1.5/SDXL native helper compares fixed-seed submitted bodies and decoded RGB for direct editing against
+native Save → Reload → Apply in Txt2Img, Img2Img, Inpaint, hires, variation, active AlwaysOn, XYZ child seeds and queued
+immutable plugin/script/Extra/ControlNet state. For Inpaint only, body parity is **mask-path-normalized** after the
+admitted mask path, PNG hash and decoded pixels are captured; distinct temporary paths mean literal raw bodies are
+not equal. The raw submitted bodies are retained in the local check artifacts. Txt2Img's Extra disabled state
+preserves a `.4` draft while submitting effective zero; Img2Img/Inpaint submit strength but currently warn that its
+image effect is unsupported. The trained SD1.5/SDXL ControlNet checks verify active model/image/weight, exact
+direct/applied body and RGB, a visible fixed-seed conditioning effect and queued freeze. Root visually inspected
+final base, ControlNet-disabled and ControlNet-active PNGs in both model families (six images): no black or invalid
+output, and active rectangle/triangle conditioning is visible. The low-step base images are parity fixtures, not
+image-quality examples. Offline preset operations observed no job, engine PID or seed work; internal RNG state was
+not directly exposed. The 4K source values and native widget
+geometry were checked without 4K inference; low-step hires parity used 128 base pixels ×5 =640 and is not an
+image-quality benchmark. Test helpers used process-local offline model flags and local pinned assets under main
+`outputs/model-cache/controlnet-acceptance-20261027`;
+the weights are not distributed here.
+
+**Ledger promotion and retained scope.**
+`outputs/presets-source-promotion.json` records 101/201/51 before and **103 done /199 todo /51 not applicable**
+after, with 139 distinct pending targets and all 353 index entries retained. Only the two target IDs for index 30
+`core:config-presets` and index 31 `core:preset-utilities` were added to `IMPLEMENTED`; the related S-map
+entries for 203 `controlnet_fastload`, 221 `scenario_loader` and 262 `core:state-manager` were separated and remain
+todo. Index 146 `model_presets` remains a distinct todo. `core:presets` was not added to `IMPLEMENTED`.
+`THIRD_PARTY_NOTICES.md` was regenerated with 132 projects and SHA-256
+`151f0df0135ba0cbcc9b7960ac416c5e56de9f5c2a05e0120223c3f1a838e3de`, byte-identical to the reviewed
+notice text. Post-promotion BuiltinsSuite and NativePresetsCoverageSuite passed as recorded above; the latter's
+earlier pre-promotion 2 fail/2 pass was the expected old-ledger mismatch. The native presets plan for indices 30/31
+is complete. At that presets checkpoint, the overall 353-entry goal remained unfinished with 199 todo entries;
+the remaining sources required their own implementation and verification.
+
+
+## Native card previews / index 333 (2026-10-27)
+
+The independent Scala/JavaFX implementation of `core:nsfw-card-blur` adapts the pinned
+[CurtisDS source](https://github.com/CurtisDS/stupid-nsfw-card-blur-a1111/tree/b2cdcebf97d1074278fb84e0a6eec3006dab0fe1)
+for native URI loading, image codecs, blur and keyboard interaction; upstream CSS, JavaScript and icons were not
+copied. The original six audited files match `outputs/next-core-card-blur-audit/manifest.json` in the main checkout;
+the archived original `LICENSE.txt` is 1084 bytes, SHA-256
+`e6b9326517557ffdbf4a4a2a9f10ab20a037e95dd08645412e64a8baf7549742`. The S mapping remains
+`todo:core:nsfw-card-blur`; adding only that ID to `IMPLEMENTED` produces the done status. The target is native
+core, not a registered inference plugin. The regenerated 353-entry ledger is 104 done / 198 todo /
+51 not applicable, with 138 distinct pending targets; the index status diff changes only entry 333. Remaining
+model types and other targets need their own work. Root ran
+`python/.venv-test/Scripts/python.exe scripts/extensions_matrix.py` and
+`python/.venv-test/Scripts/python.exe scripts/third_party.py --use-archived-licenses`; the latter generated
+notices for 133 projects. Post-promotion Java 17 sbt launcher tasks `plugins/testOnly sdfx.plugins.BuiltinsSuite`
+passed 20 tests in 4 seconds at 08:47:45 and `ui/assembly` was up to date in 1 second at 08:47:46; the log is
+`outputs/card-preview-final-ledger-build.log` in the canonical worktree. The resulting jar retained SHA-256
+`DE3DE322185786733AFDD84FF451108BDE890730BE7412F45FCAD21F8B1FD6AC`.
+
+Production source checkpoint `1590dff` and independently reviewed core helper `54dbdd4` were integrated into
+`9122a3c`. Whole-branch review `outputs/card-preview-whole-branch-review.md` approved without findings;
+Task 6 round 2's original review also approved. The production v0.01 assembled jar at that checkpoint has
+SHA-256 `DE3DE322185786733AFDD84FF451108BDE890730BE7412F45FCAD21F8B1FD6AC`; the final package, tag,
+release and final artifact hash were pending at that checkpoint; see the package verification below.
+
+The canonical regression and assembly logs are in `.worktrees/next-card-blur-design/outputs/`:
+`card-preview-release-regression-assembly.log` and `card-preview-release-serial-recheck-assembly.log`.
+The broad Scala run covered 1177 cases: 1175 passed and two fixture timeouts occurred (5000-file cancellation
+and the 128-thumbnail fixture at 30 seconds). The affected scanner suite (35 cases, 52 seconds, 08:35:41)
+and loader suite (21 cases, 46 seconds, 08:36:26) passed serial rechecks; assembly passed in 4 seconds at
+08:36:30. Two separate NativeBulk cases passed in 151.133 and 161.313 seconds (319 seconds total, 08:01:48).
+Thus all 1177 broad cases are covered by broad plus focused runs, and the two separate bulk cases bring the
+unique total to 1179; this was not one clean 1179-case command. The 867 passed / 1 skipped and 397 passed /
+82 skipped Python results above belong to the prior presets wave. Python subsequently changed in `90f311d` to fix
+packaged Windows engine DLL startup. Root's new no-torch run passed 400 tests with 82 skipped, and the focused
+startup tests passed 3. The torch suite then passed 870 tests with 1 skipped and 8 warnings in 117.92 seconds;
+the log is `.worktrees/windows-python-dll-startup/outputs/windows-dll-full-torch.log`.
+
+The user-requested reduced core native acceptance was run at `f31e412af6beb9f5196b6892ea47a0bcb89df548`.
+Reports and referenced screenshots are in `.worktrees/card-preview-native-acceptance/outputs/verify-native-card-previews/`,
+under each of `offline-core`, `cpu-core`, `sd15-core` and `sdxl-core`, in `card-preview-report.json`:
+
+| Scope | Result |
+|---|---|
+| Offline | 5 checks passed, zero engine starts, eight memory samples |
+| CPU dry run | 8 checks passed, five dry-run generations |
+| SD1.5 | 7 checks passed, three real generations, 68 seconds, 08:35:56 |
+| SDXL | 7 checks passed, three real generations, 79 seconds, 08:39:27 |
+
+For each real model, the three fixed-seed results retained exact submitted bodies and decoded RGB across the
+control, running and waiting job comparisons. Actual job snapshots and queue order remained frozen through view
+actions; reports record zero cleanup errors and three close/reopen cycles with coarse RAM and device VRAM
+observations. Root inspected the offline Show/Blur/Hide screenshots and SD1.5 output. The 2-step 256-pixel
+images are smoke fixtures, not an image-quality benchmark. This core gate does not establish exhaustive DPI,
+theme, all-mode, stress or per-allocation GPU coverage. Earlier failed fixture logs remain diagnostic evidence,
+not clean passes.
+
+
+### Windows v0.01 package verification
+
+The Windows runtime ZIP SHA-256 is
+`6e4a182ff136f44f4be289d39ef61b4078a23e0d651ddf263a6a2d8a69942f8b`. Four packaged launches passed;
+root inspected the first-run Python bootstrap dialog screenshot and an actual SD1.5 20-step, 512-pixel teapot
+image (SHA-256 `919e7ce214e844f5783ce089ec04f7831b15c5dd0e959d82374ae8fca43155b9`). The package's
+106 archived license hashes matched; it contains a bundled JVM but no Python runtime, model weights, user
+configuration, venv or output files. Check GitHub for release and tag publication status.
+
+
+### Temporal Lab isolated delivery candidate
+
+**Publication/cancellation follow-up:** After the earlier acceptance, review found that a cancellation accepted between the last check and directory publication could still publish output. The follow-up serializes cancellation admission with the start of publication without holding the server lock across filesystem I/O. Once publication starts, an explicit `too_late` decision is reported distinctly from interruption protection. Python focused tests passed 110 checks with the smoke environment and passed with expected optional-dependency skips without torch. Scala interruption/engine focused tests passed except that the first real-worker helper failed to reach its marker while NumPy was still initializing; a diagnostic trace identified the import, and a corrected test-only helper initializes NumPy before hello with BLAS threads limited. Its actual Scala supervisor-to-Python worker race passed, nine Temporal Lab UI tests passed and assembly succeeded. The helper uses synthetic frames and does not run model inference; its test cleanup helper does not prove teardown integrity. Logs are in `.worktrees/temporal-publication-hotfix/outputs/`.
+
+The candidate combines the separately reviewed Temporal Lab worker, owned protocol and native UI. On the isolated delivery checkout, the complete Python suite passed in both the smoke environment and the no-torch environment (the latter skips tests for unavailable optional dependencies); the Python temporal suites passed 87 checks, the targeted Scala suites passed 27, and assembly succeeded. The complete Scala suite passed 1,206 tests across five modules (`outputs/issue1-scala-full.log`); a separate OpenCV-present run passed 77 temporal and protocol checks. The native UI and real CPU worker passed nine synthetic operation/cancellation checks and six presentation checks in `outputs/issue1-native-final/` and `outputs/issue1-presentation-final/`. A further five checks in `outputs/issue1-model-images-final/` processed previously generated SD1.5 and SDXL stills; root inspected the outputs and the normal and minimum-size presentation screenshots. The model inputs are 2-step 256×256 smoke images, copied into artificial sequences with a darkened middle frame; no new GPU inference occurred. These checks are not a natural-video or image-quality assessment. The source was packaged into an internal jpackage image with bundled JVM, Temporal Lab Python files, the upstream license and notice; the candidate ZIP SHA-256 is `326a7a7f6b4bb7b63f3312f2a1a16dd0b6e0eaa6edaa8ef372055eac7b45b35d`. Extracted to a path with spaces, its dry-run launch exited successfully and its screenshot was inspected. The ZIP is a test artifact, not a newly published release. Earlier worktree reports provide additional bounded evidence:
+
+- `.worktrees/abysz-lab-ui/outputs/temporal-full-check-1/temporal-native-10199051309875267777/temporal-native-report.json`: passed nine checks against the native UI and actual worker, using synthetic frames and video. Checks include DFI preview/run, deflicker, fuse, MJPEG extraction, unchanged inputs, blocked interruption and owned cancellation with no final output. No model generation or GPU inference was performed.
+- `.worktrees/abysz-lab-ui/outputs/temporal-model-check-1/temporal-model-image-6689123654861684221/temporal-model-image-report.json`: passed five checks using prior SD1.5 and SDXL outputs as still frames. Each was a 2-step 256×256 prior smoke image; sequences copy the still and artificially darken the middle frame. The native buttons dispatched DFI/deflicker, paths were injected and no new inference occurred. This is neither a natural-video nor image-quality assessment.
+- `.worktrees/abysz-lab-ui/outputs/temporal-presentation-green-wrap/temporal-presentation-17070255079754669772/temporal-presentation-report.json`: passed six native presentation checks with synthetic frames/video, including latest-input inspection and explanations.
+
+The source reference is AbyszOne/Abysz-LAB-Ext commit `deff0d4b4a208f862299b14b93e088f613373153`. Its original GPL-3.0 `LICENSE` is archived byte-for-byte as `licenses/AbyszOne__Abysz-LAB-Ext.txt` with SHA-256 `3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986`. The collector identifies the source-derived algorithms under its `ported` category; this record does not establish a separate legal conclusion. The smoke Python environment imports Diffusers 0.32.2 via its parent environment, rather than the 0.33.1 requirements pin. Upstream numerical parity is not established; Inter Blur and extraction timestamps deliberately differ. Estimates limit application-controlled array work rather than guaranteeing a process-wide memory ceiling, because a codec may allocate before its decoded shape is inspected. Filesystem safeguards do not claim protection from malicious concurrent ancestor substitution.
+# Color correction wave, 2026-10-30
+
+The subsequent GPU temperature wave is recorded in [temperature-guard-verification.md](temperature-guard-verification.md): real SD1.5/SDXL sampling and native cancellation/recovery, AMD fixture/schema limits, notices and whole regression results. It covers index 186; see the twenty-issue tracker for release scope.
+
+See [color-correction-verification.md](color-correction-verification.md) for native Extras/script implementation, real SD1.5/SDXL image inspection, native explicit-reference/fallback/comparison/error-retry checks, whole Python regression exit 0, Scala report/recheck scope, source licensing and numerical/visual limits. Final assembly and Java 21 dry-run launch passed. This wave covers index 261 only; the twenty-issue release goal remains unfinished.
+
+## PNGINFO Injection (2026-10-30)
+
+See [verification](pnginfo-injection-verification.md) for real SD1.5/SDXL native PNG, wildcard, ADetailer and embedding checks, SD1.5 ControlNet provenance, exact pixel parity, cache identity handling and license boundaries. Whole Python passed. Original whole Scala run had five Windows drive-probe timeouts; focused recheck passed all 22 tests.
+
+## Steps Animation (2026-10-30)
+
+See [verification](steps-animation-verification.md) for real SD1.5/SDXL native Generate/Interrupt/recovery, txt2img/img2img/hires pixel parity, actual encoded and decoded videos, five-codec checks, incomplete-export policy, mutation/error coverage and licensing. Whole Python passed; whole Scala passed 1269 tests with one skip; final assembly passed. See the linked record for artifact hash and measured limits.
+
+## StylePile (2026-10-30)
+
+See [verification](stylepile-verification.md) for source/blob/SHA provenance, complete reference catalog, native gallery and custom data, SD1.5/SDXL configured prompt and img2img RGB parity, sequence/interrupt/recovery, whole Scala (1289 passed, one skip), assembly and assembled-jar-only native checks. Source adaptations and limits are explicit; no release publication is claimed.

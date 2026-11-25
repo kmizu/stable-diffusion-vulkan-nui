@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "stable-diffusion-nui": {
+      "command": "C:/apps/SDNUI/SDNUI.exe",
+      "args": ["--mcp", "--home", "C:/apps/SDNUI"]
+    }
+  }
+}

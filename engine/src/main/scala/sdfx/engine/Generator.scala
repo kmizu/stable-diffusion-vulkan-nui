@@ -1,0 +1,1084 @@
+package sdfx.engine
+
+import sdfx.core.config.{AppHome, Settings}
+import sdfx.core.gallery.OutputNaming
+import sdfx.core.infotext.{HardwareInfo, ImageFacts, Infotext, Img2ImgHiresMetadata}
+import sdfx.core.model.*
+import sdfx.core.plugins.api.*
+import sdfx.core.png.PngMetadata
+import sdfx.core.protocol.*
+import sdfx.core.payload.*
+
+import java.awt.image.BufferedImage
+import java.nio.file.{Files, Path, Paths}
+import scala.concurrent.duration.*
+import scala.concurrent.{Await, Future}
+import scala.util.Random
+import scala.util.control.NonFatal
+
+/** Receives everything a single job produces. All callbacks run on the job thread or the engine reader thread. */
+trait GenerationListener:
+  /** Backend interruption is authoritative even before its admission reply arrives. */
+  private[engine] def onEngineInterrupted(): Unit = ()
+  /** Private transport identity for queued work; never part of GenerationParams or image metadata. */
+  def interruptionOwner: Option[String] = None
+  private[engine] def imageSecret: Option[sdfx.core.png.ImageScrambleSecret] = None
+  private[engine] def fastloadPayload: Option[(String, Array[Byte])] = None
+  private[engine] def editorPreview: Option[EditorPreviewPayload] = None
+  private[engine] def wdBatchControl: Option[ExtrasBatchControl] = None
+  private[engine] def payloadJobId: Option[String] = None
+  private[engine] def submittedPayloadContext: Option[SubmittedPayloadContext] = None
+  private[engine] def payloadCaptureOptions: Option[CaptureOptions] = None
+  private[engine] def inputProvenance: Option[(String, String)] = None
+  private[engine] def nextPayloadKey(): PayloadKey = PayloadKey(s"direct-${java.util.UUID.randomUUID()}", 1)
+  def onPreparedRequest(snapshot: PayloadSnapshot): Unit = ()
+  def onPayloadLifecycle(key: PayloadKey, state: PayloadState, completionJson: Option[String]): Unit = ()
+  def onProgress(p: EngineEvent.Progress): Unit = ()
+  def onPreview(p: EngineEvent.Preview): Unit = ()
+  def onLog(message: String): Unit = ()
+  def onStatus(text: String, done: Int, total: Int): Unit = ()
+  def onImageSaved(image: OutputImage, grid: Boolean): Unit = ()
+  /** A temp file was created on behalf of the job (engine output, transient generation, upscale, tempFile).
+    * JobQueue deletes these when the job ends, except files that are part of the job's output.
+    */
+  def onTempFile(path: Path): Unit = ()
+  def isInterrupted: Boolean = false
+
+object GenerationListener:
+  val none: GenerationListener = new GenerationListener {}
+
+private[engine] object EditorPreviewMetadata:
+  private val key = "Embedding editor preview"
+  def forJob(params: GenerationParams, active: Boolean): GenerationParams =
+    val clean = params.extra - key
+    params.copy(extra = if active then clean.updated(key, "Unsaved embedding edits") else clean)
+
+/** Finite upper bounds for blocking engine calls. A generation fails (and the engine is restarted) when no
+  * progress/preview/log event arrives for `generationInactivity`.
+  */
+final case class EngineTimeouts(
+    load: FiniteDuration = 30.minutes,
+    generationInactivity: FiniteDuration = 10.minutes,
+    upscale: FiniteDuration = 30.minutes
+)
+
+/** Resource limits enforced by the job-scoped context for every generation of a job (script sub-generations
+  * included), checked before anything is sent to the engine.
+  */
+final case class JobLimits(
+    maxSide: Int = GenerationParams.MaxSide,
+    maxImagesPerGeneration: Int = 64,
+    maxGenerations: Int = 10000,
+    maxPixelsPerGeneration: Long = 64L * 1024 * 1024
+):
+  /** Throws [[JobLimitExceeded]] when `p` (as the `n`-th generation of the job, 1-based) breaks a limit. */
+  def check(p: GenerationParams, n: Int): Unit =
+    def fail(msg: String) = throw JobLimitExceeded(msg)
+    if n > maxGenerations then fail(s"job exceeds the limit of $maxGenerations generations")
+    if p.width > maxSide || p.height > maxSide then fail(s"size ${p.width}x${p.height} exceeds the maximum side $maxSide")
+    val images = p.batchSize.toLong * p.nIter
+    if images > maxImagesPerGeneration then fail(s"batch size x count = $images exceeds the limit of $maxImagesPerGeneration images")
+    val px = p.width.toLong * p.height * p.batchSize
+    if px > maxPixelsPerGeneration then fail(s"${p.width}x${p.height} x batch ${p.batchSize} = $px pixels exceeds the limit of $maxPixelsPerGeneration")
+    if p.hires.enabled && !p.isImg2Img then
+      val (hw, hh) = p.hires.targetSize(p.width, p.height)
+      if hw > maxSide || hh > maxSide then fail(s"hires target ${hw}x$hh exceeds the maximum side $maxSide")
+      val hpx = hw.toLong * hh * p.batchSize
+      if hpx > maxPixelsPerGeneration then fail(s"hires ${hw}x$hh x batch ${p.batchSize} = $hpx pixels exceeds the limit of $maxPixelsPerGeneration")
+    Img2ImgHiresMetadata.active(p.hooks).foreach { config =>
+      val source = if p.hires.enabled && !p.isImg2Img then p.hires.targetSize(p.width, p.height) else (p.width, p.height)
+      val (rw, rh) = Img2ImgHiresMetadata.targetSize(config, source._1, source._2)
+      if rw > maxSide || rh > maxSide then fail(s"img2img Hires target ${rw}x$rh exceeds the maximum side $maxSide")
+      // Refinement runs one completed image at a time.
+      if rw.toLong * rh > maxPixelsPerGeneration then fail(s"img2img Hires ${rw}x$rh exceeds the pixel limit $maxPixelsPerGeneration")
+    }
+
+/** A generation request violates the job's [[JobLimits]]. */
+final case class JobLimitExceeded(message: String) extends IllegalArgumentException(message)
+
+/** What [[Generator.prepare]] produces: the params recorded in infotext and the request sent to the engine. */
+final case class PreparedGeneration(recorded: GenerationParams, request: GenerationRequest, mode: String, warnings: Seq[String],
+    finalOutputDir: Option[Path] = None)
+
+/** The single-generation pipeline (seed resolution, styles, LoRA syntax, model switching, engine call, PNG saving).
+  * The Generator itself is a [[PluginContext]] without job scope; [[forJob]] gives a job-scoped context whose
+  * `generate` also applies the job's AlwaysOn plugins.
+  */
+final class Generator(
+    client: EngineClient,
+    catalog: ModelCatalog,
+    home: AppHome,
+    settings: () => Settings,
+    styles: () => Seq[PromptStyle] = null,
+    random: Random = new Random(),
+    timeouts: EngineTimeouts = EngineTimeouts(),
+    val payloads: RequestPayloadStore = new RequestPayloadStore()
+) extends PluginContext:
+
+  private val styleSource: () => Seq[PromptStyle] = Option(styles).getOrElse(() => Styles.load(home.stylesFile))
+
+  def outputsDir: Path = home.outputs(settings())
+  private[engine] def defaultCaptureOptions: CaptureOptions = CaptureOptions(settings().apiPayloadIncludeImageContents)
+
+  // ---- PluginContext (unscoped) ---------------------------------------------------------------------------
+  def generate(p: GenerationParams): Seq[OutputImage] = generateWith(p, GenerationListener.none)
+  def upscale(image: Path, upscaler: String, scale: Double): Path = upscaleImage(image, upscaler, scale)
+  def saveImage(img: BufferedImage, kind: String, params: GenerationParams, infotext: String): OutputImage =
+    saveWith(img, kind, params, infotext, GenerationListener.none)
+  def tempFile(suffix: String): Path = Files.createTempFile(home.tmpDir(settings()), "sdfx-", suffix)
+  def choices(source: ChoiceSource): Seq[String] = catalog.choices(source)
+  override def modelPath(source: ChoiceSource, name: String): Option[String] = catalog.pathOf(source, name)
+  override def checkpointInfo(name: Option[String]): Option[CheckpointInfo] = name match
+    case Some(n) => catalog.findCheckpoint(n).map(e => CheckpointInfo(e.name, e.kind))
+    case None => client.supervisor.loadedModel.map(m => CheckpointInfo(catalog.findCheckpoint(m.path).map(_.name).getOrElse(m.name), m.kind))
+  override def loadCheckpoint(name: String, vae: Option[String]): Unit =
+    ensureModel(GenerationParams(checkpoint = Some(name), vae = vae))
+  override def engineCall(kind: String, params: ujson.Obj): ujson.Value = engineCallWith(kind, params, GenerationListener.none)
+  def log(message: String): Unit = System.err.println(s"[sdfx] $message")
+  def status(text: String, done: Int, total: Int): Unit = ()
+  def isInterrupted: Boolean = false
+
+  /** Non-queue tool context bound to a snapshot; secrets are never added to request metadata. */
+  def forImageSession(secret: Option[sdfx.core.png.ImageScrambleSecret], warn: String => Unit = _ => ()): PluginContext =
+    forJob(new GenerationListener {
+      override private[engine] def imageSecret = secret
+      override def onLog(message: String): Unit = warn(message)
+    })
+
+  /** A context bound to one job: events go to `listener`; every `generate` applies the active AlwaysOn plugins. */
+  def forJob(listener: GenerationListener, alwaysOn: Seq[(Plugin, Values)] = Nil, limits: JobLimits = JobLimits(),
+      provenanceProvider: () => Option[(String, String)] = () => None,
+      snapshotProvenanceProvider: () => Option[(String, String)] = () => None): PluginContext =
+    val self = this
+    val generations = new java.util.concurrent.atomic.AtomicInteger(0)
+    val fastloadPlan = alwaysOn.find((plugin, values) => plugin.id == "controlnet_fastload" && plugin.isActive(values))
+      .flatMap((_, values) => FastloadJobPlan.fromValues(values))
+    val activeFastloadPayload = new ThreadLocal[Option[(String, Array[Byte])]]()
+    val activeInputSnapshot = new ThreadLocal[Option[(String, String)]]()
+    def limited(p: GenerationParams): GenerationParams =
+      val q = applyAlwaysOn(p, alwaysOn)
+      limits.check(q, generations.incrementAndGet())
+      q
+    // Set when an engine call ends with an `interrupted` error, so scripts that catch the error see
+    // `isInterrupted == true` and can assemble partial output (grids) before rethrowing.
+    val engineInterrupted = new java.util.concurrent.atomic.AtomicBoolean(false)
+    def guard[T](body: => T): T =
+      try body
+      catch
+        case e: EngineError if e.isInterrupted =>
+          engineInterrupted.set(true)
+          listener.onEngineInterrupted()
+          throw e
+    val scopedListener: GenerationListener = new GenerationListener:
+      override def interruptionOwner: Option[String] = listener.interruptionOwner
+      override private[engine] def imageSecret: Option[sdfx.core.png.ImageScrambleSecret] = listener.imageSecret
+      override private[engine] def fastloadPayload: Option[(String, Array[Byte])] = Option(activeFastloadPayload.get()).flatten
+      override private[engine] def editorPreview: Option[EditorPreviewPayload] = listener.editorPreview
+      override private[engine] def payloadJobId: Option[String] = listener.payloadJobId
+      override private[engine] def submittedPayloadContext: Option[SubmittedPayloadContext] = listener.submittedPayloadContext
+      override private[engine] def payloadCaptureOptions: Option[CaptureOptions] = listener.payloadCaptureOptions
+      override private[engine] def inputProvenance: Option[(String, String)] =
+        Option(activeInputSnapshot.get()).flatten.orElse(provenanceProvider())
+      override private[engine] def nextPayloadKey(): PayloadKey = listener.nextPayloadKey()
+      override def onPreparedRequest(snapshot: PayloadSnapshot): Unit = listener.onPreparedRequest(snapshot)
+      override def onPayloadLifecycle(key: PayloadKey, state: PayloadState, completionJson: Option[String]): Unit =
+        listener.onPayloadLifecycle(key, state, completionJson)
+      override def onProgress(p: EngineEvent.Progress): Unit = listener.onProgress(p)
+      override def onPreview(p: EngineEvent.Preview): Unit = listener.onPreview(p)
+      override def onLog(m: String): Unit = listener.onLog(m)
+      override def onStatus(t: String, d: Int, n: Int): Unit = listener.onStatus(t, d, n)
+      override def onImageSaved(i: OutputImage, g: Boolean): Unit = listener.onImageSaved(i, g)
+      override def onTempFile(path: Path): Unit = listener.onTempFile(path)
+      override def isInterrupted: Boolean = listener.isInterrupted || engineInterrupted.get()
+    new PluginContext:
+      override def imageScramblingEnabled: Boolean = listener.imageSecret.nonEmpty
+      override def plaintextVideoAllowed: Boolean = listener.imageSecret.forall(_.plaintextVideoAllowed)
+      override def resourceHashesEnabled: Boolean = alwaysOn.exists((plugin, values) =>
+        plugin.id == "pnginfo_injection" && plugin.isActive(values))
+      private def withFastload[T](p: GenerationParams, persist: Boolean)(run: GenerationParams => T): T =
+        val normal = limited(p)
+        fastloadPlan match
+          case None => run(normal)
+          case Some(plan) =>
+            val staged = scala.collection.mutable.ArrayBuffer.empty[Path]
+            val owner = listener.interruptionOwner.getOrElse(java.util.UUID.randomUUID().toString)
+            def check(): Unit = if isInterrupted then throw interruptedError
+            def worker(request: ujson.Obj): ujson.Value =
+              check()
+              val value = await(client.controlNetFastloadOwned(request, owner, listener.imageSecret), timeouts.upscale, "Fastload")
+              check()
+              value
+            def stage(bytes: Array[Byte]): String =
+              check()
+              val image = FastloadInputCodec.decode(bytes)
+              val path = Files.createTempFile(home.tmpDir(settings()), "fastload-input-", ".png")
+              staged += path
+              sdfx.core.png.ScrambledPng.write(image, path, Nil, listener.imageSecret.map(_.use(identity)))
+              path.toString
+            val previousPayload = Option(activeFastloadPayload.get()).flatten
+            try
+              activeFastloadPayload.set(None)
+              val prepared = FastloadGeneration.prepare(normal, plan, listener.imageSecret, worker, stage)
+              if prepared.save && persist then
+                val encoded = worker(ujson.Obj("operation" -> "encode", "units" -> prepared.units))("base64").str
+                require(encoded.length <= 180000000, "Fastload output is too large")
+                activeFastloadPayload.set(Some(plan.saveFormat -> java.util.Base64.getDecoder.decode(encoded)))
+              run(prepared.params)
+            finally
+              if previousPayload.isDefined then activeFastloadPayload.set(previousPayload) else activeFastloadPayload.remove()
+              staged.foreach(path => try Files.deleteIfExists(path) catch case NonFatal(_) => ())
+      def generate(p: GenerationParams): Seq[OutputImage] = guard(withFastload(p, true)(self.generateWith(_, scopedListener)))
+      override def generateWithInputSnapshot(p: GenerationParams, original: String): Seq[OutputImage] =
+        val staged = p.img2img.map(_.initImage).filter(_.nonEmpty).getOrElse(
+          throw new IllegalArgumentException("Snapshotted generation requires an init image"))
+        require(original.nonEmpty, "Snapshotted input requires original provenance")
+        val realOriginal = snapshotProvenanceProvider().collect { case (stagedSource, source) if stagedSource == original => source }
+          .orElse(provenanceProvider().collect { case (folderStage, source) if folderStage == original => source }).getOrElse(original)
+        val previous = Option(activeInputSnapshot.get()).flatten
+        activeInputSnapshot.set(Some((staged, realOriginal)))
+        try generate(p)
+        finally activeInputSnapshot.set(previous)
+      override def generateTransient(p: GenerationParams): Seq[OutputImage] =
+        guard(withFastload(p, false)(self.generateTransientWith(_, scopedListener)))
+      def upscale(image: Path, upscaler: String, scale: Double): Path = guard {
+        if isInterrupted then throw interruptedError
+        val out = self.upscaleImage(image, upscaler, scale, listener.interruptionOwner, listener.imageSecret, listener.onLog)
+        listener.onTempFile(out)
+        out
+      }
+      def saveImage(img: BufferedImage, kind: String, params: GenerationParams, infotext: String): OutputImage =
+        self.saveWith(img, kind, params, infotext, scopedListener)
+      override def readImage(path: Path): BufferedImage =
+        val decoded = sdfx.core.png.ScrambledPng.read(path, listener.imageSecret.map(_.use(identity)))
+        if decoded.scrambled && decoded.passwordVerified.isEmpty then listener.onLog(ScrambledInput.LegacyWarning)
+        decoded.image
+      override def readImageBytes(bytes: Array[Byte]): BufferedImage =
+        val decoded = sdfx.core.png.ScrambledPng.read(bytes, listener.imageSecret.map(_.use(identity)))
+        if decoded.scrambled && decoded.passwordVerified.isEmpty then listener.onLog(ScrambledInput.LegacyWarning)
+        decoded.image
+      override def writeTempImage(image: BufferedImage, path: Path): Unit =
+        sdfx.core.png.ScrambledPng.write(image, path, Nil, listener.imageSecret.map(_.use(identity)))
+      def tempFile(suffix: String): Path =
+        val t = self.tempFile(suffix)
+        listener.onTempFile(t)
+        t
+      def choices(source: ChoiceSource): Seq[String] = self.choices(source)
+      override def modelPath(source: ChoiceSource, name: String): Option[String] = self.modelPath(source, name)
+      override def checkpointInfo(name: Option[String]): Option[CheckpointInfo] = self.checkpointInfo(name)
+      override def loadCheckpoint(name: String, vae: Option[String]): Unit = self.loadCheckpoint(name, vae)
+      override def engineCall(kind: String, params: ujson.Obj): ujson.Value = guard {
+        if isInterrupted then throw interruptedError
+        if kind == "img2vid" then requirePlaintextVideoAllowed()
+        val fields = kind match
+          case "caption" | "restore_faces" | "novel_view" | "img2vid" => Seq("image_path")
+          case "image_tool" => Seq("image_path", "reference_path", "mask_path")
+          case _ => Nil
+        ScrambledInput.withObject(params, fields, home.tmpDir(settings()), listener.imageSecret, listener.onLog) { resolved =>
+          self.engineCallWith(kind, resolved, scopedListener)
+        }
+      }
+      def log(message: String): Unit = listener.onLog(message)
+      def status(text: String, done: Int, total: Int): Unit = listener.onStatus(text, done, total)
+      def isInterrupted: Boolean = scopedListener.isInterrupted
+
+  def applyAlwaysOn(p: GenerationParams, alwaysOn: Seq[(Plugin, Values)]): GenerationParams =
+    alwaysOn.foldLeft(p) { case (acc, (pl, v)) =>
+      if pl.kind == PluginKind.AlwaysOn && pl.isActive(v) then pl.process(acc, v) else acc
+    }
+
+  private def interruptedError = EngineError(Protocol.ErrorCodes.Interrupted, "interrupted")
+
+  // ---- pipeline ---------------------------------------------------------------------------------------------
+
+  /** A1111 style random seed (0 until 2^32-1). */
+  def randomSeed(): Long = (random.nextLong() & 0xffffffffL) % 4294967294L
+
+  /** Seeds, styles, LoRA extraction and path resolution; no engine calls. */
+  /** Hooks whose `model` field names a file from a model list; the engine gets the resolved path (infotext keeps
+    * the name).
+    */
+  private val hookModelSources: Map[String, ChoiceSource] = Map(
+    "ip_adapter" -> ChoiceSource.ControlNets, "controllllite" -> ChoiceSource.ControlNets,
+    "fooocus_inpaint" -> ChoiceSource.ControlNets, "face_restore" -> ChoiceSource.FaceRestorers,
+    "photomaker" -> ChoiceSource.PhotoMakerModels)
+
+  def resolveHookModels(hooks: Map[String, ujson.Value], warn: String => Unit): Map[String, ujson.Value] =
+    hooks.map {
+      case ("batch_face_swap", o: ujson.Obj) =>
+        o.value.get("checkpoint") match
+          case Some(ujson.Str(name)) if name.trim.nonEmpty && !name.trim.equalsIgnoreCase("none") =>
+            val model = catalog.findCheckpoint(name.trim).getOrElse(
+              throw EngineError(Protocol.ErrorCodes.InvalidParams, s"Batch Face Swap checkpoint not found: $name"))
+            "batch_face_swap" -> ujson.Obj.from(o.value.toSeq.map((field, value) =>
+              field -> (if field == "checkpoint" then ujson.Str(model.path) else value)))
+          case Some(ujson.Str(_)) | None => "batch_face_swap" -> o
+          case _ => throw EngineError(Protocol.ErrorCodes.InvalidParams, "Batch Face Swap checkpoint must be a string")
+      case (k, o: ujson.Obj) if hookModelSources.contains(k) =>
+        o.value.get("model") match
+          case Some(ujson.Str(name)) if name.nonEmpty && name != "None" =>
+            catalog.pathOf(hookModelSources(k), name) match
+              case Some(path) => k -> ujson.Obj.from(o.value.toSeq.map((f, v) => f -> (if f == "model" then ujson.Str(path) else v)))
+              case None =>
+                warn(s"$k model not found: $name")
+                k -> o
+          case _ => k -> o
+      case other => other
+    }
+
+  def prepare(requested: GenerationParams): PreparedGeneration =
+    val problems = requested.validate
+    if problems.nonEmpty then throw EngineError(Protocol.ErrorCodes.InvalidParams, problems.mkString("; "))
+    val p0 = requested.withEngineSize
+    val seed = if p0.seed < 0 then randomSeed() else p0.seed
+    val subseed = if p0.subseed < 0 then randomSeed() else p0.subseed
+    val composed = HiresPreparation.compose(p0, styleSource(), settings().hiresFixTweaks.saveTemplate)
+    val prompt = composed.prompt
+    val negative = composed.negativePrompt
+    val refinement = Img2ImgHiresMetadata.active(composed.hooks)
+    val recorded = composed.copy(seed = seed, subseed = subseed,
+      extra = p0.extra.filterNot((key, _) => HardwareInfo.fieldNames(key) ||
+        Set("Hires prompt mode", "NUI Hires template", "NUI Manual LoRAs", "Aesthetic embedding SHA256", Img2ImgHiresMetadata.key)(key)) ++
+        refinement.map(h => Img2ImgHiresMetadata.key -> Img2ImgHiresMetadata.encode(h)))
+
+    val keywordReplay = p0.extra.contains("Model keyword settings") ||
+      p0.extra.get("Model keyword replay").exists(_.equalsIgnoreCase("true"))
+    val ex = LoraSyntax.extract(prompt, preserveSpacing = keywordReplay)
+    val hrEx = LoraSyntax.extract(recorded.hires.prompt)
+    val refinePrompt = refinement.map(_("prompt").str).filter(_.nonEmpty).getOrElse(prompt)
+    val refineEx = LoraSyntax.extract(refinePrompt, preserveSpacing = keywordReplay)
+    val composable = recorded.hooks.get("composable_lora").exists {
+      case o: ujson.Obj => o.value.get("enabled").forall {
+        case ujson.Bool(value) => value
+        case ujson.Num(value) => value != 0
+        case ujson.Str(value) => !Set("disable", "disabled", "false", "off", "no", "0", "")(value.trim.toLowerCase(java.util.Locale.ROOT))
+        case _ => true
+      }
+      case ujson.Bool(value) => value
+      case ujson.Str(value) => Set("enable", "enabled", "true", "on", "yes", "1")(value.trim.toLowerCase(java.util.Locale.ROOT))
+      case _ => false
+    }
+    val allLoras =
+      if composable then
+        // Placement and repeated tag weights belong to the composable engine. Resolve
+        // each file once; retain its first native TE/UNet settings instead of summing tags.
+        val inversion = recorded.hooks.get("img2imgalt").collect { case o: ujson.Obj =>
+          Seq("override_prompt", "override_negative").flatMap(key => o.value.get(key).collect { case ujson.Str(v) => v }).mkString(" ")
+        }.getOrElse("")
+        val tags = """<(?:lora|lyco):[^>]+>""".r.findAllIn(prompt + " " + recorded.hires.prompt + " " + inversion +
+          refinement.fold("")(h => " " + h("prompt").str + " " + h("negative_prompt").str))
+          .flatMap(t => LoraSyntax.extract(t).loras).toSeq
+        (recorded.loras ++ tags).foldLeft(Vector.empty[LoraRef])((found, lr) =>
+          if found.exists(existing => existing.name == lr.name && existing.dyn == lr.dyn) then found else found :+ lr)
+      else recorded.loras ++ ex.loras ++ hrEx.loras.filterNot(l => ex.loras.exists(x => x.name == l.name && x.dyn == l.dyn))
+    val separateHiresLoras = HiresPreparation.active(recorded).isDefined && !composable
+    val warnings = Seq.newBuilder[String]
+    // A user explicitly selected this local embedding for the job. Remember its
+    // parent locally for future name/hash replay, never in the PNG itself.
+    recorded.hooks.get("aesthetic_gradients").collect { case o: ujson.Obj => o }
+      .flatMap(_.value.get("embedding")).collect { case ujson.Str(value) => value.trim }.filter(_.nonEmpty).foreach { value =>
+        val network = value.startsWith("\\\\") || value.startsWith("//") || value.startsWith("\\/") || value.startsWith("/\\") ||
+          value.toLowerCase(java.util.Locale.ROOT).startsWith("file:") || value.toLowerCase(java.util.Locale.ROOT).startsWith("smb:")
+        if !network then scala.util.Try(Paths.get(value)).toOption.filter(_.isAbsolute).filter(Files.isRegularFile(_)).foreach { file =>
+          scala.util.Try(file.toRealPath()).toOption.foreach { real =>
+            val parent = real.getParent
+            if parent != null && !parent.toString.startsWith("\\\\") && !parent.toString.startsWith("//") then
+              sdfx.core.aesthetic.AestheticEmbeddingDirectories.register(
+                home.configDir.resolve("aesthetic-embedding-directories.json"), parent, p => p == parent)
+                .left.foreach(warning => warnings += s"Aesthetic replay directory was not registered: $warning")
+          }
+        }
+      }
+    val refinementLoras = refinement.map(_ => recorded.loras ++ refineEx.loras)
+    val keywordActive = recorded.hooks.get("model_keyword").exists(_.isInstanceOf[ujson.Obj])
+    val keywordSelected = recorded.hooks.get("model_keyword").collect { case o: ujson.Obj => o }
+      .flatMap(_.value.get("lora")).collect { case ujson.Str(n) if n.nonEmpty && n != "None" => n }
+    val selectedLora = keywordSelected.map { name =>
+      name -> catalog.findLora(name).getOrElse(throw EngineError(Protocol.ErrorCodes.InvalidParams, s"LoRA not found: $name"))
+    }
+    val keywordPaths = if keywordActive then
+      val entries = catalog.loras
+      val exact = entries.iterator.map(e => e.name -> e.path).toMap
+      val aliases = entries.foldLeft(exact) { (paths, entry) =>
+        val name = entry.name.replace('\\', '/').split('/').last
+        if paths.contains(name) then paths else paths.updated(name, entry.path)
+      }
+      selectedLora.fold(aliases) { (name, entry) => aliases.updated(name.replace('\\', '/').split('/').last, entry.path) }
+    else Map.empty[String, String]
+    val loraPaths = (allLoras ++ refinementLoras.getOrElse(Nil)).map(_.name).distinct.flatMap { n =>
+      catalog.findLora(n).map(e => n -> e.path).orElse {
+        val f = home.resolve(n)
+        if Files.isRegularFile(f) && withinDirs(f, settings().modelDirs.lora) then Some(n -> f.toString)
+        else
+          warnings += s"LoRA not found: $n"
+          None
+      }
+    }.toMap ++ keywordPaths
+    val cnPaths = recorded.controlnet.filter(u => u.enabled && u.model.nonEmpty && u.model != "None").flatMap { u =>
+      catalog.findControlNet(u.model).map(e => u.model -> e.path).orElse {
+        warnings += s"ControlNet model not found: ${u.model}"
+        None
+      }
+    }.toMap
+    val sonarUpscaler = recorded.hooks.get("sonar").collect {
+      case o: ujson.Obj if o.value.get("upscale").contains(ujson.Bool(true)) && o.value.contains("upscaler") => o("upscaler").str
+    }
+    def findUpscalerPath(name: String): Option[String] = catalog.findUpscaler(name).map(_.path)
+    val upPaths = Seq(Option.when(recorded.hires.enabled)(recorded.hires.upscaler), refinement.map(_("upscaler").str), sonarUpscaler).flatten
+      .flatMap(u => findUpscalerPath(u).map(u -> _))
+      .toMap
+    val s = settings()
+    val resolvedHooks = resolveHookModels(recorded.hooks, msg => warnings += msg).map {
+      case ("img2img_hires_fix", _) if refinement.isDefined =>
+        val config = ujson.Obj.from(refinement.get.value.toSeq)
+        if !composable && config("prompt").str.nonEmpty then config("prompt") = refineEx.prompt
+        "img2img_hires_fix" -> config
+      case ("model_keyword", o: ujson.Obj) =>
+        val config = ujson.Obj.from(o.value.toSeq)
+        config("_base_prompt") = prompt
+        config("_mapping_dir") = home.configDir.resolve("model-keyword").toString
+        selectedLora.foreach { (name, entry) =>
+          val file = java.nio.file.Path.of(entry.path).getFileName.toString
+          val dot = file.lastIndexOf('.')
+          config("_lora_path") = entry.path
+          config("lora_name") = name.replace('\\', '/') + (if dot >= 0 then file.substring(dot) else "")
+        }
+        "model_keyword" -> config
+      case (id @ ("save_intermediate" | "composable_lora"), o: ujson.Obj) =>
+        val persistent = ujson.Obj.from(o.value.toSeq)
+        persistent("output_dir") = home.outputs(s).toAbsolutePath.toString
+        id -> persistent
+      case other => other
+    }
+    val sent = recorded.copy(
+      prompt = if composable then prompt else ex.prompt,
+      hires = recorded.hires.copy(prompt = if composable then recorded.hires.prompt else hrEx.prompt),
+      loras = (if separateHiresLoras then recorded.loras ++ ex.loras else allLoras).filter(l => loraPaths.contains(l.name)),
+      hooks = resolvedHooks
+    )
+    val req = GenerationRequest(
+      params = sent,
+      outputDir = home.tmpDir(s).toAbsolutePath.toString,
+      loraPaths = loraPaths,
+      manualLoras = Option.when(composable || keywordActive)(recorded.loras.filter(l => loraPaths.contains(l.name))),
+      hiresLoras = Option.when(separateHiresLoras)((recorded.loras ++ hrEx.loras).filter(l => loraPaths.contains(l.name))),
+      img2imgHiresLoras = refinementLoras.map(_.filter(l => loraPaths.contains(l.name))),
+      embeddingPaths = catalog.embeddings.map(_.path),
+      controlnetPaths = cnPaths,
+      upscalerPaths = upPaths,
+      previewEvery = s.previewEvery,
+      previewMethod = s.previewMethod,
+      systemInfoFields = s.systemInfoMetadataFields,
+      hardwareInfo = HardwareInfo.Options(s.hardwareInfoEnabled, s.hardwareInfoRemark),
+      vaeRecoveryDir = home.outputs(s).toAbsolutePath.toString,
+      lbwPresets = if (sent.loras ++ Option.when(separateHiresLoras)(recorded.loras ++ hrEx.loras).getOrElse(Nil) ++ refinementLoras.getOrElse(Nil))
+        .exists(_.lbw.nonEmpty) then Generator.lbwPresets(home.configDir) else Map.empty
+    )
+    val globalOutputs = home.outputs(s).toAbsolutePath.normalize()
+    val defaultOutputs = home.outputs(Settings()).toAbsolutePath.normalize()
+    val hiresDestination = HiresPreparation.active(recorded).flatMap(_.value.get("output_dir"))
+      .collect { case ujson.Str(path) if path.trim.nonEmpty => path.trim }
+      .orElse(Option.when(recorded.hires.enabled && !recorded.isImg2Img)(s.hiresFixTweaks.outputDir.trim).filter(_.nonEmpty))
+    // Native outputDir always has a default; a non-default global location takes
+    // precedence, matching upstream's explicit outdir_samples override.
+    val finalOutputs = if globalOutputs != defaultOutputs then globalOutputs else
+      hiresDestination.map(path => home.resolve(path).toAbsolutePath.normalize()).getOrElse(globalOutputs)
+    PreparedGeneration(recorded, req, if recorded.isImg2Img then GenerationMode.Img2Img else GenerationMode.Txt2Img,
+      warnings.result(), Some(finalOutputs))
+
+  private def await[T](f: Future[T], timeout: FiniteDuration, what: String): T =
+    try Await.result(f, timeout)
+    catch
+      case _: java.util.concurrent.TimeoutException =>
+        val err = EngineError(EngineProcess.EngineTimeout, s"$what did not finish within $timeout")
+        client.supervisor.forceRestart(err)
+        throw err
+
+  /** Waits for a generation, failing (and restarting the engine) after `timeouts.generationInactivity` without events. */
+  private def awaitActive[T](f: Future[T], lastActivity: java.util.concurrent.atomic.AtomicLong): T =
+    var res: Option[T] = None
+    while res.isEmpty do
+      try res = Some(Await.result(f, 1.second))
+      catch
+        case _: java.util.concurrent.TimeoutException =>
+          val idle = (System.nanoTime() - lastActivity.get()).nanos
+          if idle > timeouts.generationInactivity then
+            val err = EngineError(EngineProcess.EngineTimeout, s"no progress from the engine for ${timeouts.generationInactivity}")
+            client.supervisor.forceRestart(err)
+            throw err
+    res.get
+
+  /** True when `p` lies inside one of the configured model directories (resolved against the app home). */
+  def withinDirs(p: Path, dirs: Seq[String]): Boolean =
+    val n = p.toAbsolutePath.normalize()
+    dirs.exists(d => n.startsWith(home.resolve(d).toAbsolutePath.normalize()))
+
+  private def samePath(a: String, b: String): Boolean =
+    try Paths.get(a).toAbsolutePath.normalize() == Paths.get(b).toAbsolutePath.normalize()
+    catch case NonFatal(_) => a == b
+
+  /** Deletes leftover files in outputs/.tmp older than `olderThan` (call at startup). Files of another process
+    * sharing the same app home (GUI + headless MCP) are younger and survive. Returns the count.
+    */
+  def cleanTempDir(olderThan: FiniteDuration = 6.hours): Int =
+    val cutoff = System.currentTimeMillis() - olderThan.toMillis
+    val dir = home.tmpDir(settings())
+    var n = 0
+    try
+      val st = Files.list(dir)
+      try
+        st.iterator().forEachRemaining { f =>
+          try
+            if Files.isRegularFile(f) && Files.getLastModifiedTime(f).toMillis < cutoff && Files.deleteIfExists(f) then n += 1
+          catch case NonFatal(_) => ()
+        }
+      finally st.close()
+    catch case NonFatal(_) => ()
+    n
+
+  /** Loads the checkpoint / VAE requested by `p` when they differ from what is loaded. */
+  def ensureModel(p: GenerationParams, listener: GenerationListener = GenerationListener.none): Unit =
+    val s = settings()
+    p.checkpoint.map(_.trim).filter(n => n.nonEmpty && n != "None").foreach { name =>
+      val path = catalog.findCheckpoint(name).map(_.path)
+        .orElse(Some(home.resolve(name)).filter(f => Files.isRegularFile(f) && withinDirs(f, s.modelDirs.checkpoints)).map(_.toString))
+        .getOrElse(throw EngineError(Protocol.ErrorCodes.InvalidParams, s"checkpoint not found: $name"))
+      if !client.supervisor.loadedModel.exists(m => samePath(m.path, path)) then
+        listener.onLog(s"loading checkpoint $name")
+        val m = await(client.loadModelOwned(EngineBackend.loadRequest(path, s), listener.interruptionOwner), timeouts.load, "load_model")
+        catalog.rememberHash(m)
+    }
+    p.vae.map(_.trim).filter(_.nonEmpty).foreach { v =>
+      val loaded = client.supervisor.loadedModel
+      if v == "Automatic" || v == "None" then
+        if loaded.exists(_.vaeName.isDefined) then await(client.setVaeOwned(None, listener.interruptionOwner), timeouts.load, "set_vae")
+      else
+        val e = catalog.findVae(v).getOrElse(throw EngineError(Protocol.ErrorCodes.InvalidParams, s"VAE not found: $v"))
+        def stem(x: String) = Paths.get(x.replace('\\', '/')).getFileName.toString.replaceFirst("\\.[^.]+$", "")
+        if !loaded.flatMap(_.vaeName).exists(n => n == e.name || stem(n) == stem(e.name) || stem(n) == stem(e.path)) then
+          listener.onLog(s"loading VAE ${e.name}")
+          await(client.setVaeOwned(Some(e.path), listener.interruptionOwner), timeouts.load, "set_vae")
+    }
+
+  /** Runs one generation and saves every image under outputs/<txt2img|img2img>/<date>/. */
+  private[engine] def runWdBatch(p: GenerationParams, spec: WdBatchSpec, listener: GenerationListener, limits: JobLimits): JobOutput =
+    if listener.isInterrupted then throw interruptedError
+    limits.check(p, 1)
+    WdBatchSafety.validateResolved(p)
+    ensureModel(p, listener)
+    if listener.isInterrupted then throw interruptedError
+    val token = client.supervisor.loadedModel.flatMap(_.modelToken).filter(_.nonEmpty)
+      .getOrElse(throw EngineError(Protocol.ErrorCodes.Unsupported, "WD batch requires a loaded checkpoint identity"))
+    val owner = listener.interruptionOwner.getOrElse(throw new IllegalStateException("WD batch requires queue ownership"))
+    val control = listener.wdBatchControl.getOrElse(throw new IllegalStateException("WD batch cancellation gate unavailable"))
+    val prepared = prepare(p)
+    WdBatchSafety.validateResolved(prepared.request.params)
+    if LoraSyntax.extract(prepared.recorded.prompt).loras.nonEmpty then
+      throw EngineError(Protocol.ErrorCodes.Unsupported, "WD batch does not support prompt LoRA tags")
+    prepared.warnings.foreach(listener.onLog)
+    val body = WdBatchPrepareRequest(spec.imagesRoot, prepared.request.copy(vaeRecoveryDir = ""),
+      spec.outputParent, spec.outputName, token)
+    listener.onStatus("WD v3 batch: preparing images", 0, 0)
+    val activity = new java.util.concurrent.atomic.AtomicLong(System.nanoTime())
+    val handle = client.wdBatchOwned(body, owner, control, { event =>
+      activity.set(System.nanoTime())
+      event match
+        case value: EngineEvent.Progress => listener.onProgress(value)
+        case value: EngineEvent.Preview => listener.onPreview(value)
+        case value: EngineEvent.Log => listener.onLog(value.message)
+    }, listener.imageSecret)
+    val result = WdBatchSafety.awaitActive(handle.result, activity, timeouts.generationInactivity, () => {
+      WdBatchSafety.timeoutAction(handle, control, client.supervisor)
+    })
+    val root = Paths.get(spec.outputParent).resolve(spec.outputName).toAbsolutePath.normalize()
+    val validated = WdBatchSafety.validatePaths(result, root)
+    val output = validated.map { (row, image, path) =>
+      val text = PngMetadata.readParameters(path).getOrElse(
+        throw EngineError(Protocol.ErrorCodes.Internal, "WD batch PNG is missing persisted generation parameters"))
+      val base = prepared.recorded.copy(img2img = prepared.recorded.img2img.map(_.copy(initImage = row.input)))
+      val effective = Infotext.toParams(Infotext.parse(text), base)
+      OutputImage(path, effective, text, image.seed)
+    }
+    result.rows.filter(_.status == "error").foreach(row => listener.onLog(s"WD batch failed for ${row.input}: ${row.error.get}"))
+    output.foreach(saved => listener.onImageSaved(saved, grid = false))
+    JobOutput(output)
+
+  def generateWith(p: GenerationParams, listener: GenerationListener): Seq[OutputImage] =
+    val (prep, result) = runEngine(p, listener)
+    val saved = saveResult(prep, result, listener)
+    if result.interrupted then
+      listener.onEngineInterrupted()
+      throw interruptedError
+    saved
+
+  /** Same pipeline as [[generateWith]] (events forwarded, model ensured) but the PNGs stay in outputs/.tmp:
+    * no output naming, no `onImageSaved`. The returned paths are engine temp files the caller must delete.
+    * `infotext` is filled in but not embedded in the file.
+    */
+  def generateTransientWith(p: GenerationParams, listener: GenerationListener): Seq[OutputImage] =
+    val (prep, result) = runEngine(p, listener)
+    if result.interrupted then
+      // A caller cannot receive transient paths through an exception. Preserve
+      // completed images through the normal gallery path before reporting cancellation.
+      saveResult(prep, result, listener)
+      listener.onEngineInterrupted()
+      throw interruptedError
+    val loaded = client.supervisor.loadedModel
+    // Auxiliary images are user outputs even for transient generations (upstream saves them while processing).
+    try
+      val kind = outputKind(prep)
+      val outputs = prep.finalOutputDir.getOrElse(outputsDir)
+      result.images.indices.foreach(i => saveAuxiliaries(prep, result, Some(i), listener, loaded, kind, outputs))
+      saveAuxiliaries(prep, result, None, listener, loaded, kind, outputs)
+    finally deleteEngineTemps(result.auxiliaryImages)
+    result.images.map { img =>
+      val (params, text) = describe(prep, result, img, loaded)
+      OutputImage(Paths.get(img.path), params, text, img.seed)
+    }
+
+  override def generateTransient(p: GenerationParams): Seq[OutputImage] = generateTransientWith(p, GenerationListener.none)
+
+  private def describe(prep: PreparedGeneration, result: GenerationResult, img: GeneratedImage, loaded: Option[LoadedModel]): (GenerationParams, String) =
+    val originalHires = prep.recorded.hires
+    val preserveHiresFallback = img.effectivePrompt.isDefined && originalHires.enabled && originalHires.prompt.isEmpty &&
+      !HiresPreparation.active(prep.recorded).exists(_.value.get("prompts_resolved").contains(ujson.Bool(true)))
+    val refinementExtra = for
+      prompt <- img.modelKeywordRefinementPrompt
+      config <- Img2ImgHiresMetadata.active(prep.recorded.hooks)
+    yield
+      val copy = ujson.Obj.from(config.value.toSeq)
+      copy("prompt") = prompt
+      Img2ImgHiresMetadata.key -> Img2ImgHiresMetadata.encode(copy)
+    val params = prep.recorded.copy(seed = img.seed, subseed = if img.subseed >= 0 then img.subseed else prep.recorded.subseed,
+      prompt = img.effectivePrompt.getOrElse(prep.recorded.prompt),
+      hires = if preserveHiresFallback then originalHires.copy(prompt = prep.recorded.prompt) else originalHires,
+      extra = prep.recorded.extra ++ refinementExtra)
+    val hiresFields = img.hiresSeed.toSeq.map { seed =>
+      val info = ujson.Obj("Seed" -> sdfx.core.infotext.HiresSeedMetadata.encode(seed))
+      img.hiresSubseed.foreach(s => info("Subseed") = sdfx.core.infotext.HiresSeedMetadata.encode(s))
+      img.hiresSubseedStrength.foreach(s => info("Strength") = ujson.Num(s))
+      for
+        w <- img.hiresSeedResizeFromW.filter(_ > 0)
+        h <- img.hiresSeedResizeFromH.filter(_ > 0)
+      do info("Resize") = ujson.Arr(w, h)
+      // Upstream swaps single/double quotes so its JSON survives infotext CSV parsing.
+      "Hires seed" -> info.render().map { case '"' => '\''; case '\'' => '"'; case c => c }
+    }
+    val templateFields = HiresPreparation.active(params).toSeq.flatMap(_.value.get("prompt_template")).flatMap { t =>
+      Seq("NUI Hires template" -> t.render()) ++
+        t.obj.get("mode").map(_.str).filter(_.nonEmpty).map("Hires prompt mode" -> _)
+    }
+    val resourceFields = Option.when(params.hooks.get("pnginfo_injection").exists(o =>
+      !o.obj.get("enabled").contains(ujson.Bool(false)))) {
+      "Hashes" -> sdfx.core.infotext.ResourceHashes.merge(params.extra.get("Hashes"), result.resourceHashes.toSeq)
+    }.toSeq
+    val facts = ImageFacts(
+      seed = img.seed,
+      subseed = params.subseed,
+      modelName = result.modelName.orElse(loaded.map(_.name)),
+      modelHash = result.modelHash.orElse(loaded.map(_.hash).filter(_.nonEmpty)).map(h => h.take(10)),
+      vaeName = result.vaeName.orElse(loaded.flatMap(_.vaeName)),
+      vaeHash = result.vaeHash.orElse(loaded.flatMap(_.vaeHash)).map(_.take(10)),
+      loraHashes = result.loraHashes.toSeq.sortBy(_._1),
+      scheduler = result.scheduler,
+      extra = scala.collection.immutable.ListMap.from(result.systemInfo.toSeq.map(v => "System Info" -> v.render()) ++
+        Option.when(result.vaeRecovery.nonEmpty)("VAE recovery" -> ujson.Arr.from(result.vaeRecovery).render()) ++
+        img.modelKeywordSourcePrompt.map("Model keyword source prompt" -> _) ++ resourceFields ++ hiresFields ++ templateFields ++ img.infotextFields) ++ HardwareInfo.fields(img.hardwareInfo)
+    )
+    (params, Infotext.write(params, facts))
+
+  private def runEngine(p: GenerationParams, listener: GenerationListener): (PreparedGeneration, GenerationResult) =
+    if listener.isInterrupted then throw interruptedError
+    val prepared = prepare(EditorPreviewMetadata.forJob(p, listener.editorPreview.nonEmpty))
+    val original = prepared.copy(recorded = Img2ImgFolderRunner.recordedParams(prepared.recorded, listener.inputProvenance))
+    ScrambledInput.withParams(original.request.params, home.tmpDir(settings()), listener.imageSecret, listener.onLog) { params =>
+      runEnginePrepared(p, listener, original.copy(request = original.request.copy(params = params)))
+    }
+
+  private def usesNativeNsfw: Boolean =
+    client.supervisor.hello.forall(_.python.trim.isEmpty)
+
+  private def nativeNsfwConfig(prep: PreparedGeneration): Option[NativeNsfwCensor.GenerationConfig] =
+    if !usesNativeNsfw then None
+    else
+      prep.request.params.hooks.get("nsfw_checker").collect { case o: ujson.Obj => o }.flatMap { obj =>
+        val enabled = obj.value.get("enabled") match
+          case Some(ujson.Bool(false)) => false
+          case _                       => true
+        if !enabled then None
+        else
+          val cfg = NativeNsfwCensor.parseGenerationConfig(obj)
+          NativeNsfwCensor.prepareSession(cfg, home)
+          Some(cfg)
+      }
+
+  private def applyNativeNsfw(
+      completed: GenerationResult,
+      cfgOpt: Option[NativeNsfwCensor.GenerationConfig],
+      listener: GenerationListener
+  ): GenerationResult =
+    cfgOpt.filter(_.nudenetActive(preview = false)) match
+      case None => completed
+      case Some(cfg) =>
+        val tmpRoot = home.tmpDir(settings())
+        val extraAux = scala.collection.mutable.ArrayBuffer.empty[GeneratedImage]
+        val updated = completed.images.zipWithIndex.map { (img, idx) =>
+          val srcPath = Paths.get(img.path)
+          val srcImg = PngMetadata.readImage(srcPath)
+          val res = NativeNsfwCensor.censorGeneration(
+            srcImg, cfg, home, log = Some(line => listener.onLog(s"NudeNet: $line"))
+          )
+          if !res.detected then img
+          else
+            val censoredPath = Files.createTempFile(tmpRoot, "nudenet-", ".png")
+            PngMetadata.write(res.image, censoredPath, Nil)
+            listener.onTempFile(censoredPath)
+            res.beforeCensor.foreach { beforeImg =>
+              val p = Files.createTempFile(tmpRoot, "nudenet-before-", ".png")
+              PngMetadata.write(beforeImg, p, Nil)
+              listener.onTempFile(p)
+              extraAux += img.copy(path = p.toAbsolutePath.toString,
+                outputSuffix = Some(NativeNsfwCensor.AuxiliarySuffixes._1), auxiliaryOf = Some(idx))
+            }
+            res.mask.foreach { maskImg =>
+              val p = Files.createTempFile(tmpRoot, "nudenet-mask-", ".png")
+              PngMetadata.write(maskImg, p, Nil)
+              listener.onTempFile(p)
+              extraAux += img.copy(path = p.toAbsolutePath.toString,
+                outputSuffix = Some(NativeNsfwCensor.AuxiliarySuffixes._2), auxiliaryOf = Some(idx))
+            }
+            try Files.deleteIfExists(srcPath) catch case NonFatal(_) => ()
+            img.copy(path = censoredPath.toAbsolutePath.toString)
+        }
+        completed.copy(images = updated, auxiliaryImages = completed.auxiliaryImages ++ extraAux)
+
+  private def runEnginePrepared(p: GenerationParams, listener: GenerationListener, prep: PreparedGeneration): (PreparedGeneration, GenerationResult) =
+    prep.warnings.foreach(listener.onLog)
+    ensureModel(prep.recorded, listener)
+    if listener.isInterrupted then throw interruptedError
+    val nativeNsfw = nativeNsfwConfig(prep)
+    val workerRequest =
+      if nativeNsfw.isEmpty then prep.request
+      else prep.request.copy(params = prep.request.params.copy(hooks = prep.request.params.hooks - "nsfw_checker"))
+    val activity = new java.util.concurrent.atomic.AtomicLong(System.nanoTime())
+    val jsonLimits = PayloadJsonBudget.Limits(maxBytes = math.min(payloads.limits.maxEntryBytes, Int.MaxValue.toLong - 1).toInt)
+    var captureKey: Option[PayloadKey] = None
+    def diagnostic(action: => Unit): Unit =
+      try action
+      catch
+        case error: InterruptedException => System.err.println(s"[sdfx] Payload diagnostic failed: ${error.getClass.getSimpleName}")
+        case NonFatal(error) => System.err.println(s"[sdfx] Payload diagnostic failed: ${error.getClass.getSimpleName}")
+    def lifecycle(state: PayloadState, completion: Option[String] = None): Unit = captureKey.foreach { key =>
+      diagnostic(payloads.transition(key, state, completion))
+      diagnostic(listener.onPayloadLifecycle(key, state, completion))
+    }
+    val result = try
+      if listener.editorPreview.nonEmpty then
+        listener.onLog("Embedding editor preview uses unsaved vectors; exact request capture is disabled for this job.")
+      val handle = client.generateOwned(workerRequest, prep.mode, { ev =>
+        activity.set(System.nanoTime())
+        ev match
+          case e: EngineEvent.Progress => listener.onProgress(e)
+          case e: EngineEvent.Preview  =>
+            val outEv = nativeNsfw.filter(_.nudenetActive(preview = true)) match
+              case Some(cfg) => e.copy(jpegB64 = NativeNsfwCensor.censorPreviewB64(e.jpegB64, cfg, home))
+              case None      => e
+            listener.onPreview(outEv)
+          case EngineEvent.Log(_, m)   => listener.onLog(m)
+      }, listener.interruptionOwner, body => {
+        val key = listener.nextPayloadKey()
+        captureKey = Some(key)
+        val submitted = listener.submittedPayloadContext.getOrElse(SubmittedPayloadContext("direct"))
+        val model = client.supervisor.loadedModel
+        val options = listener.payloadCaptureOptions.getOrElse(defaultCaptureOptions)
+        var warnings = Vector.empty[String]
+        val context = try
+          PayloadCaptureContext.captured(submitted, p, body.capturedAtMillis, model, jsonLimits,
+            prep.finalOutputDir.map(_.toString)) match
+            case Right(json) => Some(json)
+            case Left(reason) =>
+              warnings :+= s"Submitted context unavailable: $reason"
+              None
+          catch
+            case NonFatal(_) =>
+              warnings :+= "Submitted context unavailable: invalid diagnostic JSON"
+              None
+        val assets =
+          if RequestPayloadStore.utf8Size(body.bodyJson, payloads.limits.maxBodyBytes) > payloads.limits.maxBodyBytes then
+            warnings :+= "Image diagnostic unavailable: exact body exceeds capture byte limit"
+            None
+          else
+            try
+              val result = PayloadAssets.collect(body.bodyJson, options.includeImageContents && listener.imageSecret.isEmpty)
+              warnings ++= result.warnings
+              Some(result.assetsJson)
+            catch
+              case NonFatal(_) =>
+                warnings :+= "Image diagnostic unavailable: input inspection failed"
+                None
+        val snapshot = PayloadSnapshot(key, body.requestType, Some(body.bodyJson), body.capturedAtMillis,
+          context, assets, PayloadState.Prepared, warnings, submitted.sourceMode)
+        payloads.put(snapshot)
+        payloads.snapshots.find(_.key == key).foreach(s => diagnostic(listener.onPreparedRequest(s)))
+      }, () => if listener.isInterrupted then throw interruptedError, listener.imageSecret, listener.editorPreview)
+      lifecycle(PayloadState.Submitted)
+      val completed = applyNativeNsfw(awaitActive(handle.result, activity), nativeNsfw, listener)
+      val completion = PayloadCaptureContext.completion(completed, jsonLimits) match
+        case Right(json) => json
+        case Left(reason) =>
+          captureKey.foreach(key => diagnostic(payloads.warn(key, s"Completion context unavailable: $reason")))
+          None
+      lifecycle(if completed.interrupted then PayloadState.Cancelled else PayloadState.Succeeded, completion)
+      completed
+    catch
+      case error: InterruptedException => lifecycle(PayloadState.Cancelled); throw error
+      case NonFatal(error) =>
+        lifecycle(if JobRunner.isInterruption(error) then PayloadState.Cancelled else PayloadState.Failed)
+        throw error
+    (result.images ++ result.auxiliaryImages).foreach(i => listener.onTempFile(Paths.get(i.path)))
+    result.warnings.foreach(listener.onLog)
+    result.vaeRecovery.foreach(a => listener.onLog(s"VAE decode recovery: ${a("latent_path").str}"))
+    result.composableLoraTrace.foreach(t => listener.onLog(s"Composable LoRA trace: ${t.path}"))
+    result.intermediateArtifacts.filter(a => a.`type` == "manifest" || a.`type` == "video")
+      .foreach(a => listener.onLog(s"Intermediate ${a.`type`}: ${a.path}"))
+    (prep, result)
+
+  private def outputKind(prep: PreparedGeneration): String = if prep.mode == GenerationMode.Img2Img then "img2img" else "txt2img"
+
+  private def deleteEngineTemps(images: Seq[GeneratedImage]): Unit =
+    images.foreach(img =>
+      try Files.deleteIfExists(Paths.get(img.path))
+      catch case NonFatal(_) => ()
+    )
+
+  private def saveResult(prep: PreparedGeneration, result: GenerationResult, listener: GenerationListener): Seq[OutputImage] =
+    val loaded = client.supervisor.loadedModel
+    val outputs = prep.finalOutputDir.getOrElse(outputsDir)
+    try saveAll(prep, result, listener, loaded, outputKind(prep), outputs)
+    finally
+      // Engine temp files are never needed after this point, whether saving succeeded or not.
+      deleteEngineTemps(result.images ++ result.auxiliaryImages)
+
+  /** Persists auxiliary engine images (NudeNet before-censor copy / mask) as `<index>-<seed><suffix>.png` with the
+    * infotext of the image they belong to, under the same scrambling session. They are logged, not returned. */
+  private def saveAuxiliary(prep: PreparedGeneration, result: GenerationResult, aux: GeneratedImage, listener: GenerationListener,
+      loaded: Option[LoadedModel], kind: String, outputs: Path): Option[Path] =
+    val src = Paths.get(aux.path)
+    try
+      aux.outputSuffix.filter(Generator.AuxiliarySuffix.matches) match
+        case None =>
+          listener.onLog(s"Skipped an auxiliary engine image with an invalid name suffix: ${aux.outputSuffix.getOrElse("")}")
+          None
+        case Some(suffix) =>
+          val (_, text) = describe(prep, result, aux, loaded)
+          val target = OutputNaming.nextFile(outputs, kind, aux.seed, suffix)
+          try
+            val pixels = PngMetadata.readImage(src)
+            sdfx.core.png.ScrambledPng.write(pixels, target, Seq(PngMetadata.ParametersKey -> text), listener.imageSecret.map(_.use(identity)))
+          catch
+            case NonFatal(e) =>
+              Files.deleteIfExists(target)
+              throw e
+          listener.onLog(s"Saved $suffix image: $target")
+          Some(target)
+    finally
+      try Files.deleteIfExists(src)
+      catch case NonFatal(_) => ()
+
+  private def saveAuxiliaries(prep: PreparedGeneration, result: GenerationResult, index: Option[Int], listener: GenerationListener,
+      loaded: Option[LoadedModel], kind: String, outputs: Path): Unit =
+    val valid = result.images.indices.toSet
+    result.auxiliaryImages.filter(a => if index.isDefined then a.auxiliaryOf == index else !a.auxiliaryOf.exists(valid))
+      .foreach(aux => saveAuxiliary(prep, result, aux, listener, loaded, kind, outputs))
+
+  private def saveAll(prep: PreparedGeneration, result: GenerationResult, listener: GenerationListener, loaded: Option[LoadedModel],
+      kind: String, outputs: Path): Seq[OutputImage] =
+    val saved = result.images.zipWithIndex.map { (img, index) =>
+      // Upstream writes the before-censor copy and the mask before the censored image itself.
+      saveAuxiliaries(prep, result, Some(index), listener, loaded, kind, outputs)
+      val (params, text) = describe(prep, result, img, loaded)
+      val src = Paths.get(img.path)
+      val source = listener.inputProvenance.collect {
+        case (_, original) if original.nonEmpty && prep.recorded.img2img.exists(_.initImage == original) => original
+      }
+      val chunks = if source.nonEmpty then img.pngChunks.filterNot(_._1 == "NUI img2img source") else img.pngChunks
+      val texts = Generator.pngTexts(text, chunks) ++ source.toSeq.map("NUI img2img source" -> _)
+      val dst = listener.fastloadPayload match
+        case None =>
+          val target = OutputNaming.nextFile(outputs, kind, img.seed)
+          try
+            val pixels = PngMetadata.readImage(src)
+            sdfx.core.png.ScrambledPng.write(pixels, target, texts, listener.imageSecret.map(_.use(identity)))
+          catch
+            case NonFatal(e) =>
+              Files.deleteIfExists(target)
+              throw e
+          target
+        case Some((format, payload)) =>
+          require(listener.imageSecret.isEmpty, "Protected sessions cannot save readable Fastload data")
+          val dir = OutputNaming.dayDir(outputs, kind)
+          val stage = Files.createTempFile(dir, ".fastload-image-", ".tmp")
+          try
+            val pixels = PngMetadata.readImage(src)
+            sdfx.core.png.ScrambledPng.write(pixels, stage, texts, None)
+            // Completed engine images follow the normal partial-result contract even if
+            // interruption was admitted after sampling. The stage remains private until publication.
+            FastloadOutput.publish(stage, dir, img.seed, payload, format, () => ())
+          finally Files.deleteIfExists(stage)
+      try Files.deleteIfExists(src)
+      catch case NonFatal(_) => ()
+      val out = OutputImage(dst, params, text, img.seed)
+      listener.onImageSaved(out, grid = false)
+      out
+    }
+    saveAuxiliaries(prep, result, None, listener, loaded, kind, outputs)
+    saved
+
+  /** Non-generation engine request. Fills `output_dir` with the temp dir and registers returned image paths as job
+    * temp files (callers save what they keep). Progress events are forwarded to the listener.
+    */
+  def engineCallWith(kind: String, params: ujson.Obj, listener: GenerationListener): ujson.Value =
+    val p = ujson.Obj.from(params.value)
+    if !p.value.contains("output_dir") then p("output_dir") = home.tmpDir(settings()).toAbsolutePath.toString
+    val r: ujson.Value =
+      if kind == "image_tool" && p.value.get("tool").contains(ujson.Str("nsfw_checker")) && usesNativeNsfw then
+        NativeNsfwCensor.censorTool(p, home, Paths.get(p("output_dir").str), log = Some(listener.onLog))
+      else
+        await(client.rawOwned(kind, p, listener.interruptionOwner, {
+          case e: EngineEvent.Progress => listener.onProgress(e)
+          case e: EngineEvent.Preview  => listener.onPreview(e)
+          case EngineEvent.Log(_, m)   => listener.onLog(m)
+        }), timeouts.upscale, kind)
+    r match
+      case o: ujson.Obj =>
+        // Model tools publish the user's requested checkpoint path. It is not
+        // a job temporary and must survive queue cleanup, even for scripts
+        // that return no generated images.
+        val temporaryKeys = if Set("merge_models", "convert_model")(kind) then Seq("preview") else Seq("path", "preview")
+        temporaryKeys.flatMap(k => o.value.get(k)).collect { case ujson.Str(s) => s }.foreach(s => listener.onTempFile(Paths.get(s)))
+        o.value.get("images").collect { case a: ujson.Arr => a.value.collect { case ujson.Str(s) => s } }
+          .getOrElse(Nil).foreach(s => listener.onTempFile(Paths.get(s)))
+        o.value.get("outputs").collect { case m: ujson.Obj => m.value.values.collect { case ujson.Str(s) => s } }
+          .getOrElse(Nil).foreach(s => listener.onTempFile(Paths.get(s)))
+      case _ => ()
+    r
+
+  def upscaleImage(image: Path, upscaler: String, scale: Double, owner: Option[String] = None,
+      secret: Option[sdfx.core.png.ImageScrambleSecret] = None, warn: String => Unit = _ => ()): Path =
+    ScrambledInput.withPlain(image, home.tmpDir(settings()), secret, warn) { plain =>
+      protectToolOutput(upscalePlain(plain, upscaler, scale, owner), plain, secret)
+    }
+
+  /** Worker tools create a plaintext temporary first; do not leave it readable after success. */
+  private def protectToolOutput(output: Path, input: Path, secret: Option[sdfx.core.png.ImageScrambleSecret]): Path =
+    secret.foreach { value =>
+      require(!Files.isSameFile(input, output), "Tool output cannot overwrite its input")
+      try
+        val pixels = PngMetadata.readImage(output)
+        val texts = PngMetadata.readTexts(output).toSeq
+        value.use(pass => sdfx.core.png.ScrambledPng.write(pixels, output, texts, Some(pass)))
+      catch
+        case NonFatal(error) =>
+          try Files.deleteIfExists(output) catch case NonFatal(cleanup) => error.addSuppressed(cleanup)
+          throw error
+    }
+    output
+
+  private def upscalePlain(image: Path, upscaler: String, scale: Double, owner: Option[String]): Path =
+    val s = settings()
+    val paths = catalog.findUpscaler(upscaler).map(e => upscaler -> e.path).toMap
+    val req = UpscaleRequest(image.toAbsolutePath.toString, upscaler, scale, home.tmpDir(s).toAbsolutePath.toString, paths,
+      HardwareInfo.Options(s.hardwareInfoEnabled, s.hardwareInfoRemark))
+    val r = Json.fromJs[ImagePathResult](await(client.rawOwned(Protocol.Types.Upscale, Json.toJs(req), owner), timeouts.upscale, "upscale"))
+    val output = Paths.get(r.path)
+    r.hardwareInfo.foreach { record =>
+      require(!Files.isSameFile(image, output), "Upscale metadata cannot overwrite the original input image")
+      val pixels = PngMetadata.readImage(output)
+      val existing = PngMetadata.readTexts(output)
+      val processing = scala.collection.immutable.ListMap("Postprocess upscaler" -> upscaler,
+        "Postprocess upscale by" -> scale.toString, "Size" -> s"${pixels.getWidth}x${pixels.getHeight}") ++ HardwareInfo.fields(Some(record))
+      val extra = existing.toSeq.filterNot(_._1 == PngMetadata.ParametersKey) ++
+        existing.get(PngMetadata.ParametersKey).filter(_.nonEmpty).filter(_ => !existing.contains("Source parameters"))
+          .map("Source parameters" -> _)
+      PngMetadata.write(pixels, output, (PngMetadata.ParametersKey -> Infotext.render("", "", processing)) +: extra)
+    }
+    output
+
+  def preprocess(image: Path, preprocessor: String, args: Map[String, Double] = Map.empty,
+      secret: Option[sdfx.core.png.ImageScrambleSecret] = None, warn: String => Unit = _ => ()): Path =
+    preprocessWith(image, preprocessor, args, secret, warn)
+
+  /** Extras step: the resolution rules of the ControlNet unit apply (`processorRes` 64..2048, or the short side of the
+    * image with `pixelPerfect`, else 512) and the result carries `ControlNet Preprocessor: "{...}"` as its parameters.
+    * With `outputDir` the result is moved there as `<input name>-<module>.png` (never overwriting). */
+  def preprocessExtras(image: Path, preprocessor: String, args: Map[String, Double], processorRes: Int, pixelPerfect: Boolean,
+      outputDir: Option[Path] = None, secret: Option[sdfx.core.png.ImageScrambleSecret] = None, warn: String => Unit = _ => ()): Path =
+    PreprocessorControls.validate(preprocessor, args).left.foreach(m => throw new IllegalArgumentException(m))
+    require(processorRes == -1 || (processorRes >= PreprocessorControls.MinResolution && processorRes <= PreprocessorControls.MaxResolution),
+      s"processor resolution must be ${PreprocessorControls.MinResolution}..${PreprocessorControls.MaxResolution}")
+    val made = preprocessWith(image, preprocessor, args, secret, warn, standalone = true, processorRes, pixelPerfect)
+    outputDir.fold(made) { dir =>
+      Files.createDirectories(dir)
+      val stem = Option(image.getFileName).map(_.toString).getOrElse("image").replaceAll("""\.[^.]*$""", "")
+      var n = 0
+      def candidate = dir.resolve(if n == 0 then s"$stem-$preprocessor.png" else s"$stem-$preprocessor-$n.png")
+      var target = candidate
+      while Files.exists(target) do { n += 1; target = candidate }
+      Files.move(made, target)
+      target
+    }
+
+  private def preprocessWith(image: Path, preprocessor: String, args: Map[String, Double],
+      secret: Option[sdfx.core.png.ImageScrambleSecret], warn: String => Unit, standalone: Boolean = false,
+      processorRes: Int = -1, pixelPerfect: Boolean = false): Path =
+    val s = settings()
+    ScrambledInput.withPlain(image, home.tmpDir(s), secret, warn) { plain =>
+      val request = PreprocessRequest(preprocessor, plain.toAbsolutePath.toString, home.tmpDir(s).toAbsolutePath.toString, args,
+        standalone, processorRes, pixelPerfect)
+      val output = Paths.get(await(client.preprocess(request), timeouts.upscale, "preprocess").path)
+      protectToolOutput(output, plain, secret)
+    }
+
+  /** Saves an image to outputs/<kind>/<date>/ (`grid`/`grids` -> outputs/grids). */
+  def saveWith(img: BufferedImage, kind: String, params: GenerationParams, infotext: String, listener: GenerationListener): OutputImage =
+    val k = if kind == "grid" then "grids" else kind
+    val recorded = Img2ImgFolderRunner.recordedParams(params, listener.inputProvenance)
+    val source = listener.inputProvenance.collect {
+      case (staged, original) if original.nonEmpty && params.img2img.exists(i => i.initImage == staged || i.initImage == original) => original
+    }.orElse(params.extra.get("NUI img2img source").filter(_.nonEmpty))
+    val text = source.fold(infotext) { path =>
+      val parsed = Infotext.parse(infotext)
+      if parsed.fields.nonEmpty then Infotext.render(parsed.prompt, parsed.negativePrompt, parsed.fields.updated("NUI img2img source", path))
+      else infotext
+    }
+    val dst = OutputNaming.nextFile(outputsDir, k, recorded.seed, if k.contains("grid") then "-grid" else "")
+    val texts = Seq(PngMetadata.ParametersKey -> text) ++ source.toSeq.map("NUI img2img source" -> _)
+    try sdfx.core.png.ScrambledPng.write(img, dst, texts, listener.imageSecret.map(_.use(identity)))
+    catch
+      case NonFatal(e) =>
+        Files.deleteIfExists(dst)
+        throw e
+    val out = OutputImage(dst, recorded, text, recorded.seed)
+    listener.onImageSaved(out, grid = k.contains("grid"))
+    out
+
+object Generator:
+  /** `parameters` first, then the engine's extra PNG chunks (keywords the app writes itself are never overridden). */
+  def pngTexts(parameters: String, chunks: Seq[(String, String)]): Seq[(String, String)] =
+    val reserved = Set(PngMetadata.ParametersKey, "Encrypt", "EncryptPwdSha")
+    (PngMetadata.ParametersKey -> parameters) +: chunks.filter((k, _) => k.nonEmpty && k.length <= 79 && !reserved(k))
+
+  /** File name suffixes the engine may request for auxiliary outputs (e.g. `-before-censor`, `-censor-mask`). */
+  val AuxiliarySuffix: scala.util.matching.Regex = "-[a-z][a-z0-9-]{0,31}".r
+
+  /** LoRA Block Weight user presets, `config/lbwpresets.txt`: one `NAME:w1,w2,...` per line (`#` comments). */
+  def lbwPresets(configDir: java.nio.file.Path): Map[String, String] =
+    val f = configDir.resolve("lbwpresets.txt")
+    if !java.nio.file.Files.isRegularFile(f) then Map.empty
+    else
+      import scala.jdk.CollectionConverters.*
+      java.nio.file.Files.readAllLines(f, java.nio.charset.StandardCharsets.UTF_8).asScala.toSeq
+        .map(_.trim).filter(l => l.nonEmpty && !l.startsWith("#") && l.contains(':'))
+        .map { l =>
+          val i = l.indexOf(':')
+          l.take(i).trim -> l.drop(i + 1).trim
+        }.filter(_._1.nonEmpty).toMap

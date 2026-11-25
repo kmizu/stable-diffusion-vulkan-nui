@@ -1,0 +1,218 @@
+package sdfx.ui.vm
+
+import javafx.beans.property.{SimpleStringProperty, StringProperty}
+import sdfx.core.image.GridNumbers
+import sdfx.core.infotext.Infotext
+import sdfx.core.plugins.api.*
+import sdfx.core.payload.PayloadJsonBudget
+
+/** How a declarative [[Control]] is rendered by the generic plugin form. */
+enum Widget:
+  case SliderSpinner, IntSpinner, CheckBox, Combo, DynamicCombo, TextField, TextArea, Label, Section, ImagePicker, ImageList
+
+/** Editable values of one plugin for one tab. Values are kept as strings exactly like [[Values]]. */
+final class PluginValuesVM(val plugin: Plugin, initial: Values = Values.empty):
+  val props: Map[String, StringProperty] =
+    plugin.controls.collect {
+      case c if c.hasValue => c.key -> new SimpleStringProperty(initial.map.getOrElse(c.key, c.default))
+    }.toMap
+
+  def prop(key: String): Option[StringProperty] = props.get(key)
+  def values: Values = Values(props.view.mapValues(_.get).toMap)
+  def isActive: Boolean = plugin.isActive(values)
+  def hasEnabledToggle: Boolean = props.contains("enabled")
+
+  def load(v: Values): Unit = props.foreach((k, p) => v.map.get(k).foreach(p.set))
+  def reset(): Unit = load(PluginValuesVM.defaults(plugin.controls))
+
+object PluginValuesVM:
+  def defaults(controls: Seq[Control]): Values = Values.defaults(controls)
+
+  def widgetFor(c: Control): Widget = c match
+    case _: Control.Slider                => Widget.SliderSpinner
+    case _: Control.IntField              => Widget.IntSpinner
+    case _: Control.Check                 => Widget.CheckBox
+    case _: Control.Choice                => Widget.Combo
+    case _: Control.DynamicChoice         => Widget.DynamicCombo
+    case t: Control.Text if t.multiline   => Widget.TextArea
+    case _: Control.Text                  => Widget.TextField
+    case _: Control.Note                  => Widget.Label
+    case _: Control.Section               => Widget.Section
+    case i: Control.ImageFile if i.multiple => Widget.ImageList
+    case _: Control.ImageFile             => Widget.ImagePicker
+
+  /** Options of a choice control; dynamic ones are resolved through `choices` and get "None" when allowed. */
+  def options(c: Control, choices: ChoiceSource => Seq[String]): Seq[String] = c match
+    case ch: Control.Choice         => ch.options
+    case dc: Control.DynamicChoice  => (if dc.allowNone then Seq("None") else Nil) ++ choices(dc.source)
+    case _                          => Nil
+
+/** Corridor PNGs contain settings but do not contain their original img2img source. */
+object CorridorRestore:
+  def prepare(fields: Map[String, String], vms: Map[Mode, GenerationVM]): Option[Mode] =
+    sdfx.plugins.CorridorCrawlerPlugin.replay(fields).map { _ =>
+      vms(Mode.Img2Img).initImage.set("")
+      Mode.Img2Img
+    }
+
+/** Plugins of one tab: the selected script and every AlwaysOn plugin, with their values. */
+final class PluginsVM(val mode: Mode, scripts: Seq[Plugin], alwaysOnPlugins: Seq[Plugin], initial: Plugin => Values):
+  val scriptForms: Seq[PluginValuesVM] = scripts.map(p => new PluginValuesVM(p, initial(p)))
+  val alwaysOnForms: Seq[PluginValuesVM] = alwaysOnPlugins.map(p => new PluginValuesVM(p, initial(p)))
+  /** Selected script plugin id, "" = None. */
+  val selectedScript = new SimpleStringProperty("")
+
+  def form(id: String): Option[PluginValuesVM] = (scriptForms ++ alwaysOnForms).find(_.plugin.id == id)
+
+  /** Replay only this script's own settings; ordinary infotext leaves other script choices alone. */
+  def restoreLatentUpscale(fields: Map[String, String]): Unit =
+    sdfx.plugins.LatentUpscalePlugin.replay(fields) match
+      case Some(values) => form("latent_upscale").foreach { f =>
+        f.load(values)
+        selectedScript.set("latent_upscale")
+      }
+      case None => if selectedScript.get == "latent_upscale" then selectedScript.set("")
+
+  def restoreOldSdFirstpasser(fields: Map[String, String]): Unit =
+    sdfx.plugins.OldSdFirstpasserPlugin.replay(fields) match
+      case Some(values) => form("old_sd_firstpasser").foreach { f =>
+        f.load(values)
+        selectedScript.set("old_sd_firstpasser")
+      }
+      case None => if selectedScript.get == "old_sd_firstpasser" then selectedScript.set("")
+
+  def restoreAnimateDiff(fields: Map[String, String]): Unit =
+    sdfx.plugins.AnimateDiffPlugin.replay(fields) match
+      case Some(values) => form("animatediff").foreach { f =>
+        f.load(values)
+        selectedScript.set("animatediff")
+      }
+      case None => if selectedScript.get == "animatediff" then selectedScript.set("")
+
+  def restoreCnAnimation(fields: Map[String, String]): Unit =
+    sdfx.plugins.CnAnimationPlugin.replay(fields) match
+      case Some(values) => form("cn_animation").foreach { f =>
+        f.load(values)
+        selectedScript.set("cn_animation")
+      }
+      case None => if selectedScript.get == "cn_animation" then selectedScript.set("")
+
+  def restoreCorridorCrawler(fields: Map[String, String]): Unit =
+    sdfx.plugins.CorridorCrawlerPlugin.replay(fields) match
+      case Some(values) => form("corridor_crawler").foreach { f =>
+        f.load(values)
+        selectedScript.set("corridor_crawler")
+      }
+      case None => if selectedScript.get == "corridor_crawler" then selectedScript.set("")
+
+  def scriptJob: Option[(Plugin, Values)] =
+    scriptForms.find(_.plugin.id == selectedScript.get).map(f => f.plugin -> f.values)
+
+  def alwaysOnJob: Seq[(Plugin, Values)] = alwaysOnForms.filter(_.isActive).map(f => f.plugin -> f.values)
+
+  /** All applicable AlwaysOn forms, including disabled values, frozen on actual queue submission. */
+  def payloadConfigurationJson(limits: PayloadJsonBudget.Limits = PayloadJsonBudget.Limits()): String =
+    def form(f: PluginValuesVM): ujson.Obj =
+      val values = f.values
+      ujson.Obj("id" -> f.plugin.id, "title" -> f.plugin.name,
+        "values" -> ujson.Obj.from(values.map.toSeq.sortBy(_._1).map((k, v) => k -> ujson.Str(v))),
+        "active" -> f.plugin.isActive(values))
+    val configuration = ujson.Obj("ui_forms" -> "available",
+      "selected_script" -> scriptForms.find(_.plugin.id == selectedScript.get).map(form).getOrElse(ujson.Null),
+      "always_on" -> ujson.Arr.from(alwaysOnForms.map(form)))
+    PayloadJsonBudget.write(configuration, limits).getOrElse("{\"status\":\"unavailable_limits\"}")
+
+  /** Restore native display controls from PNG parameters. GenerationVM deliberately clears extra fields;
+    * the form must own restored values so both its checkboxes and the next queued job agree.
+    */
+  def restoreInfotext(text: String): Unit =
+    val fields = Infotext.parse(text).fields
+    sdfx.plugins.ConditioningHighresFixPlugin.replay(fields).foreach(values => form("conditioning_highres_fix").foreach(_.load(values)))
+    sdfx.plugins.Img2ImgHiresFixPlugin.replay(fields).foreach(values => form("img2img_hires_fix").foreach(_.load(values)))
+    if fields.contains("Model keyword settings") || fields.get("Model keyword replay").exists(_.equalsIgnoreCase("true")) then
+      form("model_keyword").foreach(_.load(Values(Map("enabled" -> "false"))))
+    fields.get("Hires seed").flatMap(sdfx.core.infotext.HiresSeedMetadata.parse).foreach { h =>
+      val values = Values(h.value.toMap.map { (key, value) => key -> (value match
+        case ujson.Bool(b) => b.toString
+        case ujson.Num(n) if n == math.floor(n) => n.toLong.toString
+        case ujson.Num(n) => n.toString
+        case other => other.str)
+      })
+      form("hires_fix_tweaks").foreach(_.load(values))
+    }
+    sdfx.plugins.TokenDownsamplingPlugin.replay(fields).foreach(values => form("token_downsampling").foreach(_.load(values)))
+    sdfx.plugins.SemanticGuidancePlugin.replay(fields).foreach(values => form("semantic_guidance").foreach(_.load(values)))
+    sdfx.plugins.AgentAttentionPlugin.replay(fields).foreach(values => form("agent_attention").foreach(_.load(values)))
+    sdfx.plugins.CdTunerPlugin.replay(fields).foreach(values => form("cd_tuner").foreach(_.load(values)))
+    sdfx.plugins.NsfwCheckerPlugin.replay(fields).foreach(values => form("nsfw_checker").foreach(_.load(values)))
+    sdfx.plugins.CharacteristicGuidancePlugin.replay(fields).foreach(values => form("characteristic_guidance").foreach(_.load(values)))
+    sdfx.plugins.IncantationsPlugin.replay(fields).foreach(values => form("incantations").foreach(_.load(values)))
+    sdfx.plugins.SonarPlugin.replay(fields).foreach(values => form("sonar").foreach(_.load(values)))
+    sdfx.plugins.LlulPlugin.replay(fields).foreach(values => form("llul").foreach(_.load(values)))
+    sdfx.plugins.BatchFaceSwapPlugin.replay(fields).foreach(values => form("batch_face_swap").foreach(_.load(values)))
+    sdfx.plugins.AestheticGradientsPlugin.replay(fields).foreach(values => form("aesthetic_gradients").foreach(_.load(values)))
+    sdfx.plugins.AestheticScorePlugin.replay(fields).foreach(values => form("aesthetic_score").foreach(_.load(values)))
+    sdfx.plugins.ClipIoPlugin.replay(fields).foreach(values => form("clip_io").foreach(_.load(values)))
+    sdfx.plugins.CompilePlugin.replay(fields).foreach(values => form("compile").foreach(_.load(values)))
+    sdfx.plugins.DeepCachePlugin.replay(fields).foreach(values => form("deepcache").foreach(_.load(values)))
+    sdfx.plugins.CfgCachePlugin.replay(fields).foreach(values => form("cfg_cache").foreach(_.load(values)))
+    sdfx.plugins.PostDiffPlugin.replay(fields).foreach(values => form("postdiff").foreach(_.load(values)))
+    sdfx.plugins.TGatePlugin.replay(fields).foreach(values => form("tgate").foreach(_.load(values)))
+    sdfx.plugins.FastModePlugin.replay(fields).foreach { fm =>
+      form("fast_mode").foreach(_.load(fm))
+      if fm.bool("enabled") then
+        val fmInterval = fm.int("interval", 3)
+        val fmOrder = fm.int("order", 0)
+        val fmContraction = fm.double("contraction", 1.0)
+        val fmCfgCache = fm.int("cfg_cache_interval", 0)
+        val fmGateStep = fm.int("gate_step", 0)
+        form("deepcache").foreach { dc =>
+          val v = dc.values
+          if v.bool("enabled") && fmInterval >= 2 && v.int("interval", -1) == fmInterval &&
+              v.int("branch", -1) == 0 && v.int("full_first", -1) == 5 && v.int("order", 0) == fmOrder &&
+              math.abs(v.double("contraction", 1.0) - fmContraction) < 1e-6 then
+            dc.load(Values(Map("enabled" -> "false")))
+        }
+        form("cfg_cache").foreach { cc =>
+          val v = cc.values
+          if v.bool("enabled") && fmCfgCache >= 2 && v.int("interval", -1) == fmCfgCache &&
+              math.abs(v.double("start", -1.0) - 0.25) < 1e-6 &&
+              v.double("adaptive_threshold", 0.0) == 0.0 && v.double("hf_weight", 0.0) == 0.0 then
+            cc.load(Values(Map("enabled" -> "false")))
+        }
+        form("tgate").foreach { tg =>
+          val v = tg.values
+          if v.bool("enabled") && fmGateStep >= 1 && v.int("gate_step", -1) == fmGateStep then
+            tg.load(Values(Map("enabled" -> "false")))
+        }
+    }
+    def flag(key: String): Option[Boolean] = fields.get(key).flatMap { v =>
+      v.trim.toLowerCase(java.util.Locale.ROOT) match
+        case "true" => Some(true)
+        case "false" => Some(false)
+        case _ => None
+    }
+    val numbers = flag(GridNumbers.NumbersKey)
+    val xyz = flag(GridNumbers.XyzKey)
+    if numbers.isDefined || xyz.isDefined then
+      form("grid_numbers").foreach(_.load(Values(Map(
+        "enabled" -> "true", "image_numbers" -> numbers.getOrElse(true).toString,
+        "xyz_info" -> xyz.getOrElse(false).toString))))
+
+  /** Apply the validated prompt/seed restore result to the owned native Hires form. */
+  def restoreHiresParams(params: sdfx.core.model.GenerationParams): Unit =
+    form("hires_fix_tweaks").foreach { f =>
+      f.reset()
+      params.hooks.get("hires_fix_tweaks").collect { case o: ujson.Obj => o }.foreach { h =>
+        val values = h.value.toSeq.collect {
+          case (k, ujson.Str(s)) => k -> s
+          case (k, v: ujson.Bool) => k -> v.bool.toString
+          case (k, ujson.Num(n)) => k -> (if n == math.floor(n) then n.toLong.toString else n.toString)
+          case ("styles", v: ujson.Arr) => "styles" -> v.render()
+        }
+        f.load(Values(values.toMap))
+      }
+    }
+
+  /** plugin id -> values, for persistence. */
+  def snapshot: Map[String, Map[String, String]] = (scriptForms ++ alwaysOnForms).map(f => f.plugin.id -> f.values.map).toMap

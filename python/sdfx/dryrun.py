@@ -1,0 +1,535 @@
+"""Dry-run engine: same request surface as the real engine, never imports torch/diffusers.
+
+Generation writes deterministic seed-based gradient+noise PNGs (Pillow, or a pure-python PNG writer),
+emits progress for each step of each pass, 1-2 previews per pass, and honours interrupt.
+"""
+from __future__ import annotations
+
+import importlib.util
+import os
+import random
+import shutil
+import time
+from typing import Optional
+
+from . import inpaint, models, schedulers
+
+try:  # warm optional imports on the main thread: a first numpy import inside the worker thread can stall
+    import numpy  # noqa: F401  (for many seconds on Windows when stdio are pipes)
+    HAVE_NUMPY = True
+except ImportError:
+    HAVE_NUMPY = False
+from .base import LATENT_UPSCALERS, BaseEngine
+from .images import (HAVE_PIL, Image, ImageFilter, ImageOps, load_mask, load_rgb, next_output_path, png_size,
+                     resize_image, save_png, to_jpeg_b64, write_png_rgb)
+# The sampling hooks use NumPy; dry-run itself still starts without it.
+if HAVE_NUMPY:
+    from . import sampling_ext
+    SAMPLING_HOOKS = tuple(sampling_ext.HOOKS)
+else:
+    SAMPLING_HOOKS = ()
+from .params import hires_steps, img2img_steps, resolve_seed
+from .protocol import INVALID_PARAMS, MODEL_LOAD_FAILED, UNSUPPORTED, EngineError, JobContext
+
+
+def _colors(seed: int):
+    rnd = random.Random(seed)
+    return tuple(rnd.randrange(256) for _ in range(3)), tuple(rnd.randrange(256) for _ in range(3)), rnd
+
+
+def fake_image(width: int, height: int, seed: int, subseed: int = -1, subseed_strength: float = 0.0):
+    """Deterministic colourful gradient + noise image (PIL)."""
+    c1, c2, rnd = _colors(seed)
+    grad = Image.linear_gradient("L").rotate(rnd.choice([0, 45, 90, 135, 180, 225, 270, 315]))
+    grad = grad.resize((width, height), Image.BILINEAR)
+    img = ImageOps.colorize(grad, c1, c2)
+    nw, nh = max(1, width // 8), max(1, height // 8)
+    noise = Image.frombytes("RGB", (nw, nh), rnd.randbytes(nw * nh * 3)).resize((width, height), Image.BICUBIC)
+    img = Image.blend(img, noise, 0.25)
+    if subseed_strength > 0 and subseed >= 0:
+        img = Image.blend(img, fake_image(width, height, subseed), min(1.0, subseed_strength))
+    return img
+
+
+def fake_rows(width: int, height: int, seed: int) -> list[bytes]:
+    """Pure-python fallback pixels (no Pillow)."""
+    c1, c2, rnd = _colors(seed)
+    rows = []
+    for y in range(height):
+        t = y / max(1, height - 1)
+        base = [int(c1[i] * (1 - t) + c2[i] * t) for i in range(3)]
+        row = bytearray()
+        noise = rnd.randbytes(width)
+        for x in range(width):
+            n = noise[x] // 8 - 16
+            row += bytes((min(255, max(0, base[0] + n)), min(255, max(0, base[1] + n)), min(255, max(0, base[2] + n))))
+        rows.append(bytes(row))
+    return rows
+
+
+class FakeEngine(BaseEngine):
+    dry_run = True
+
+    def __init__(self, delay_ms: int = 0):
+        super().__init__()
+        self.delay = max(0, int(delay_ms)) / 1000.0
+        self.vae: Optional[dict] = None
+
+    def features(self) -> list[str]:
+        from importlib.util import find_spec
+        nsfw = []
+        if HAVE_NUMPY and HAVE_PIL:
+            from .nsfw_checker import available as nsfw_available
+            nsfw = ["nsfw_checker"] if nsfw_available() else []
+            from .aesthetic_score import available as aesthetic_available
+            nsfw += ["aesthetic_score"] if aesthetic_available() else []
+            from .chara_searcher import available as chara_available
+            nsfw += ["chara_searcher"] if chara_available() else []
+        return (["inpaint_difference"] if HAVE_NUMPY and HAVE_PIL and find_spec('cv2') else []) + nsfw + ["clip_interrogator", "controlnet_preprocess_extras", "controlnet_fastload_data", "conditioning_highres_fix", "model_keyword", "embedding_merge", "metadata_utils", "img2img_hires_fix", "hires_fix_tweaks", "token_downsampling", "vram_estimator", "steps_animation", "pnginfo_injection", "gpu_temperature_guard", "freeu", "dynamic_thresholding", "hypertile", "pag", "controlnet", "apg", "mahiro", "rescale_cfg", "semantic_guidance", "agent_attention", "cd_tuner", "incantations", "sonar", "llul", "aesthetic_gradients", "characteristic_guidance",
+                "model_sampling", "kohya_hrfix", "multidiffusion", "latent_modifier", "soft_inpainting", "sag", "neveroom",
+                "reference", "revision", "ip_adapter", "controllllite", "fooocus_inpaint", "photomaker", "img2imgalt",
+                "face_restore", "caption", "img2vid", "novel_view", "ldsr", "marigold", "adetailer", "batch_face_swap", "weight_gradient", "negpip", "neutral_prompt", "prompt_fusion", "save_intermediate", "latent_upscale", "composable_lora", "loopback_scaler", "animatediff", "clip_io", "compile", "deepcache", "tgate", "cfg_cache", "postdiff", "system_info", "prevent_interrupt"] + list(SAMPLING_HOOKS) + (
+                    ["temporal_lab"] if HAVE_NUMPY and HAVE_PIL else []) + (
+                    ["cn_animation"] if HAVE_NUMPY and HAVE_PIL and find_spec('cv2') else []) + (
+                    ["custom_code"] if os.environ.get("SDFX_ALLOW_CODE") == "1" else [])
+
+    def temporal_lab(self, params: dict, ctx: JobContext) -> dict:
+        """Validate synthetic requests only: do not read or write user files."""
+        if not HAVE_NUMPY or not HAVE_PIL:
+            raise EngineError(UNSUPPORTED, "Temporal Lab dry-run requires NumPy and Pillow; install the Python dependencies")
+        from .temporal_lab import _dfi_options, _number, _path, _transaction
+        if not isinstance(params, dict):
+            raise EngineError(INVALID_PARAMS, "Temporal Lab parameters must be an object")
+        operation = params.get("operation")
+        if not isinstance(operation, str) or operation not in ("dfi", "preview", "deflicker", "fuse", "extract"):
+            raise EngineError(INVALID_PARAMS, "unknown Temporal Lab operation")
+        try:
+            ctx.check_interrupt()
+            if operation in ("dfi", "preview"):
+                _dfi_options(params)
+                sources = [_path(params, "reference_dir"), _path(params, "generated_dir")]
+                if operation == "preview":
+                    _number(params, "frame_index", 1, 1, 9999, integer=True)
+            elif operation == "deflicker":
+                sources = [_path(params, "frames_dir")]
+                _number(params, "blend", 0, 0, 1)
+                _number(params, "overlay", 0, 0, 1)
+                if not isinstance(params.get("normalize", False), bool):
+                    raise ValueError("normalize must be boolean")
+            elif operation == "fuse":
+                sources = [_path(params, "style_dir"), _path(params, "video_dir")]
+                _number(params, "strength", 0.5, 0.1, 1)
+            else:
+                sources = [_path(params, "video_path")]
+                _number(params, "fps", 0, 0, 1000)
+            if operation != "preview":
+                _transaction(params, sources)  # validates names and path form, never enters or writes
+            ctx.check_interrupt()
+            return {"operation": operation, "dry_run": True}
+        except EngineError:
+            raise
+        except (ValueError, OSError) as exc:
+            raise EngineError(INVALID_PARAMS, str(exc)) from exc
+
+    def preprocessors(self) -> list[str]:
+        return (["none", "canny", "depth", "invert", "inpaint", "recolor_luminance", "recolor_intensity", "tile_resample",
+                 "tile_colorfix", "blur_gaussian", "depth_marigold", "normal_marigold"] if HAVE_PIL else ["none"])
+
+    # -- models ------------------------------------------------------------
+    def load_model(self, params: dict, ctx: JobContext) -> dict:
+        t0 = time.monotonic()
+        req = self.parse_load(params)
+        kind = models.detect_kind(req.path)
+        if kind == "unsupported":
+            raise EngineError(MODEL_LOAD_FAILED, f"unsupported model architecture: {os.path.basename(req.path)}")
+        self.load_opts = req
+        self.vae = None
+        if req.vae_path:
+            self.vae = {"vae_name": models.model_name(req.vae_path), "vae_hash": models.path_hash(req.vae_path), "path": req.vae_path}
+        self.model = {"name": models.model_name(req.path), "path": req.path,
+                      "kind": "sd15" if kind == "unknown" else kind, "hash": models.short_hash(req.path)}
+        return self._loaded(int((time.monotonic() - t0) * 1000))
+
+    def _loaded(self, ms: int = 0) -> dict:
+        m = dict(self.model)
+        m["loaded_ms"] = ms
+        m["vae_name"] = self.vae["vae_name"] if self.vae else None
+        m["vae_hash"] = self.vae["vae_hash"] if self.vae else None
+        m["vae_path"] = self.vae["path"] if self.vae else None
+        return m
+
+    def set_vae(self, params: dict, ctx: JobContext) -> dict:
+        if self.model is None:
+            raise EngineError("no_model", "no model loaded")
+        p = params.get("path")
+        if p:
+            if not os.path.exists(p):
+                raise EngineError(MODEL_LOAD_FAILED, f"VAE file not found: {p}")
+            self.vae = {"vae_name": models.model_name(p), "vae_hash": models.path_hash(p), "path": p}
+        else:
+            self.vae = None
+        self.load_opts.vae_path = p or None
+        return self._loaded()
+
+    def unload(self, params: dict, ctx: JobContext) -> dict:
+        self.model = None
+        self.vae = None
+        return {}
+
+    # -- generation --------------------------------------------------------
+    def txt2img(self, params: dict, ctx: JobContext) -> dict:
+        return self._generate(params, ctx, "txt2img")
+
+    def img2img(self, params: dict, ctx: JobContext) -> dict:
+        return self._generate(params, ctx, "img2img")
+
+    def _sleep_step(self, ctx: JobContext):
+        ctx.check_interrupt()
+        if self.delay:
+            end = time.monotonic() + self.delay
+            while time.monotonic() < end:
+                ctx.check_interrupt()
+                time.sleep(min(0.01, max(0.0, end - time.monotonic())))
+        ctx.check_interrupt()
+
+    def _run_pass(self, ctx: JobContext, steps: int, pass_: str, image: int, images: int, seed: int,
+                  preview_every: int, size: tuple[int, int]):
+        ctx.start_pass()
+        previews = 0
+        for step in range(1, steps + 1):
+            self._sleep_step(ctx)
+            ctx.progress(step, steps, pass_, image=image, images=images)
+            if HAVE_PIL and preview_every > 0 and previews < 2 and (step % preview_every == 0 or step == steps):
+                w, h = size
+                f = 64 / max(w, h)
+                pv = fake_image(max(8, int(w * f)), max(8, int(h * f)), seed + step)
+                ctx.preview(to_jpeg_b64(pv), step)
+                previews += 1
+
+    def _generate(self, params: dict, ctx: JobContext, mode: str) -> dict:
+        from .hooks import hook_config
+        fields = params.get('params', {}) if isinstance(params, dict) else {}
+        if not isinstance(fields, dict):
+            fields = {}
+        if hook_config(fields.get('hooks', {}), 'inpaint_difference', {}) is None:
+            return self._generate_recorded(params, ctx, mode)
+        with self.difference_generation(params, mode, ctx) as prepared:
+            return self._generate_recorded(prepared, ctx, mode)
+
+    def _generate_recorded(self, params: dict, ctx: JobContext, mode: str) -> dict:
+        t0 = time.monotonic()
+        hardware_started = time.perf_counter()
+        req = self.parse_generation(params, mode, ctx)
+        gp = req.params
+        from .hooks import hook_config
+        from .hires_tweaks import seed_plan, wire_seed
+        from .img2img_hires_fix import normalize, effective
+        refine_config = hook_config(gp.hooks, 'img2img_hires_fix', {})
+        refine_config = normalize(refine_config) if refine_config is not None else None
+        nsfw_cfg = None
+        if hook_config(gp.hooks, 'nsfw_checker', {}) is not None:
+            if not (HAVE_NUMPY and HAVE_PIL):
+                raise EngineError(UNSUPPORTED, 'NudeNet NSFW Censor dry-run requires NumPy and Pillow')
+            from .nsfw_checker import job_config
+            nsfw_cfg = job_config(gp.hooks, ctx)
+        aesthetic_cfg = None
+        if hook_config(gp.hooks, 'aesthetic_score', {}) is not None:
+            if not (HAVE_NUMPY and HAVE_PIL):
+                raise EngineError(UNSUPPORTED, 'Aesthetic score dry-run requires NumPy and Pillow')
+            from .aesthetic_score import job_config as aesthetic_job_config
+            aesthetic_cfg = aesthetic_job_config(gp.hooks, ctx)
+        auxiliary = []
+        seed, subseed = resolve_seed(gp.seed), resolve_seed(gp.subseed)
+        bs, n_iter = gp.batch_size, gp.n_iter
+        hires = mode == "txt2img" and gp.hires.enabled
+        tweaks = hook_config(gp.hooks, "hires_fix_tweaks", {}) if hires else None
+        hr_plan = seed_plan(tweaks, [seed + i for i in range(bs * n_iter)],
+            [subseed + i for i in range(bs * n_iter)], gp.subseed_strength) if tweaks is not None else None
+        repeats = hr_plan.count if hr_plan is not None else 1
+        total = bs * n_iter * repeats
+        if total > 1600:
+            raise EngineError(INVALID_PARAMS, "Hires repeats exceed the 1600-image generation limit")
+        hardware_timer = None
+        hardware_profile = None
+        if req.hardware_info.enabled:
+            from .hardware_info import ImageTiming, cached_profile
+            hardware_timer = ImageTiming(gp.batch_size, started_at=hardware_started)
+            hardware_profile = cached_profile(self)
+        try:
+            self.ensure_model(gp, ctx)
+            m = self.model
+        except EngineError as e:
+            if e.code != "no_model":
+                raise
+            # dry run stays usable without any checkpoint (UI development / smoke tests)
+            m = {"name": "dry-run", "path": "", "kind": "sd15", "hash": "0000000000"}
+            ctx.log("info", "dry run: no model loaded, using placeholder model 'dry-run'")
+        keyword_plan, keyword_loras = self.generation_keyword_plan(gp, req, seed, ctx)
+        w, h = gp.width, gp.height
+        hires = mode == "txt2img" and gp.hires.enabled
+        out_w, out_h = gp.hires.target_size(w, h) if hires else (w, h)
+
+        if mode == "img2img":
+            from .hooks import hook_config
+            from .latent_upscale import full_steps
+            latent = hook_config(gp.hooks, "latent_upscale", {})
+            base_steps = (full_steps(gp.steps, gp.img2img.denoising_strength)[2] if latent is not None else
+                          img2img_steps(gp.steps, gp.img2img.denoising_strength)[2])
+        else:
+            base_steps = gp.steps
+        hr_steps = hires_steps(gp.hires.second_pass_steps or gp.steps, gp.hires.denoising_strength)[2] if hires else 0
+
+
+        init = job = None
+        if mode == "img2img" and HAVE_PIL:
+            init = load_rgb(gp.img2img.init_image)
+
+        images = []
+        interrupted = False
+        from . import animatediff
+        ad_cfg = hook_config(gp.hooks, "animatediff", animatediff.DEFAULTS)
+        ad_cfg = animatediff.normalize(ad_cfg) if ad_cfg is not None else None
+        if ad_cfg is not None:
+            if bs != 1:
+                raise EngineError(INVALID_PARAMS, "AnimateDiff: batch size must be 1 (one video per image; use the batch count for several videos)")
+            if hires or refine_config is not None:
+                raise EngineError(UNSUPPORTED, "AnimateDiff cannot be combined with Hires. fix")
+            if not HAVE_PIL:
+                raise EngineError(UNSUPPORTED, "AnimateDiff dry run needs Pillow")
+        from . import clip_io
+        cio = hook_config(gp.hooks, "clip_io", clip_io.DEFAULTS)
+        if cio is not None:
+            cio = clip_io.normalize(cio)
+            for text, mode in ((gp.prompt, cio["positive_mode"]), (gp.negative_prompt, cio["negative_mode"])):
+                if cio["input_enabled"] and mode != "off":
+                    for piece in clip_io.parse_input(text, mode):
+                        if piece.kind == "file":
+                            clip_io.resolve_file(piece.text)
+        try:
+            for it in range(n_iter):
+                idx0 = it * bs
+                self._run_pass(ctx, base_steps, "base", idx0 * repeats, total, seed + idx0, req.preview_every, (w, h))
+                if ad_cfg is not None:
+                    for frame in range(ad_cfg["video_length"]):
+                        path = next_output_path(req.output_dir, str(seed + idx0))
+                        save_png(fake_image(w, h, seed + idx0, seed + idx0 + 1, frame / max(1, ad_cfg["video_length"] - 1)), path)
+                        images.append({"path": path, "seed": seed + idx0, "subseed": subseed + idx0, "width": w, "height": h})
+                    continue
+                for repeat in range(repeats):
+                    hr_seeds, hr_subs = hr_plan.batch(idx0, bs, repeat) if hr_plan else (
+                        [seed + idx0 + j for j in range(bs)], [subseed + idx0 + j for j in range(bs)])
+                    if hires:
+                        self._run_pass(ctx, hr_steps, "hires", (it * repeats + repeat) * bs, total, hr_seeds[0] + 7, req.preview_every, (out_w, out_h))
+                    for j in range(bs):
+                        k = idx0 + j
+                        s, ss = seed + k, subseed + k
+                        path = next_output_path(req.output_dir, str(s))
+                        hardware_record = None
+                        aesthetic_fields = None
+                        if HAVE_PIL:
+                            img = fake_image(out_w, out_h, hr_seeds[j], hr_subs[j], hr_plan.strength if hr_plan else gp.subseed_strength)
+                            if init is not None:
+                                ip = gp.img2img
+                                if ip.mask is not None:
+                                    job = inpaint.prepare(init, load_mask(ip.mask), w, h, ip.resize_mode, ip.mask_blur,
+                                                          ip.inpainting_fill, ip.inpaint_full_res, ip.inpaint_full_res_padding,
+                                                          ip.inpainting_mask_invert, s)
+                                    img = job.finalize(Image.blend(job.image, img, ip.denoising_strength))
+                                else:
+                                    base = resize_image(ip.resize_mode, init, w, h)
+                                    img = Image.blend(base, img, ip.denoising_strength)
+                            if hardware_timer is not None:
+                                from .hardware_info import record
+                                hardware_record = record(hardware_profile, hardware_timer.next_image(), req.hardware_info.remark)
+                            if refine_config is not None:
+                                rw, rh = refine_config.target(*img.size)
+                                if refine_config.denoise:
+                                    refine_params = effective(refine_config, gp)
+                                    actual = img2img_steps(refine_params.steps, refine_config.denoise)[2]
+                                    self._run_pass(ctx, actual, 'img2img_hires', (it * repeats + repeat) * bs + j,
+                                        total, hr_seeds[j], req.preview_every, (rw, rh))
+                                img = img.resize((rw, rh))
+                            censor_auxiliaries = []
+                            if nsfw_cfg is not None:
+                                from .nsfw_checker import censor_final
+                                img, censor_auxiliaries = censor_final(img, nsfw_cfg, ctx)
+                            if aesthetic_cfg is not None:
+                                from .aesthetic_score import score_final
+                                aesthetic_fields = score_final(img, aesthetic_cfg, ctx, gp, seed, m["hash"])
+                            save_png(img, path)
+                            iw, ih = img.size
+                        else:
+                            if refine_config is not None:
+                                raise EngineError(UNSUPPORTED, 'img2img Hires Fix dry-run requires Pillow')
+                            rows = fake_rows(out_w, out_h, hr_seeds[j])
+                            if hardware_timer is not None:
+                                from .hardware_info import record
+                                hardware_record = record(hardware_profile, hardware_timer.next_image(), req.hardware_info.remark)
+                            write_png_rgb(path, out_w, out_h, rows)
+                            iw, ih = out_w, out_h
+                        entry = {"path": path, "seed": s, "subseed": ss, "width": iw, "height": ih}
+                        if keyword_plan is not None:
+                            entry['effective_prompt'] = keyword_plan['replay_prompts'][k]
+                            entry['model_keyword_source_prompt'] = keyword_plan['prompts'][k]
+                            if 'refinement_prompt' in keyword_plan:
+                                entry['model_keyword_refinement_prompt'] = keyword_plan['refinement_prompt']
+                        if hr_plan is not None:
+                            entry.update(hires_seed=wire_seed(hr_seeds[j]), hires_subseed=wire_seed(hr_subs[j]),
+                                hires_subseed_strength=hr_plan.strength, hires_repeat=repeat,
+                                hires_seed_resize_from_w=hr_plan.resize_width, hires_seed_resize_from_h=hr_plan.resize_height)
+                        if hardware_record is not None:
+                            entry['hardware_info'] = hardware_record
+                        if aesthetic_fields is not None:
+                            entry.update(aesthetic_fields)
+                        images.append(entry)
+                        if HAVE_PIL and censor_auxiliaries:
+                            from .nsfw_checker import save_auxiliaries
+                            auxiliary.extend(save_auxiliaries(entry, censor_auxiliaries, req.output_dir, len(images) - 1))
+        except EngineError as error:
+            if error.code != "interrupted" or (hr_plan is None and refine_config is None) or not images:
+                raise
+            interrupted = True
+
+        return {
+            "images": images,
+            "interrupted": interrupted,
+            "timing_s": round(time.monotonic() - t0, 3),
+            "model_name": m["name"], "model_hash": m["hash"],
+            "vae_name": self.vae["vae_name"] if self.vae else None,
+            "vae_hash": self.vae["vae_hash"] if self.vae else None,
+            "lora_hashes": {lr.name: models.short_hash(req.lora_paths[lr.name]) for lr in gp.loras},
+            "scheduler": schedulers.resolve_schedule(gp.sampler_name, gp.scheduler),
+            "warnings": list(ctx.warnings),
+            "system_info": self._system_metadata(req.system_info_fields),
+            **({"auxiliary_images": auxiliary} if auxiliary else {}),
+        }
+
+    # -- tools ---------------------------------------------------------------
+    def _system_metadata(self, fields):
+        if not fields:
+            return None
+        from .system_info import snapshot, metadata
+        return metadata(snapshot(self, full=True), fields)
+
+    def preprocess(self, params: dict, ctx: JobContext) -> dict:
+        req = self.parse_preprocess(params)
+        out = next_output_path(req.output_dir, f"pre-{req.preprocessor}")
+        if not HAVE_PIL:
+            shutil.copyfile(req.image_path, out)
+            return {"path": out}
+        img = load_rgb(req.image_path)
+        if req.standalone and req.preprocessor not in ("depth", "depth_marigold", "normal_marigold") and (
+                req.preprocessor != "canny" or importlib.util.find_spec("cv2")):
+            from . import controlnet as cn_mod
+            out_img, info, notes = cn_mod.standalone_preprocess(req.preprocessor, img, req.args, req.processor_res, req.pixel_perfect)
+            for note in notes:
+                ctx.warn(note)
+            cn_mod.save_preprocessed(out_img, out, info, req.image_path)
+            return {"path": out, "info": info, "notes": notes}
+        if req.preprocessor == "canny":
+            img = img.convert("L").filter(ImageFilter.FIND_EDGES).point(
+                lambda v: 255 if v > int(req.args.get("low_threshold", 100)) // 4 else 0).convert("RGB")
+        elif req.preprocessor == "depth":
+            img = img.convert("L").filter(ImageFilter.GaussianBlur(4)).convert("RGB")
+        elif req.preprocessor == "invert":
+            img = ImageOps.invert(img)
+        elif req.preprocessor in ("recolor_luminance", "recolor_intensity", "tile_resample", "tile_colorfix", "blur_gaussian"):
+            from .controlnet import pil_preprocess
+            img = pil_preprocess(req.preprocessor, img, req.args)
+        elif req.preprocessor in ("depth_marigold", "normal_marigold"):
+            img = img.convert("L").filter(ImageFilter.GaussianBlur(6)).convert("RGB")
+        save_png(img, out)
+        return {"path": out}
+
+    def upscale(self, params: dict, ctx: JobContext) -> dict:
+        hardware_started = time.perf_counter()
+        req = self.parse_upscale(params)
+        hardware_timer = None
+        hardware_profile = None
+        if req.hardware_info.enabled:
+            from .hardware_info import ImageTiming, cached_profile
+            hardware_timer = ImageTiming(1, started_at=hardware_started)
+            hardware_profile = cached_profile(self)
+        out = next_output_path(req.output_dir, f"up-{req.upscaler}")
+        result = {"path": out}
+        if not HAVE_PIL:
+            if hardware_timer is not None:
+                from .hardware_info import record
+                result['hardware_info'] = record(hardware_profile, hardware_timer.next_image(), req.hardware_info.remark)
+            shutil.copyfile(req.image_path, out)
+            return result
+        img = load_rgb(req.image_path)
+        if req.upscaler != "None":
+            nw, nh = max(1, round(img.width * req.scale)), max(1, round(img.height * req.scale))
+            img = img.resize((nw, nh), Image.NEAREST if req.upscaler == "Nearest" else Image.LANCZOS)
+        if hardware_timer is not None:
+            from .hardware_info import record
+            result['hardware_info'] = record(hardware_profile, hardware_timer.next_image(), req.hardware_info.remark)
+        save_png(img, out)
+        return result
+
+
+    # -- extras (fake but shape-correct outputs) ----------------------------------------------------------------------
+    def _require(self, params: dict, key: str) -> str:
+        v = params.get(key)
+        if not v:
+            raise EngineError(INVALID_PARAMS, f"'{key}' is required")
+        return str(v)
+
+    def restore_faces(self, params: dict, ctx: JobContext) -> dict:
+        src = self._require(params, "image_path")
+        model = self._require(params, "model")
+        if not os.path.isfile(model):
+            raise EngineError(INVALID_PARAMS, f"face restoration model not found: {model}")
+        out = next_output_path(self._require(params, "output_dir"), "faces")
+        if HAVE_PIL:
+            save_png(load_rgb(src).filter(ImageFilter.SMOOTH), out)
+        else:
+            shutil.copyfile(src, out)
+        return {"path": out}
+
+    def caption(self, params: dict, ctx: JobContext) -> dict:
+        self._require(params, "image_path")
+        method = str(params.get("method", "blip"))
+        if method not in ("blip", "wd14"):
+            raise EngineError(INVALID_PARAMS, f"unknown caption method '{method}' (blip, wd14)")
+        return {"caption": "a dry-run image" if method == "blip" else "dry run, noise, colorful"}
+
+    def run_code(self, params: dict, ctx: JobContext) -> dict:
+        from .extras import run_code
+        res = run_code(str(params.get("code", "")), {"engine": self, "params": params, "ctx": ctx})
+        res["images"] = []
+        return res
+
+    def img2vid(self, params: dict, ctx: JobContext) -> dict:
+        src = self._require(params, "image_path")
+        model = self._require(params, "model")
+        if not os.path.exists(model):
+            raise EngineError(INVALID_PARAMS, f"SVD model not found: {model}")
+        out_dir = self._require(params, "output_dir")
+        n = max(2, min(int(params.get("frames", 14)), 64))
+        steps = int(params.get("steps", 25))
+        for i in range(steps):
+            ctx.check_interrupt()
+            ctx.progress(i + 1, steps, "base")
+        if not HAVE_PIL:
+            raise EngineError(UNSUPPORTED, "img2vid dry run needs Pillow")
+        base = load_rgb(src).resize((int(params.get("width", 1024)) // 4, int(params.get("height", 576)) // 4))
+        frames = [base.rotate(i * 360 / n) for i in range(n)]
+        from .extras import save_gif
+        gif = save_gif(frames, next_output_path(out_dir, "svd", ".gif"), int(params.get("fps", 6)))
+        first = next_output_path(out_dir, "svd-frame0")
+        save_png(frames[0], first)
+        return {"path": gif, "frames": n, "preview": first}
+
+    def novel_view(self, params: dict, ctx: JobContext) -> dict:
+        src = self._require(params, "image_path")
+        out = next_output_path(self._require(params, "output_dir"), "novel-view")
+        if HAVE_PIL:
+            save_png(ImageOps.mirror(load_rgb(src)), out)
+        else:
+            shutil.copyfile(src, out)
+        return {"path": out}
+
+
+__all__ = ["FakeEngine", "fake_image", "LATENT_UPSCALERS", "png_size"]

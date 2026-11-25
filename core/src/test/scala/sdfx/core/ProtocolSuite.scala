@@ -1,0 +1,260 @@
+package sdfx.core
+
+import sdfx.core.json.SnakePickle
+import sdfx.core.model.*
+import sdfx.core.protocol.*
+import sdfx.core.infotext.HardwareInfo
+
+class ProtocolSuite extends munit.FunSuite:
+  test("per-image effective prompts survive protocol decoding and older workers remain compatible") {
+    val result = Json.fromJs[GenerationResult](ujson.read(
+      """{"images":[{"path":"one.png","seed":1,"effective_prompt":"first","model_keyword_source_prompt":"selected"},{"path":"two.png","seed":2,"effective_prompt":"second"}]}"""))
+    assertEquals(result.images.map(_.effectivePrompt), Seq(Some("first"), Some("second")))
+    assertEquals(result.images.map(_.modelKeywordSourcePrompt), Seq(Some("selected"), None))
+    val old = Json.fromJs[GenerationResult](ujson.read(
+      """{"images":[{"path":"old.png","seed":1}]}"""))
+    assertEquals(old.images.head.effectivePrompt, None)
+  }
+  import EngineEvent.*
+
+  test("difference hook enablement matches engine when determining inpaint mode") {
+    val base = GenerationParams(img2img = Some(Img2ImgParams(initImage = "altered.png")))
+    def enabled(value: ujson.Value) = base.copy(hooks = Map("inpaint_difference" -> value)).isInpaint
+    assert(enabled(ujson.Obj("base_path" -> "base.png")))
+    assert(!enabled(ujson.Obj("enabled" -> "false")))
+    assert(enabled(ujson.Str("yes")))
+    assert(!enabled(ujson.Str("false")))
+    assert(!enabled(ujson.Num(1)))
+  }
+
+  test("large Hires output seeds decode exactly from decimal text") {
+    val raw = ujson.read("""{"path":"a.png","seed":1,"width":64,"height":64,"hires_seed":"9007199254740993","hires_subseed":"9223372036854775807"}""")
+    val image = Json.fromJs[GeneratedImage](raw)
+    assertEquals(image.hiresSeed, Some(9007199254740993L))
+    assertEquals(image.hiresSubseed, Some(Long.MaxValue))
+  }
+
+  test("intermediate artifacts are typed auxiliary outputs and old responses still decode") {
+    val old = SnakePickle.read[GenerationResult]("""{"images":[]}""")
+    assertEquals(old.intermediateArtifacts, Nil)
+    val result = SnakePickle.read[GenerationResult]("""{"images":[],"intermediate_artifacts":[{"path":"outputs/intermediates/job/manifest.json","type":"manifest","future_field":1}]}""")
+    assertEquals(result.images, Nil)
+    assertEquals(result.intermediateArtifacts, Seq(IntermediateArtifact("outputs/intermediates/job/manifest.json", "manifest")))
+  }
+
+  test("Composable trace is typed and legacy results decode without it") {
+    assertEquals(Json.fromJs[GenerationResult](ujson.Obj("images" -> ujson.Arr())).composableLoraTrace, None)
+    val raw = ujson.read("""{"images":[],"composable_lora_trace":{"path":"outputs/intermediates/composable-lora/job.json","records":[],"plot":"obsolete-temp.png"}}""")
+    val result = Json.fromJs[GenerationResult](raw)
+    assertEquals(result.composableLoraTrace.map(_.path), Some("outputs/intermediates/composable-lora/job.json"))
+    assertEquals(Json.fromJs[GenerationResult](Json.toJs(result)), result)
+  }
+
+  private def ev(s: String) = EngineEvent.parse(ujson.read(s))
+
+  test("EngineEvent.parse: progress (full and defaults)") {
+    assertEquals(ev("""{"id":"r1","type":"event","event":"progress","step":3,"total":28,"pass":"hires","eta_s":1.5,"image":1,"images":4}"""),
+      Some(Progress(3, 28, "hires", 1.5, 1, 4)))
+    assertEquals(ev("""{"event":"progress"}"""), Some(Progress(0, 0, "base", 0.0, 0, 1)))
+    assertEquals(ev("""{"event":"progress","step":2.9,"total":10.0}"""), Some(Progress(2, 10)))
+  }
+
+  test("EngineEvent.parse: preview") {
+    assertEquals(ev("""{"event":"preview","jpeg_b64":"/9j/4AAQ","step":5}"""), Some(Preview("/9j/4AAQ", 5)))
+    assertEquals(ev("""{"event":"preview","jpeg_b64":"abc"}"""), Some(Preview("abc", 0)))
+    assertEquals(ev("""{"event":"preview","step":5}"""), None)
+    assertEquals(ev("""{"event":"preview","jpeg_b64":null}"""), None)
+  }
+
+  test("EngineEvent.parse: actual batch size with legacy and invalid fallback") {
+    assertEquals(ev("""{"event":"progress","step":3,"total":20,"image":4,"images":20,"batch_size":4}"""),
+      Some(Progress(3, 20, image = 4, images = 20, batchSize = 4)))
+    assertEquals(ev("""{"event":"progress","batch_size":0}"""), Some(Progress(0, 0)))
+  }
+
+  test("EngineEvent.parse: log") {
+    assertEquals(ev("""{"event":"log","level":"warning","message":"VRAM low"}"""), Some(Log("warning", "VRAM low")))
+    assertEquals(ev("""{"event":"log"}"""), Some(Log("info", "")))
+    assertEquals(ev("""{"event":"log","message":"日本語ログ"}"""), Some(Log("info", "日本語ログ")))
+  }
+
+  test("EngineEvent.parse: unknown / missing / malformed never throws") {
+    assertEquals(ev("""{"event":"telemetry","x":1}"""), None)
+    assertEquals(ev("""{"type":"event"}"""), None)
+    assertEquals(ev("""{"event":null}"""), None)
+    assertEquals(ev("""{"event":42}"""), None)
+    assertEquals(ev("""[1,2]"""), None)
+    assertEquals(ev("""null"""), None)
+    assertEquals(ev(""""progress""""), None)
+    assertEquals(ev("""{"event":"progress","step":"3","pass":null,"eta_s":"x"}"""), Some(Progress(0, 0)))
+    assertEquals(ev("""{"event":"log","level":null,"message":123}"""), Some(Log("info", "")))
+  }
+
+  test("EngineHello: full") {
+    val js = """{"id":null,"type":"hello","protocol":1,"engine_version":"0.1.0","python":"3.10.11","torch":"2.3.1+cu121",
+               |"diffusers":"0.30.0","cuda":true,"device":"cuda:0","vram_mb":24576,"dry_run":false,"features":["controlnet","freeu"]}""".stripMargin
+    val h = SnakePickle.read[EngineHello](js)
+    assertEquals(h, EngineHello(1, "0.1.0", "3.10.11", Some("2.3.1+cu121"), Some("0.30.0"), true, "cuda:0", 24576, false,
+      Seq("controlnet", "freeu")))
+  }
+
+  test("EngineHello: lenient — only required fields, optional ones missing or null") {
+    assertEquals(SnakePickle.read[EngineHello]("""{"protocol":1,"engine_version":"x"}"""), EngineHello(1, "x"))
+    val h = SnakePickle.read[EngineHello]("""{"protocol":2,"engine_version":"y","torch":null,"diffusers":null,"extra_future":[1]}""")
+    assertEquals(h, EngineHello(2, "y"))
+  }
+
+  test("EngineHello: missing required field fails") {
+    intercept[Exception](SnakePickle.read[EngineHello]("""{"engine_version":"x"}"""))
+  }
+
+  test("EngineHello round trip and snake keys") {
+    val h = EngineHello(1, "v", torch = Some("t"), vramMb = 8, dryRun = true, vulkanDevices = Seq("Vulkan0: GPU"))
+    val js = SnakePickle.writeJs(h)
+    assertEquals(js.obj.keys.toSet, Set("protocol", "engine_version", "python", "torch", "diffusers", "cuda", "device",
+      "vram_mb", "dry_run", "features", "vulkan_devices"))
+    assertEquals(SnakePickle.read[EngineHello](js), h)
+  }
+
+  test("GenerationRequest JSON has snake keys and round trips") {
+    val req = GenerationRequest(
+      params = GenerationParams(prompt = "p", negativePrompt = "n", cfgScale = 6, loras = Seq(LoraRef("foo", 0.5))),
+      outputDir = "D:/out/.tmp",
+      loraPaths = Map("foo" -> "D:/models/Lora/foo.safetensors"),
+      embeddingPaths = Seq("D:/emb/easyneg.pt"),
+      controlnetPaths = Map("canny" -> "D:/cn/canny.pth"),
+      upscalerPaths = Map("4x-UltraSharp" -> "D:/up/4x.pth"),
+      previewEvery = 3,
+      previewMethod = "full",
+      systemInfoFields = Seq("version.app", "platform.python"),
+      vaeRecoveryDir = "D:/out",
+      hardwareInfo = HardwareInfo.Options(enabled = true, remark = "quiet, 日本語\nsecond line")
+    )
+    val js = Json.toJs(req)
+    assertEquals(js.obj.keys.toSet, Set("params", "output_dir", "lora_paths", "embedding_paths", "controlnet_paths",
+      "upscaler_paths", "preview_every", "preview_method", "lbw_presets", "system_info_fields", "vae_recovery_dir", "hardware_info", "hires_loras", "manual_loras", "img2img_hires_loras"))
+    assertEquals(js("hires_loras"), ujson.Null)
+    assertEquals(js("manual_loras"), ujson.Null)
+    assertEquals(js("img2img_hires_loras"), ujson.Null)
+    val noImg2ImgHiresLoras = req.copy(img2imgHiresLoras = Some(Nil))
+    val noImg2ImgHiresLorasJs = Json.toJs(noImg2ImgHiresLoras)
+    assertEquals(noImg2ImgHiresLorasJs("img2img_hires_loras"), ujson.Arr())
+    assertEquals(Json.fromJs[GenerationRequest](noImg2ImgHiresLorasJs), noImg2ImgHiresLoras)
+    val img2imgHiresLoras = req.copy(img2imgHiresLoras = Some(Seq(LoraRef("refinement", 0.75))))
+    val img2imgHiresLorasJs = Json.toJs(img2imgHiresLoras)
+    assertEquals(img2imgHiresLorasJs("img2img_hires_loras")(0)("name").str, "refinement")
+    assertEquals(Json.fromJs[GenerationRequest](ujson.read(ujson.write(img2imgHiresLorasJs))), img2imgHiresLoras)
+    val noManual = req.copy(manualLoras = Some(Nil))
+    assertEquals(Json.toJs(noManual).obj("manual_loras"), ujson.Arr())
+    assertEquals(Json.fromJs[GenerationRequest](Json.toJs(noManual)).manualLoras, Some(Nil))
+    val explicitEmpty = req.copy(hiresLoras = Some(Nil))
+    assertEquals(Json.toJs(explicitEmpty).obj("hires_loras"), ujson.Arr())
+    assertEquals(Json.fromJs[GenerationRequest](Json.toJs(explicitEmpty)).hiresLoras, Some(Nil))
+    assertEquals(js("hardware_info"), ujson.Obj("enabled" -> true, "remark" -> "quiet, 日本語\nsecond line"))
+    assertEquals(js("vae_recovery_dir").str, "D:/out")
+    assertEquals(js("system_info_fields").arr.map(_.str).toSeq, Seq("version.app", "platform.python"))
+    assertEquals(js("params")("negative_prompt").str, "n")
+    assertEquals(js("params")("cfg_scale").num, 6.0)
+    assertEquals(js("lora_paths").obj.keys.toSeq, Seq("foo"))
+    assertEquals(js("upscaler_paths").obj.keys.toSeq, Seq("4x-UltraSharp"))
+    assertEquals(Json.fromJs[GenerationRequest](js), req)
+    assertEquals(Json.fromJs[GenerationRequest](ujson.read(ujson.write(js))), req)
+  }
+
+  test("GenerationRequest minimal") {
+    val r = Json.fromJs[GenerationRequest](ujson.read("""{"params":{},"output_dir":"o"}"""))
+    assertEquals(r, GenerationRequest(GenerationParams(), "o"))
+    assertEquals(r.img2imgHiresLoras, None)
+    assertEquals(r.vaeRecoveryDir, "")
+    assertEquals(r.hardwareInfo, HardwareInfo.Options())
+    val serialized = Json.toJs(r)
+    assertEquals(serialized("vae_recovery_dir").str, "")
+    assertEquals(serialized("hardware_info"), ujson.Obj("enabled" -> false, "remark" -> ""))
+    assertEquals(Json.fromJs[GenerationRequest](serialized), r)
+  }
+
+  test("hardware metadata absent in legacy generation/Extras results and nested options remain additive") {
+    assertEquals(Json.fromJs[GeneratedImage](ujson.Obj("path" -> "legacy.png", "seed" -> 17)).hardwareInfo, None)
+    assertEquals(Json.fromJs[ImagePathResult](ujson.Obj("path" -> "legacy-upscale.png")).hardwareInfo, None)
+    val oldUpscale = Json.fromJs[UpscaleRequest](ujson.Obj("image_path" -> "source.png", "upscaler" -> "Lanczos",
+      "scale" -> 2, "output_dir" -> "tmp"))
+    assertEquals(oldUpscale.hardwareInfo, HardwareInfo.Options())
+    val configured = oldUpscale.copy(hardwareInfo = HardwareInfo.Options(true, "日本語 remark"))
+    assertEquals(Json.fromJs[UpscaleRequest](Json.toJs(configured)), configured)
+    val record = HardwareInfo.Record("GPU, CPU, RAM", "2.5 sec.")
+    val result = ImagePathResult("upscaled.png", Some(record))
+    assertEquals(Json.fromJs[ImagePathResult](Json.toJs(result)), result)
+  }
+
+  test("GenerationResult: snake keys, defaults when reading engine output") {
+    val js = ujson.read(
+      """{"images":[{"path":"D:/o/1.png","seed":4294967296,"subseed":7,"width":832,"height":1216},{"path":"b.png","seed":1}],
+        |"timing_s":12.5,"model_name":"animagineXL","model_hash":"4496b36d48","lora_hashes":{"foo":"abcdef123456"},
+        |"scheduler":"Karras","warnings":["LoRA not found: bar"],"unknown":true}""".stripMargin)
+    val r = Json.fromJs[GenerationResult](js)
+    assertEquals(r.images, Seq(GeneratedImage("D:/o/1.png", 4294967296L, 7, 832, 1216), GeneratedImage("b.png", 1)))
+    assertEquals(r.timingS, 12.5)
+    assertEquals(r.modelName, Some("animagineXL"))
+    assertEquals(r.vaeName, None)
+    assertEquals(r.loraHashes, Map("foo" -> "abcdef123456"))
+    assertEquals(r.scheduler, Some("Karras"))
+    assertEquals(r.warnings, Seq("LoRA not found: bar"))
+    val out = Json.toJs(r)
+    Seq("timing_s", "model_name", "model_hash", "vae_name", "vae_hash", "lora_hashes").foreach(k => assert(out.obj.contains(k), k))
+    assertEquals(Json.fromJs[GenerationResult](out), r)
+    assertEquals(Json.fromJs[GenerationResult](ujson.read("""{"images":[]}""")), GenerationResult(Nil))
+  }
+
+  test("other messages round trip with snake keys") {
+    def rt[T: SnakePickle.ReadWriter](t: T, keys: String*) =
+      val js = Json.toJs(t)
+      keys.foreach(k => assert(js.obj.contains(k), s"$k in $js"))
+      assertEquals(Json.fromJs[T](js), t)
+    rt(ModelEntry("m", "p", "sdxl", 6617.5), "size_mb")
+    rt(FileEntry("f", "p"), "size_mb")
+    rt(LoadModelRequest("p", vaePath = Some("v"), vaeTiling = true, vaeSlicing = true,
+      fp8Storage = true, vaeAuto = false, vaeFp16 = true), "vae_path", "vae_tiling", "vram_mode", "vae_slicing", "fp8_storage", "vae_auto", "vae_fp16")
+    rt(LoadedModel("n", "p", "sdxl", "h", 1234, Some("vae"), Some("vh")), "loaded_ms", "vae_name", "vae_hash")
+    rt(SamplerList(Seq(SamplerInfo("Euler a"), SamplerInfo("DDIM", false, "Uniform")), Seq("Automatic", "Karras")), "samplers", "schedulers")
+    rt(SamplerInfo("x"), "default_scheduler")
+    rt(UpscaleRequest("i.png", "R-ESRGAN 4x+", 2.0, "o", Map("R-ESRGAN 4x+" -> "p")), "image_path", "output_dir", "upscaler_paths")
+    rt(PreprocessRequest("canny", "i.png", "o", Map("low_threshold" -> 100.0)), "image_path", "output_dir")
+    rt(PreprocessRequest("canny", "i.png", "o", Map("low_threshold" -> 100.0), standalone = true, processorRes = 640, pixelPerfect = true),
+      "image_path", "output_dir", "standalone", "processor_res", "pixel_perfect")
+    rt(ImagePathResult("x.png"), "path")
+    rt(MemoryInfo(1, 2, 3, 4), "allocated_mb", "reserved_mb", "total_mb", "ram_used_mb")
+  }
+
+  test("LoadedModel lenient read") {
+    assertEquals(Json.fromJs[LoadedModel](ujson.read("""{"name":"n","path":"p","kind":"sd15","hash":"h"}""")),
+      LoadedModel("n", "p", "sd15", "h"))
+  }
+
+  test("memory telemetry accepts device-wide usage and legacy responses") {
+    val native=Json.fromJs[MemoryInfo](ujson.read("""{"allocated_mb":0,"reserved_mb":0,"total_mb":4096,"ram_used_mb":0,"device_used_mb":1234}"""))
+    assertEquals(native.deviceUsedMb,Some(1234.0))
+    val legacy=Json.fromJs[MemoryInfo](ujson.read("""{"allocated_mb":100,"reserved_mb":150,"total_mb":4096,"ram_used_mb":300}"""))
+    assertEquals(legacy.deviceUsedMb,None)
+  }
+
+  test("loaded model VAE path is optional for older workers and round trips for new workers") {
+    val old = Json.fromJs[LoadedModel](ujson.read("""{"name":"n","path":"p","kind":"sd15","hash":"h","vae_name":"custom"}"""))
+    assertEquals(old.vaePath, None)
+    val current = old.copy(vaePath = Some("/private/vae.safetensors"))
+    assertEquals(Json.fromJs[LoadedModel](Json.toJs(current)), current)
+  }
+
+  test("EngineError") {
+    val e = EngineError(Protocol.ErrorCodes.Interrupted, "stopped")
+    assert(e.isInterrupted)
+    assertEquals(e.getMessage, "[interrupted] stopped")
+    assert(!EngineError(Protocol.ErrorCodes.Oom, "x", "detail").isInterrupted)
+  }
+
+  test("protocol constants") {
+    assertEquals(Protocol.Types.Txt2Img, "txt2img")
+    assertEquals(Protocol.Types.ListModels, "list_models")
+    assertEquals(Protocol.ErrorCodes.InvalidParams, "invalid_params")
+    assertEquals(Version.protocol, 1)
+    assert(Version.label.contains(Version.app))
+  }

@@ -1,0 +1,30 @@
+# Twenty-issue release goal
+
+Objective: resolve twenty issues, then publish and verify a release containing the fixes. This file tracks accepted issue resolutions, not extension-index rows or passing tests.
+
+## Accepted and pushed
+
+| Issue | Commit | Evidence |
+|---|---|---|
+| #15 color_correction | 35f402f3db16a7618d0d62834078cfd696caeaca | docs/color-correction-verification.md; closed 2026-10-29T23:18:32Z |
+| #54 gpu_temperature_guard | 3663a6b8763b60f69bd64a371c8bd4d602a8fc59 | docs/temperature-guard-verification.md |
+| #98 pnginfo_injection | 1f701d74e532309ad745b7baf4391ab992da28bd | docs/pnginfo-injection-verification.md; closed 2026-10-30T00:15:30Z |
+| #120 steps_animation | 92bb873d64a0cfed7af7e86e0351050eef4614c2 | docs/steps-animation-verification.md; closed 2026-10-30T00:37:31Z |
+| #122 stylepile | 3e579dd565e8c89a9bbd50abaec4cda324079f4b | docs/stylepile-verification.md; closed 2026-10-30T01:21:11Z |
+| #136 vram_estimator | b9d113e426941424c0483530a9f8402c83f80307 | docs/vram-estimator-verification.md; closed 2026-10-30T02:27:15Z |
+| #137 waifu2x | a44214756f32add81105b356f819ba4665fa6bc0 | docs/waifu2x-verification.md; closed 2026-10-30T03:58:45Z |
+| #129 token_downsampling | 8df4858fa2cfc722a86b68f9f8bcc6fd5328d262 | docs/token-downsampling-verification.md; closed 2026-10-30T04:25:06Z |
+| #56 hires_fix_tweaks | Hires Fix Tweaks wave; exact commit in issue closure | docs/hires-fix-tweaks-verification.md; complete regressions and both extracted-package native checks |
+| #67 inpaint_difference | Inpaint Difference wave; exact commit in issue closure | docs/inpaint-difference-verification.md; both extracted-package native checks |
+
+Accepted count: **10 / 20** after the #67 wave push/closure. Earlier closed #1, #7 and #141 predate this active goal and are not counted. No new release has been published for this goal.
+
+
+
+## Next
+
+Select the eleventh distinct open issue after verifying #67 push and closure; inspect its full original scope before implementation. The #54 AMD providers have fixture/schema checks, not AMD hardware validation; this limitation remains explicit in its acceptance record.
+
+## Final release gates
+
+Prove twenty distinct accepted issue resolutions on the remote branch, preserve each issue's behavior/license/verification conditions, build the actual distributable, test the extracted package, inspect real output images, publish the release, and verify remote tag/commit plus downloaded artifact hashes. A jar build alone does not satisfy publication.
