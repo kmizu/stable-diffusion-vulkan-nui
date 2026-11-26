@@ -43,7 +43,8 @@ private[vulkan] object VulkanKeyword:
             num("start"), num("stop"), num("dyn").map(_.toInt))
         }
         val manual = req.manualLoras.getOrElse(p.loras)
-        Image(clean, NativeLoraPrompt.replay(prompts(start).str,clean), prompts(i).str, manual ++ adapters)
+        Image(clean, NativeLoraPrompt.replay(sdfx.vulkan.VulkanCdTuner.cleanPrompt(prompts(start).str),clean),
+          prompts(i).str, manual ++ adapters)
       }
       Plan(images, () => session.keywordState = state)
     }

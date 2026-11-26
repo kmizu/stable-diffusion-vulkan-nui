@@ -8,7 +8,8 @@ private[vulkan] object VulkanHiresGraph:
 
   /** The first pass leaves its diffusion latent in `latent`; sample again at the target resolution. */
   def refinement(req: GenerationRequest, firstPrompt: String, firstLoras: Seq[LoraRef], seed: Long,
-      baseUnet: String, baseText: String, eta: String, device: String, customNoise: Boolean, tiled: String): Vector[String] =
+      baseUnet: String, baseText: String, eta: String, device: String, customNoise: Boolean, tiled: String,
+      cdTuner: Option[VulkanCdTuner.Options] = None): Vector[String] =
     import VulkanProtocol.{invalid,unsupported}
     val p = req.params
     val h = p.hires
@@ -42,15 +43,21 @@ private[vulkan] object VulkanHiresGraph:
     val encoding = s"width = $width, height = $height, clip_skip = ${p.clipSkip}"
     val resolved = p.hooks.get("hires_fix_tweaks").exists(_.obj.get("prompts_resolved").exists(_.bool))
     def selected(value: String, fallback: String) = if resolved || value.nonEmpty then value else fallback
+    val areaRatio = width.toDouble * height / (p.width.toDouble * p.height)
+    val baseSteps = p.img2img.fold(p.steps)(i => ((p.steps * i.denoisingStrength).toInt + 1).min(p.steps))
     for (name,prompt) <- Seq("pos" -> selected(h.prompt,firstPrompt), "neg" -> selected(h.negativePrompt,p.negativePrompt)) do
-      lines += s"hr_$name = predictor($unet, encode_prompt($text, ${q(prompt)}, $encoding))"
+      val grown = areaRatio > 1
+      val cdt = cdTuner.fold("")(t => t.args(t.weights(areaRatio, baseSteps), "cdt_map", name == "neg",
+        colorShift = grown, high = true, colorMapped = grown))
+      lines += s"hr_$name = predictor($unet, encode_prompt($text, ${q(prompt)}, $encoding)$cdt)"
     lines += s"hr_guided = cfg(hr_pos, hr_neg, scale = ${h.cfgScale.getOrElse(p.cfgScale)})"
     val aa = h.upscaler.contains("antialiased")
     lines += s"""hr_rng = make_rng("cpu", seed = $seed)"""
     if h.upscaler.startsWith("Latent") then
       lines += s"hr_base = tensor::interpolate(latent, size = [${width/8},${height/8}], mode = ${q(method)}, antialias = $aa)"
     else
-      lines += s"hr_pixels = vae_decode(vae, unet_to_vae_latents(vae, latent)$tiled)"
+      val saturation = cdTuner.fold("")(_.decoderArgs)
+      lines += s"hr_pixels = vae_decode(vae, unet_to_vae_latents(vae, latent)$tiled$saturation)"
       val input = req.upscalerPaths.get(h.upscaler).fold("hr_pixels") { file =>
         lines += s"hr_upscaler = load_upscaler(${q(VulkanConditioning.file(file,"upscaler"))}, backend = ${q(device)})"
         lines += "hr_large = upscale(hr_upscaler, hr_pixels)"

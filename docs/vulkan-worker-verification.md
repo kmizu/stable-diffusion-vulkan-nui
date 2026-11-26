@@ -3,6 +3,12 @@
 
 
 
+## Windows v0.47 — CD Tuner
+
+The ZIP SHA-256 is `d02e740ed57c5a6ac197b1edaf44df24306433c64584c96b7511484bd81dac23`. The staged `SDV-NUI.exe` processed `<cdt:d1=3;col1=1>`, additional AlwaysOn values and a 768 × 768 mask through MCP on RTX 3090 with a system-only PATH. The PNG stored the effective `CDT` fields, and every unmasked source pixel matched. The ten-step output retained the fox and meadow. A three-step check with stronger settings produced color artifacts in the edited region. The ZIP contains the tested Java worker and native DLL byte for byte.
+
+Direct worker tests compared a same-seed stopped-detail control with Detail and Contrast 1, the denoised color shift, a two-region Color Map, and both VAE saturation controls on SD1.5 at 512 × 512 on Radeon 780M and SDXL at 768 × 768 on RTX 3090. Each setting altered only the masked region, and the stopped control replayed exactly after active tuning. RTX 3090 also ran the detail hook with a nine-channel SDXL Inpaint checkpoint and the built-in SDXL Latent Hires pass at 832 × 832. Radeon 780M ran the separate img2img Hires Fix and one detected ADetailer face with Apply once on and off. Representative outputs were visually inspected. All 36 worker tests, nine CD Tuner plugin tests and 35 MCP metadata tests passed.
+
 ## Windows v0.46 — Fooocus Inpaint
 
 The Windows ZIP SHA-256 is `f05760d224ed0bd8a5b63e3bbddd87517770584a98d01a790264bbaf29e7c962`. The Java 25 worker used the original Fooocus v2.6 patch and head with `animaPencilXL_v500` at 768 × 768 on Radeon 780M and RTX 3090. Both PNGs retained every pixel outside the mask and were visually inspected. The worker reported `cuda=false` on both GPUs. An independent archive read matched all 14,400 exported head values and eleven sampled weights after dequantization and FP16 merging.

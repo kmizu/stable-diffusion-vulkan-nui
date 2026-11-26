@@ -52,7 +52,9 @@ private[vulkan] object VulkanProtocol:
     if !samplers.contains(p.samplerName) then unsupported(s"sampler ${p.samplerName}")
     val schedule = if p.scheduler == "Automatic" then defaultSchedule(p.samplerName) else p.scheduler
     if !schedulers.contains(schedule) then unsupported(s"scheduler ${p.scheduler}")
-    val sized = p.withEngineSize
+    val clean = VulkanCdTuner.cleanPrompt
+    val sized = p.withEngineSize.copy(prompt = clean(p.prompt), negativePrompt = clean(p.negativePrompt),
+      hires = p.hires.copy(prompt = clean(p.hires.prompt), negativePrompt = clean(p.hires.negativePrompt)))
     if sized.width.toLong * sized.height > 64L * 1024 * 1024 || sized.imagesPerJob > 64 then invalid("Generation exceeds pixel or image count limit")
     val skip = Vector(
       ("soft_inpainting",!p.isInpaint,"Soft Inpainting requires an inpaint mask. The regular generation pass was used."),

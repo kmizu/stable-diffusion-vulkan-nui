@@ -94,6 +94,7 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
       Option.when(backend.supportsLatentModifier())(VulkanLatentModifier.id).toVector ++
       Option.when(backend.supportsNegPip())(VulkanNegPip.id).toVector ++
       Option.when(backend.supportsFooocusInpaint())(VulkanFooocusInpaint.id).toVector ++
+      Option.when(backend.supportsCdTuner())(VulkanCdTuner.id).toVector ++
       Option.when(backend.supportsDynamicThreshold())("dynamic_thresholding") ++
       (if backend.supportsSvd() then Vector("img2vid","novel_view") else Vector.empty) ++ Option.when(sdfx.vulkan.tools.VulkanCharaImport.available)("chara_searcher") ++ Option.when(sdfx.vulkan.tools.VulkanBlip.available && !sdfx.vulkan.tools.VulkanWdTagger.available)("caption") ++ Option.when(sdfx.vulkan.tools.VulkanCustomCode.enabled)("custom_code") ++ sdfx.vulkan.tools.VulkanWdTagger.features ++ Option.when(sdfx.vulkan.tools.VulkanFaceRestore.available)("face_restore") ++ Vector("vulkan_nsfw") ++ Option.when(sdfx.vulkan.tools.VulkanSafety.available)("nsfw_checker")))
 
@@ -499,13 +500,20 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
       val image = sdfx.vulkan.tools.DiffusionImageInput.readRgb(Path.of(path), maxBytes = 200000000L)
       (image, VulkanTools.differenceMask(config, image, () => job.cancelled))
     }
+    val cdTuner = VulkanCdTuner.config(p.hooks, Set("sdxl", "SDXL Inpaint")(model.kind))
     val graph = Option.when(VulkanNegPip.applies(p,p.prompt,p.negativePrompt))(VulkanNegPip.id)
       .orElse(p.hooks.iterator.collectFirst { case (key, config)
         if key != VulkanLatentModifier.id && key != VulkanNegPip.id && VulkanGraph.hooks(key) &&
           !config.obj.get("enabled").contains(ujson.Bool(false)) && VulkanFusionPrompt.applies(key,p.prompt,p.negativePrompt) &&
+          (key != VulkanCdTuner.id || cdTuner.nonEmpty) &&
           (key != VulkanUnetHooks.tiledDiffusion || VulkanUnetHooks.needsTiles(config,p.width,p.height)) => key })
       .orElse(VulkanLatentModifier.config(p).map(_ => VulkanLatentModifier.id))
       .orElse(Option.when(tweak.nonEmpty || separateHires && p.hires.upscaler.startsWith("Latent"))(VulkanGraph.latentHires))
+    def cdFollowup(width: Int, height: Int): Option[VulkanCdTuner.Options] =
+      graph.filter(_ == VulkanCdTuner.id).flatMap { _ =>
+        val baseSteps = p.img2img.fold(p.steps)(i => ((p.steps * i.denoisingStrength).toInt + 1).min(p.steps))
+        cdTuner.flatMap(_.followup(width.toDouble * height / (p.width.toDouble * p.height), baseSteps))
+      }
     val graphRequest = if graph.nonEmpty || refinement.nonEmpty then
       val attachmentPaths = if graph.contains(VulkanFooocusInpaint.id) then req.controlnetPaths else Map.empty[String,String]
       req.copy(controlnetPaths = attachmentPaths ++ resolveControls(req,job))
@@ -588,7 +596,8 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
           if strength == 0 then resized
           else
             job.check()
-            def inherit(key: String, fallback: String) = Option(h(key).str).filter(_.nonEmpty).getOrElse(fallback)
+            def inherit(key: String, fallback: String) =
+              Option(VulkanCdTuner.cleanPrompt(h(key).str)).filter(_.nonEmpty).getOrElse(fallback)
             val prompt = inherit("prompt", activePrompt)
             val negative = inherit("negative_prompt", p.negativePrompt)
             val sampler = if h("sampler").str == "Use same sampler" then p.samplerName else h("sampler").str
@@ -618,10 +627,12 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
             if unetHooks.nonEmpty && (clip.nonEmpty || textGraph.nonEmpty) then
               unsupported("U-Net hooks and custom text conditioning in the same refinement")
             val modifier = VulkanLatentModifier.config(refinementParams).map(VulkanLatentModifier.id -> _)
+            val cdRefinement = cdFollowup(w, ht)
             val refinementGraph = clip.map(value => VulkanClipIo.id -> Map(VulkanClipIo.id -> value))
               .orElse(textGraph.map(_ -> scheduleHooks))
               .orElse(unetHooks.keysIterator.nextOption().map(_ -> unetHooks))
               .orElse(modifier.map(entry => VulkanLatentModifier.id -> Map(entry)))
+              .orElse(cdRefinement.map(_ => VulkanCdTuner.id -> Map(VulkanCdTuner.id -> p.hooks(VulkanCdTuner.id))))
               .map((key,hooks) => key -> (hooks ++ modifier))
             refinementGraph match
               case Some((hook, hooks)) =>
@@ -631,7 +642,7 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
                   hooks = hooks)
                 VulkanGraph.render(backend, device.id(), model, loadRequest.get, graphRequest.copy(params = params),
                   hook, prompt, params.loras, seed, actualSchedule, () => job.cancelled,
-                  refinementImage = Some(resized)).head
+                  refinementImage = Some(resized), cdRefinement = cdRefinement).head
               case None =>
                 val conditioning2 = prepareConditioning(req.copy(params = refinementParams.copy(prompt = prompt)), job, resources)
                 backend.generate(prompt, negative, w, ht, refinementParams.steps, refinementParams.cfgScale,
@@ -651,9 +662,19 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
           sdfx.vulkan.tools.VulkanADetailer(backend,device.id(),Option(models.getParent).getOrElse(models),canvas,config,p,activePrompt,seed,
             () => job.cancelled, (unit,count) => emit(Obj("id" -> job.id,"type" -> "event","event" -> "log",
               "level" -> "info","message" -> s"ADetailer unit ${unit+1} detected $count regions")),
-            (pos,neg,w,h,steps,cfg,sampler,regionSeed,opts) =>
-              backend.generate(pos,neg,w,h,steps,cfg,regionSeed,samplers.getOrElse(sampler,unsupported(s"ADetailer sampler $sampler")),
-                schedulers(gen.scheduler),p.clipSkip,opts,activeConditioning,progress(Some("adetailer"))))
+            (pos,neg,w,h,steps,cfg,sampler,regionSeed,opts) => cdFollowup(w, h) match
+              case None =>
+                backend.generate(pos,neg,w,h,steps,cfg,regionSeed,samplers.getOrElse(sampler,unsupported(s"ADetailer sampler $sampler")),
+                  schedulers(gen.scheduler),p.clipSkip,opts,activeConditioning,progress(Some("adetailer")))
+              case Some(tuner) =>
+                val params = p.copy(prompt = pos, negativePrompt = neg, width = w, height = h, steps = steps,
+                  cfgScale = cfg, samplerName = sampler, hires = p.hires.copy(enabled = false),
+                  img2img = Some(sdfx.core.model.Img2ImgParams("", denoisingStrength = opts.strength)),
+                  hooks = Map(VulkanCdTuner.id -> p.hooks(VulkanCdTuner.id)))
+                val prepared = VulkanImageInputs.Inputs(opts.init(), Option(opts.mask()), opts.init(), None, None)
+                VulkanGraph.render(backend, device.id(), model, loadRequest.get, graphRequest.copy(params = params),
+                  VulkanCdTuner.id, pos, planned.fold(p.loras)(_.loras), regionSeed, gen.scheduler, () => job.cancelled,
+                  cdRefinement = Some(tuner), preparedInput = Some(prepared)).head)
         }
 
         val restored = p.hooks.get("face_restore").filterNot(_.obj.get("enabled").contains(ujson.Bool(false))).fold(detailed) { options =>

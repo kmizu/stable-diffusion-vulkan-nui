@@ -137,7 +137,7 @@ private[tools] object NativeKeywordMappings:
     context.checkCancelled()
     val directive="""<(\w+):([^>]+)>""".r
     val batches=(0 until planned.prompts.size by batchSize).toVector.map { start =>
-      val slice=planned.prompts.slice(start,start+batchSize)
+      val slice=planned.prompts.slice(start,start+batchSize).map(sdfx.vulkan.VulkanCdTuner.cleanPrompt)
       val cleanPrompts=slice.map(p => directive.replaceAllIn(p,""))
       val firstNetworks=scala.collection.mutable.LinkedHashMap.empty[String,Vector[Vector[String]]]
       val adapters=Vector.newBuilder[NativeJson]

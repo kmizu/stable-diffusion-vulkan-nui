@@ -1,0 +1,272 @@
+--- a/src/dgl/bindings/components.cpp
++++ b/src/dgl/bindings/components.cpp
+@@ -188,4 +188,5 @@
+
+     Value vae_decode(Values& args, RunState&) {
++        sd::nui::CdTunerVaeScope saturation(float(get_number(args, "cdt_sat")), float(get_number(args, "cdt_sat2")));
+         auto& engine = *object<VAE>(args, "vae");
+         auto output  = ops::decode_vae(engine, float_tensor(args, "latent"), vae_options(args));
+--- a/src/dgl/bindings/predictor.cpp
++++ b/src/dgl/bindings/predictor.cpp
+@@ -53,5 +53,21 @@
+                 throw std::runtime_error("Fooocus start must precede end");
+         }
++        if (args.count("cdt_regions")) {
++            options.cdt_regions = std::shared_ptr<const sd::Tensor<float>>(
++                object<sd_tensor_t>(args, "cdt_regions"), &float_tensor(args, "cdt_regions"));
++            if (options.cdt_regions->dim() != 1 || options.cdt_regions->shape()[0] % 7 != 0)
++                throw std::runtime_error("CD Tuner requires seven values per Color Map region");
++        }
++        for (int i = 0; i < 4; ++i)
++            options.cdt_shifts[i] = float(get_number(args, std::string("cdt_shift") + std::to_string(i)));
++        options.cdt_shift_delay = float(get_number(args, "cdt_shift_delay"));
++        options.cdt_map_steps = int(get_int(args, "cdt_map_steps"));
++        options.cdt_map_strength = float(get_number(args, "cdt_map_strength"));
++        options.cdt_map_sign = int(get_int(args, "cdt_map_sign"));
+         auto& hooks = options.unet_hooks;
++        hooks.cdt_detail = float(get_number(args, "cdt_detail"));
++        hooks.cdt_detail2 = float(get_number(args, "cdt_detail2"));
++        hooks.cdt_contrast = float(get_number(args, "cdt_contrast"));
++        hooks.cdt_stop = float(get_number(args, "cdt_stop"));
+         hooks.backbone[0] = float(get_number(args,"freeu_b1"));
+         hooks.backbone[1] = float(get_number(args,"freeu_b2"));
+--- a/src/dgl/bindings/registration.cpp
++++ b/src/dgl/bindings/registration.cpp
+@@ -498,4 +498,5 @@
+         registry["vae_decode"] = make_operation(
+             {required("vae", Kind::VAE), required("latent", Kind::Tensor), optional("tiling", Kind::Dict),
++             number("cdt_sat", -10000, 10000, 0), number("cdt_sat2", -10000, 10000, 0),
+              optional("circular_x", Kind::Boolean, false), optional("circular_y", Kind::Boolean, false),
+              choice("dtype", {"u8", "f32"}, "u8")},
+@@ -599,4 +600,11 @@
+              number("fps", 0.01, 100000, 24), number("video_sigma_shift", 0.001, 1000, 12), number("audio_sigma_shift", 0.001, 1000, 3),
+              optional("circular_x", Kind::Boolean, false), optional("circular_y", Kind::Boolean, false),
++             number("cdt_detail", -10000, 10000, 0), number("cdt_detail2", -10000, 10000, 0),
++             number("cdt_contrast", -10000, 10000, 0), number("cdt_stop", -10000, 10000, 0),
++             number("cdt_shift0", -10000, 10000, 0), number("cdt_shift1", -10000, 10000, 0),
++             number("cdt_shift2", -10000, 10000, 0), number("cdt_shift3", -10000, 10000, 0),
++             number("cdt_shift_delay", -10000, 10000, 0), optional("cdt_regions", Kind::Tensor),
++             integer("cdt_map_steps", 0, 10000, 0), number("cdt_map_strength", -10000, 10000, 0),
++             integer("cdt_map_sign", -1, 1, -1),
+              optional("fooocus_head", Kind::Tensor), optional("fooocus_input", Kind::Tensor),
+              number("fooocus_start", 0, 1, 0), number("fooocus_end", 0, 1, 1),
+--- a/src/dgl/models/diffusion_prediction.h
++++ b/src/dgl/models/diffusion_prediction.h
+@@ -2,4 +2,5 @@
+ #define __SD_DGL_MODELS_DIFFUSION_PREDICTION_H__
+
++#include <array>
+ #include <cstdint>
+ #include <functional>
+@@ -36,4 +37,8 @@
+     struct DiffusionPredictionOptions {
+         sd::nui::UNetOptions unet_hooks;
++        std::shared_ptr<const sd::Tensor<float>> cdt_regions;
++        std::array<float, 4> cdt_shifts{};
++        float cdt_shift_delay = 0.f, cdt_map_strength = 0.f;
++        int cdt_map_steps = 0, cdt_map_sign = -1;
+         std::shared_ptr<const sd::Tensor<float>> fooocus_head, fooocus_input;
+         float fooocus_start = 0.f, fooocus_end = 1.f;
+--- a/src/dgl/models/dit.cpp
++++ b/src/dgl/models/dit.cpp
+@@ -293,4 +293,41 @@
+     int DiT::get_diffusion_model_down_factor() {
+         return find_model_definition(version())->geometry.diffusion_down_factor;
++    }
++
++    static void apply_cd_tuner_map(Tensor<float>& x, const DiffusionPredictionOptions& options, int step) {
++        const auto& shape = x.shape();
++        const auto& regions = *options.cdt_regions;
++        const auto w = shape[0], h = shape[1], plane = w * h, channels = shape[2];
++        const float attenuation = options.cdt_map_steps < 5 ? 1.15f - options.cdt_map_steps * 0.15f : 0.4f;
++        const float strength = options.cdt_map_strength * 0.5f * attenuation /
++                               (1.f + std::pow(float(1 + step), 1.5f) / 10.f);
++        const auto index = [](float fraction, int64_t dim) {
++            const auto position = int64_t(std::clamp(fraction, -1.f, 1.f) * dim);
++            return position < 0 ? position + dim : position;
++        };
++        for (int64_t r = 0; r < regions.shape()[0]; r += 7) {
++            const auto* cell = regions.data() + r;
++            const auto left = index(cell[0], w), top = index(cell[1], h);
++            const auto right = index(cell[2], w), bottom = index(cell[3], h);
++            const float ratio = 5.f * strength * (std::abs(cell[4]) + std::abs(cell[5]) + std::abs(cell[6]));
++            if (ratio <= 0.f)
++                continue;
++            for (int64_t channel = 1; channel < 4; ++channel) {
++                double magnitude = 0;
++                for (int64_t b = 0; b < shape[3]; ++b) {
++                    const auto* pixels = x.data() + (b * channels + channel) * plane;
++                    for (int64_t i = 0; i < plane; ++i)
++                        magnitude += std::abs(pixels[i]);
++                }
++                const float shift = float(magnitude / (plane * shape[3])) * cell[3 + channel] *
++                                    6.f * ratio * options.cdt_map_sign;
++                for (int64_t b = 0; b < shape[3]; ++b) {
++                    auto* pixels = x.data() + (b * channels + channel) * plane;
++                    for (int64_t row = top; row < bottom; ++row)
++                        for (int64_t col = left; col < right; ++col)
++                            pixels[row * w + col] = pixels[row * w + col] * (1.f - ratio) + shift;
++                }
++            }
++        }
+     }
+
+@@ -345,4 +382,12 @@
+         if (step.mask_input)
+             step.blend_mask(input);
++        const int pass_step = std::max(0, step.index - 1);
++        const bool mapped = options.cdt_regions && options.cdt_map_strength != 0.f &&
++                            pass_step < options.cdt_map_steps && shape.size() == 4 && shape[2] == 4;
++        sd::Tensor<float> original_input;
++        if (mapped) {
++            original_input = input;
++            apply_cd_tuner_map(input, options, pass_step);
++        }
+         sd::Tensor<float> cached;
+         if (step.cache && step.cache->before_condition(&condition, input, &cached)) {
+@@ -443,4 +488,22 @@
+             step.cache->after_condition(&condition, input, result);
+         }
++        if (std::abs(scaling[1]) > 1e-8f) {
++            if (mapped)
++                result += (input - original_input) * (scaling[0] / (scaling[2] * scaling[1]));
++            const float target = float(step.schedule_size) - 3.f - options.cdt_shift_delay;
++            if (pass_step == target && shape.size() == 4 && shape[2] == 4) {
++                const auto plane = shape[0] * shape[1];
++                for (int channel = 0; channel < 4; ++channel) {
++                    if (options.cdt_shifts[channel] == 0.f)
++                        continue;
++                    const float shift = options.cdt_shifts[channel] * (-20.f / 3.f) / scaling[1];
++                    for (int64_t b = 0; b < shape[3]; ++b) {
++                        auto* pixels = result.data() + (b * 4 + channel) * plane;
++                        for (int64_t i = 0; i < plane; ++i)
++                            pixels[i] += shift;
++                    }
++                }
++            }
++        }
+         return {std::move(result), scaling[0], scaling[1]};
+     }
+--- a/src/dgl/ops/predictor.cpp
++++ b/src/dgl/ops/predictor.cpp
+@@ -514,4 +514,5 @@
+                 pos->ip_adapters || neg->ip_adapters || pos->pulid || neg->pulid ||
+                 pos->options.transform || neg->options.transform ||
++                pos->options.cdt_regions || neg->options.cdt_regions ||
+                 pos->options.unet_hooks.pag_regions != neg->options.unet_hooks.pag_regions ||
+                 !pos->references.empty() || !neg->references.empty() ||
+--- a/src/model/common/ggml_block.hpp
++++ b/src/model/common/ggml_block.hpp
+@@ -18,4 +18,5 @@
+ #include "core/ggml_runner.h"
+ #include "model.h"
++#include "nui_unet_hooks.hpp"
+
+ class GGMLBlock {
+@@ -489,9 +490,35 @@
+
+     ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
++        const auto* factors = sd::nui::CdTunerVaeScope::factors;
++        float factor = 1.f;
++        if (factors[0] != 1.f || factors[1] != 1.f) {
++            const auto suffix = [&](const char* name) { return ends_with(prefix, name); };
++            if (suffix("decoder.up.1.upsample.conv.") || suffix("decoder.up.0.block.0.nin_shortcut."))
++                factor = factors[0];
++            else if (suffix("decoder.up.3.upsample.conv.") || suffix("decoder.up.2.upsample.conv.") ||
++                     suffix("decoder.up.1.block.0.nin_shortcut.") || suffix("decoder.conv_in.") ||
++                     suffix("decoder.conv_out."))
++                factor = factors[1];
++        }
++        return forward_scaled(ctx, x, factor, 1.f, 0.f);
++    }
++
++    ggml_tensor* forward_scaled(GGMLRunnerContext* ctx, ggml_tensor* x, float weight_factor, float bias_factor,
++                                float first_bias_offset = 0.f) {
+         const float scale = ctx->conv_scale > 0.f ? ctx->conv_scale : this->scale;
+-        ggml_tensor* w    = params["weight"];
+-        ggml_tensor* b    = nullptr;
+-        if (bias) {
+-            b = params["bias"];
++        auto* graph = ctx->ggml_ctx;
++        ggml_tensor* w = params["weight"];
++        ggml_tensor* b = bias ? params["bias"] : nullptr;
++        if (weight_factor != 1.f) {
++            const auto type = w->type;
++            w = ggml_cast(graph, ggml_scale(graph, ggml_ext_cast_f32(ctx, w), weight_factor), type);
++        }
++        if (b && bias_factor != 1.f)
++            b = ggml_scale(graph, b, bias_factor);
++        if (b && first_bias_offset != 0.f) {
++            auto* first = ggml_view_1d(graph, b, 1, 0);
++            auto* shift = ggml_fill(graph, first, first_bias_offset);
++            auto* tail = ggml_view_1d(graph, b, b->ne[0] - 1, b->nb[0]);
++            b = ggml_concat(graph, ggml_add(graph, first, shift), tail, 0);
+         }
+         if (ctx->weight_adapter) {
+@@ -811,5 +838,5 @@
+           affine(affine) {}
+
+-    ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) {
++    ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x, float weight_factor = 1.f, float bias_factor = 1.f) {
+         ggml_tensor* w = nullptr;
+         ggml_tensor* b = nullptr;
+@@ -817,4 +844,8 @@
+             w = params["weight"];
+             b = params["bias"];
++            if (weight_factor != 1.f)
++                w = ggml_scale(ctx->ggml_ctx, w, weight_factor);
++            if (bias_factor != 1.f)
++                b = ggml_scale(ctx->ggml_ctx, b, bias_factor);
+             if (ctx->weight_adapter) {
+                 w = ctx->weight_adapter->patch_weight(ctx, w, prefix + "weight");
+--- a/src/model/common/nui_unet_hooks.hpp
++++ b/src/model/common/nui_unet_hooks.hpp
+@@ -19,4 +19,5 @@
+         bool shrink_after_skip = true;
+         uint32_t tile_seed = 0;
++        float cdt_detail = 0.f, cdt_detail2 = 0.f, cdt_contrast = 0.f, cdt_stop = 0.f;
+     };
+
+@@ -30,4 +31,17 @@
+     };
+     inline thread_local UNetPass active;
++    struct CdTunerVaeScope {
++        float previous[2];
++        static inline thread_local float factors[2] = {1.f, 1.f};
++        CdTunerVaeScope(float sat, float sat2) : previous{factors[0], factors[1]} {
++            factors[0] = 1.f + sat * 0.075f;
++            factors[1] = 1.f + sat2 * 0.02f;
++        }
++        ~CdTunerVaeScope() { factors[0] = previous[0]; factors[1] = previous[1]; }
++    };
++    inline bool cd_tuner_weights_active() {
++        const auto* o = active.options;
++        return o && (o->cdt_stop < 0 || float(active.step) - 1.f < o->cdt_stop);
++    }
+     struct UNetPassScope {
+         UNetPass previous = active;
+--- a/src/model/diffusion/unet.hpp
++++ b/src/model/diffusion/unet.hpp
+@@ -609,5 +609,9 @@
+
+         // input block 0
+-        auto h = input_blocks_0_0->forward(ctx, x);
++        const auto* cdt = sd::nui::cd_tuner_weights_active() ? sd::nui::active.options : nullptr;
++        auto h = cdt
++                     ? input_blocks_0_0->forward_scaled(ctx, x, 1.f - cdt->cdt_detail * 0.01f,
++                                                         1.f + cdt->cdt_detail * 0.02f)
++                     : input_blocks_0_0->forward(ctx, x);
+         if (fooocus_head && fooocus_input) {
+             if (h->ne[0] + 2 != fooocus_input->ne[0] || h->ne[1] + 2 != fooocus_input->ne[1] ||
+@@ -801,7 +805,9 @@
+
+         // out
+-        h = out_0->forward(ctx, h);
++        h = cdt ? out_0->forward(ctx, h, 1.f - cdt->cdt_detail2 * 0.01f, 1.f + cdt->cdt_detail2 * 0.02f)
++                : out_0->forward(ctx, h);
+         h = ggml_silu_inplace(ctx->ggml_ctx, h);
+-        h = out_2->forward(ctx, h);
++        h = cdt ? out_2->forward_scaled(ctx, h, 1.f, 1.f, cdt->cdt_contrast * 0.02f)
++                : out_2->forward(ctx, h);
+         ggml_set_name(h, "bench-end");
+         return h;  // [N, out_channels, h, w]

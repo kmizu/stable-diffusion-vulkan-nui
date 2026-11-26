@@ -88,7 +88,15 @@ The worker reads the original Fooocus v2.6 patch and head, broadcasts the per-ch
 
 The staged Windows MCP executable also verified the four-channel SDXL checkpoint. A nine-channel SDXL Inpaint checkpoint ran on Radeon 780M and preserved unmasked pixels, with strong color artifacts inside the mask. [Verification](vulkan-worker-verification.md#windows-v046--fooocus-inpaint) records the fixtures and comparison.
 
-Further Python generation hooks without a corresponding verified implementation in this inventory include `aesthetic_gradients`, `agent_attention`, `cd_tuner`, `characteristic_guidance`, `compile`, `composable_lora`, `controllllite`, `deepcache`, `incantations`, `llul`, `reference`, `tgate`.
+### CD Tuner
+
+The Vulkan graph scopes Detail and Contrast 1 to the selected steps and adjusts Contrast 2, Brightness and the three color axes at the configured denoised step. Color Map edits the regional latent input before prediction and compensates the denoised output. Saturation scales the original seven VAE decoder weight paths without writing to the checkpoint. Same-seed SD1.5 and SDXL runs confirmed distinct results for detail, color shift, Color Map and saturation on Radeon 780M and RTX 3090 respectively. Each edit preserved every source pixel outside the mask. Replaying after the active runs reproduced the stopped-detail control exactly.
+
+RTX 3090 ran SDXL Latent Hires at 832 × 832 with separate Hires detail and stop settings. Detail also ran with a nine-channel SDXL Inpaint checkpoint at 768 × 768 and preserved the unmasked pixels. On Radeon 780M, changing Apply once affected the SD1.5 img2img Hires Fix and ADetailer follow-up passes.
+
+Color Map evaluates the positive and negative branches separately. The worker computes each branch's own magnitude after previous region edits. The legacy backend measures both branches together. SD2.x and arbitrary combinations with other sampling hooks still need end-to-end coverage.
+
+Further Python generation hooks without a corresponding verified implementation in this inventory include `aesthetic_gradients`, `agent_attention`, `characteristic_guidance`, `compile`, `composable_lora`, `controllllite`, `deepcache`, `incantations`, `llul`, `reference`, `tgate`.
 
 ### Boundaries of the port
 
