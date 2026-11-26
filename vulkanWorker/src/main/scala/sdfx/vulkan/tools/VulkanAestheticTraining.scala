@@ -5,6 +5,7 @@ import java.nio.file.{Files, Path}
 import java.security.MessageDigest
 import java.util.HexFormat
 import scala.util.Using
+import scala.util.boundary, boundary.break
 import sdfx.vulkan.{VulkanInference, VulkanPromptAttention, VulkanProtocol}
 import ujson.Value
 
@@ -83,13 +84,17 @@ private[vulkan] object VulkanAestheticTraining:
       VulkanProtocol.invalid("Expected a finite, nonzero 768-dimensional aesthetic embedding")
     values.map(x => (x / norm).toFloat) -> digest
 
-  def chunks(prompt: String): Vector[Vector[Int]] =
+  def chunks(prompt: String): Vector[Vector[Int]] = promptChunks(prompt, firstOnly = false)
+
+  private def promptChunks(prompt: String, firstOnly: Boolean): Vector[Vector[Int]] = boundary:
     val comma = tokenizer.encode(",", addSpecialTokens = false).headOption.map(_.toInt)
     val result = scala.collection.mutable.ArrayBuffer.empty[Vector[Int]]
     var pending = Vector.empty[Int]
     var lastComma = -1
     def flush(): Unit =
       result += ((tokenizer.bosId.toInt +: pending).padTo(tokenCount - 1, tokenizer.eosId.toInt) :+ tokenizer.eosId.toInt)
+      if firstOnly then break(result.toVector)
+      if result.size > 16 then VulkanProtocol.unsupported("more than 16 CLIP chunks in an aesthetic training prompt")
       pending = Vector.empty
       lastComma = -1
     for span <- VulkanPromptAttention.parse(prompt) do
@@ -104,14 +109,19 @@ private[vulkan] object VulkanAestheticTraining:
         if pending.size == 75 then flush()
         pending :+= id
     if pending.nonEmpty || result.isEmpty then flush()
-    if result.size > 16 then VulkanProtocol.unsupported("more than 16 CLIP chunks in an aesthetic training prompt")
     result.toVector
+
+  def styleChunk(config: Settings): Option[Vector[Int]] =
+    Option.when(config.slerp && config.angle.toFloat > 0 && config.style.trim.nonEmpty)(
+      promptChunks(config.style, firstOnly = true).head)
 
   def train(engine: VulkanInference, device: String, checkpoint: Path, sdxl: Boolean, prompt: String,
       config: Settings, folder: Path, cancelled: () => Boolean, progress: (Int, Float) => Unit): (Path, String) =
-    if config.slerp && config.angle != 0 && config.style.trim.nonEmpty then VulkanProtocol.unsupported("Aesthetic Gradients slerp")
     if !checkpoint.getFileName.toString.toLowerCase(java.util.Locale.ROOT).endsWith(".safetensors") then
       VulkanProtocol.unsupported("Aesthetic Gradients with a checkpoint outside SafeTensors")
+    val style = styleChunk(config)
+    if style.nonEmpty && !engine.supportsAestheticSlerp() then
+      VulkanProtocol.unsupported("Aesthetic Gradients slerp with this Vulkan runtime")
     val context = new NativeWorkContext(cancelled, () => (), (_, _) => ())
     val (target, digest) = embedding(config, folder)
     val reference = VulkanAesthetic.referenceWeights(VulkanAesthetic.cache, () => context.checkCancelled(), (_, _, _) => ())
@@ -137,6 +147,11 @@ private[vulkan] object VulkanAestheticTraining:
         else writeTensor(source, prefix + parameter.name, parameter)
       }
       writeTensor(stock, projection.name, projection)
+      style.foreach { tokens =>
+        writeInt(java.lang.Float.floatToRawIntBits(config.angle.toFloat))
+        tokens.foreach(writeInt)
+        writeInt(tokens.indexOf(tokenizer.eosId.toInt))
+      }
     }
     engine.trainAesthetic(device, input, trained, config.steps, config.rate, (step, loss) =>
       if step > 0 && !cancelled() then progress(step, loss)

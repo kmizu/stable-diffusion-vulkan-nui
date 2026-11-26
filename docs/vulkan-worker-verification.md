@@ -3,6 +3,14 @@
 
 
 
+## Windows v0.62 — Aesthetic text interpolation
+
+Both Vulkan adapters projected the first style chunk and trained CLIP-L for three Adam steps with an interpolated target. Independent CPU PyTorch used the same checkpoint tensors, tokens and fractions. At fraction 0.35 with SD1.5, the maximum absolute loss differences were 0.000128 on Radeon 780M and 0.000249 on RTX 3090. At fraction 1.0 with SDXL, they were 0.000162 and 0.002650 respectively. The largest difference came at the first SDXL step on RTX 3090. The v0.61 inference DLL returned an explicit unsupported error for a nonzero style fraction when paired with the new worker.
+
+The staged `SDV-NUI.exe` generated masked SD1.5 img2img on Radeon 780M and masked SDXL img2img on RTX 3090 through MCP with `cuda=false`. The PNGs recorded the style text, fraction and embedding fingerprint. Both retained every RGB channel outside the mask. The images were inspected. The 780M image showed a visible edge at the zero-blur test mask.
+
+All 68 Vulkan worker tests and 14 aesthetic plugin tests passed. The ZIP SHA-256 is `4b91060da873aeb195471e4ea6255ae517fa34785d80187d0a67491b548fd1ba`. The archived launcher, desktop JAR, worker JAR and inference DLL matched the tested staging files.
+
 ## Windows v0.61 — Aesthetic Gradients in img2img
 
 An isolated full CLIP-L training run updated 196 parameter tensors on Vulkan with each adapter. Three Adam iterations moved the SD1.5 loss from −0.245517 to −0.560078 on RTX 3090 and the SDXL loss from −0.231040 to −0.381057 on Radeon 780M. The maximum absolute difference from independent CPU PyTorch was 0.000731 for SD1.5 and 0.000571 for SDXL.

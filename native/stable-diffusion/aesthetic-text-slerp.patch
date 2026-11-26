@@ -1,0 +1,143 @@
+--- a/src/extensions/aesthetic_train.cpp
++++ b/src/extensions/aesthetic_train.cpp
+@@ -1,3 +1,4 @@
++#include <algorithm>
+ #include <array>
+ #include <cmath>
+ #include <cstring>
+@@ -73,6 +74,32 @@
+         return ggml_add(ctx, x, linear(ctx, joined, block.attention[3]));
+     }
+
++    std::array<float, width> slerp(const std::array<float, width>& a,
++                                    const std::array<float, width>& b, float fraction) {
++        double dot = 0;
++        for (size_t i = 0; i < a.size(); ++i)
++            dot += static_cast<double>(a[i]) * b[i];
++        const double angle = std::acos(std::clamp(dot, -1.0, 1.0));
++        const double sine = std::sin(angle);
++        double wa = 1.0 - fraction, wb = fraction;
++        if (std::abs(sine) >= 1e-6) {
++            wa = std::sin(wa * angle) / sine;
++            wb = std::sin(wb * angle) / sine;
++        }
++        std::array<float, width> result;
++        double square = 0;
++        for (size_t i = 0; i < a.size(); ++i) {
++            result[i] = static_cast<float>(wa * a[i] + wb * b[i]);
++            square += static_cast<double>(result[i]) * result[i];
++        }
++        if (!(square > 0) || !std::isfinite(square))
++            throw std::runtime_error("Aesthetic slerp produced an invalid target");
++        const double norm = std::sqrt(square);
++        for (float& value : result)
++            value = static_cast<float>(value / norm);
++        return result;
++    }
++
+     Tensor mlp(ggml_context* ctx, Tensor x, const Block& block) {
+         auto h = linear(ctx, affine_norm(ctx, x, block.norm2), block.fc1);
+         h = ggml_scale(ctx, ggml_silu(ctx, ggml_scale(ctx, h, 1.702f)), 1.f / 1.702f);
+@@ -81,6 +108,8 @@
+ }
+
+ using AestheticProgress = bool(*)(int step, float loss, void* user_data);
++
++extern "C" SD_API bool sdv_aesthetic_supports_slerp() { return true; }
+
+ extern "C" SD_API int sdv_aesthetic_train(const char* device, const char* input, const char* output,
+                                            int steps, float rate, AestheticProgress progress, void* user_data,
+@@ -166,15 +195,31 @@
+                 throw std::runtime_error("Invalid CLIP training token");
+         ggml_backend_tensor_set(ids, ids_data.data(), 0, ggml_nbytes(ids));
+         ggml_backend_tensor_set(positions, eos_data.data(), 0, ggml_nbytes(positions));
+-        read_tensor(target);
++        std::array<float, width> target_values;
++        read(target_values.data(), sizeof(target_values));
++        for (float value : target_values)
++            if (!std::isfinite(value)) throw std::runtime_error("Invalid aesthetic target");
++        ggml_backend_tensor_set(target, target_values.data(), 0, sizeof(target_values));
+         for (auto t : trainable) {
+             if (progress && !progress(0, 0.f, user_data))
+                 return 1;
+             read_tensor(t);
+         }
+         read_tensor(projection);
+-        if (data.peek() != std::ifstream::traits_type::eof())
+-            throw std::runtime_error("Unexpected trailing CLIP training data");
++        std::array<int32_t, tokens> style_tokens{};
++        int32_t style_eos = 0;
++        float fraction = 0;
++        if (data.peek() != std::ifstream::traits_type::eof()) {
++            read(&fraction, sizeof(fraction));
++            read(style_tokens.data(), sizeof(style_tokens));
++            read(&style_eos, sizeof(style_eos));
++            if (!(fraction > 0 && fraction <= 1) || style_eos < 0 || style_eos >= tokens ||
++                style_tokens[style_eos] != 49407 || data.peek() != std::ifstream::traits_type::eof())
++                throw std::runtime_error("Invalid aesthetic style conditioning");
++            for (int id : style_tokens)
++                if (id < 0 || id >= vocabulary)
++                    throw std::runtime_error("Invalid aesthetic style token");
++        }
+         data.close();
+         std::array<float,tokens*tokens> causal;
+         for (int row=0;row<tokens;++row)
+@@ -182,15 +227,51 @@
+                 causal[row*tokens+col] = col>row ? -INFINITY : 0.f;
+         ggml_backend_tensor_set(mask,causal.data(),0,sizeof(causal));
+
+-        auto embedded=ggml_get_rows(ctx,token_embed,ids);
+-        auto hidden=ggml_add(ctx,ggml_reshape_3d(ctx,embedded,width,tokens,chunks),position_embed);
+-        for (auto& block : blocks) hidden=mlp(ctx,attend(ctx,hidden,mask,block,chunks),block);
+-        auto eos=ggml_get_rows(ctx,ggml_reshape_2d(ctx,hidden,width,tokens*chunks),positions);
+-        auto projected=ggml_mul_mat(ctx,projection,affine_norm(ctx,eos,final_norm));
+-        auto similarity=ggml_mul(ctx,normalize(ctx,projected,false),target);
+-        auto objective=ggml_scale(ctx,ggml_sum(ctx,similarity),-1.f/chunks);
++        const auto encode = [&](ggml_context* compute, Tensor input_ids, Tensor eos_positions, int count) {
++            auto embedded = ggml_get_rows(compute, token_embed, input_ids);
++            auto hidden = ggml_add(compute, ggml_reshape_3d(compute, embedded, width, tokens, count), position_embed);
++            for (const auto& block : blocks)
++                hidden = mlp(compute, attend(compute, hidden, mask, block, count), block);
++            auto eos = ggml_get_rows(compute, ggml_reshape_2d(compute, hidden, width, tokens * count), eos_positions);
++            auto projected = ggml_mul_mat(compute, projection, affine_norm(compute, eos, final_norm));
++            return normalize(compute, projected, false);
++        };
+
+         ggml_backend_t devices[] = {gpu.get(), cpu.get()};
++        if (fraction > 0) {
++            if (progress && !progress(0, 0.f, user_data))
++                return 1;
++            Owner<ggml_context, ggml_free> style_params(ggml_init({65536, nullptr, true}), ggml_free);
++            Owner<ggml_context, ggml_free> style_graph(ggml_init({8<<20, nullptr, true}), ggml_free);
++            auto style_ids = ggml_new_tensor_1d(style_params.get(), GGML_TYPE_I32, tokens);
++            auto style_index = ggml_new_tensor_1d(style_params.get(), GGML_TYPE_I32, 1);
++            Owner<ggml_backend_buffer, ggml_backend_buffer_free> style_buffer(
++                ggml_backend_alloc_ctx_tensors(style_params.get(), gpu.get()), ggml_backend_buffer_free);
++            if (!style_buffer) throw std::runtime_error("Cannot allocate aesthetic style inputs");
++            ggml_backend_tensor_set(style_ids, style_tokens.data(), 0, sizeof(style_tokens));
++            ggml_backend_tensor_set(style_index, &style_eos, 0, sizeof(style_eos));
++            Owner<ggml_backend_sched, ggml_backend_sched_free> style_sched(
++                ggml_backend_sched_new(devices, nullptr, 2, graph_capacity, false, true), ggml_backend_sched_free);
++            auto style = encode(style_graph.get(), style_ids, style_index, 1);
++            ggml_set_output(style);
++            auto forward = ggml_new_graph_custom(style_graph.get(), graph_capacity, false);
++            ggml_build_forward_expand(forward, style);
++            if (!ggml_backend_sched_alloc_graph(style_sched.get(), forward))
++                throw std::runtime_error("Cannot allocate aesthetic style graph");
++            if (progress && !progress(0, 0.f, user_data))
++                return 1;
++            if (ggml_backend_sched_graph_compute(style_sched.get(), forward) != GGML_STATUS_SUCCESS)
++                throw std::runtime_error("Vulkan aesthetic style projection failed");
++            if (progress && !progress(0, 0.f, user_data))
++                return 1;
++            std::array<float, width> style_values;
++            ggml_backend_tensor_get(style, style_values.data(), 0, sizeof(style_values));
++            const auto mixed = slerp(target_values, style_values, fraction);
++            ggml_backend_tensor_set(target, mixed.data(), 0, sizeof(mixed));
++        }
++        auto similarity = ggml_mul(ctx, encode(ctx, ids, positions, chunks), target);
++        auto objective = ggml_scale(ctx, ggml_sum(ctx, similarity), -1.f / chunks);
++
+         Owner<ggml_backend_sched, ggml_backend_sched_free> sched(
+             ggml_backend_sched_new(devices, nullptr, 2, graph_capacity, false, true),ggml_backend_sched_free);
+         auto computation=ggml_new_graph_custom(ctx,graph_capacity,true);

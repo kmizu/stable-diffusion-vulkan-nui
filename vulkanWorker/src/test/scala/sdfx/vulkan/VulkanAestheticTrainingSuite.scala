@@ -24,3 +24,14 @@ class VulkanAestheticTrainingSuite extends munit.FunSuite:
       assertEquals(chunk.last, 49407)
       assert(chunk.drop(chunk.indexOf(49407)).forall(_ == 49407))
   }
+
+  test("aesthetic text selects its first CLIP chunk only when slerp changes the target") {
+    val config = VulkanAestheticTraining.settings(ujson.Obj("embedding" -> "style", "slerp" -> true,
+      "text" -> "red fox BREAK white owl", "slerp_angle" -> .35))
+    val style = VulkanAestheticTraining.styleChunk(config).get
+    assertEquals(style, VulkanAestheticTraining.chunks("red fox").head)
+    assertEquals(VulkanAestheticTraining.styleChunk(config.copy(style = "red fox" + " BREAK owl" * 20)), Some(style))
+    assertEquals(VulkanAestheticTraining.styleChunk(config.copy(angle = 0)), None)
+    assertEquals(VulkanAestheticTraining.styleChunk(config.copy(style = "  ")), None)
+    assertEquals(VulkanAestheticTraining.styleChunk(config.copy(slerp = false)), None)
+  }

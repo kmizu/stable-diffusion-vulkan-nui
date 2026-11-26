@@ -156,7 +156,7 @@ Advanced `#cmd` scripts, layer-level context, dynamic ranks, extended Neutral Pr
 
 Aesthetic Gradients trains a job-local copy of the checkpoint's CLIP-L text encoder in float32 with Adam on the selected Vulkan device. Base img2img and inpainting can blend the personalized conditioning into either prompt side. For SDXL the blend replaces only the CLIP-L channels and reuses the original pooled conditioning. The worker accepts supported SD1.x and SDXL SafeTensors checkpoints, reads `.pt` or `.safetensors` aesthetic embeddings, and records the SHA-256 of the embedding actually used in PNG infotext for replay.
 
-The current path uses the pinned CLIP ViT-L/14 asset shared with embedding creation. It supports up to 16 CLIP chunks per training prompt. Aesthetic-text slerp, Hires passes, combinations with LoRA or ControlNet, and alternate checkpoint formats remain open.
+The worker uses the pinned CLIP ViT-L/14 asset shared with embedding creation and supports up to 16 CLIP chunks per training prompt. With Aesthetic slerp enabled, the unmodified encoder projects the first chunk of Aesthetic text. The worker interpolates between that unit vector and the selected aesthetic embedding before training. Hires passes, combinations with LoRA or ControlNet, and alternate checkpoint formats remain open.
 
 Further Python generation hooks without a corresponding verified implementation in this inventory include `compile` and `incantations`.
 

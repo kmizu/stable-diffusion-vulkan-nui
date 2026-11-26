@@ -245,6 +245,10 @@ public final class VulkanInference implements AutoCloseable {
         return calls.containsKey("sdv_aesthetic_train");
     }
 
+    public boolean supportsAestheticSlerp() {
+        return symbols.find("sdv_aesthetic_supports_slerp").isPresent();
+    }
+
     public synchronized void trainAesthetic(String device, Path input, Path output, int steps, float rate,
                                              AestheticProgress progress) {
         if (!supportsAestheticTraining()) throw new IllegalStateException("Aesthetic training is unavailable");
