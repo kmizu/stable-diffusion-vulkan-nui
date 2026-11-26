@@ -90,14 +90,15 @@ private[vulkan] object VulkanHiresGraph:
     else ""
     val aa = h.upscaler.contains("antialiased")
     val seg = VulkanIncantations.segArguments(p.hooks, p.width, p.height, count)
-    val segPasses = seg.nonEmpty || VulkanIncantations.segPasses(p)
-    val randomAlgorithm = if llul.nonEmpty || characteristic.nonEmpty || composable.nonEmpty || aesthetic.nonEmpty || segPasses then "cuda" else "cpu"
+    val incantations = VulkanIncantations.attentionPasses(p)
+    val pag = VulkanIncantations.pag(p.hooks).exists(_.canApply(count))
+    val randomAlgorithm = if llul.nonEmpty || characteristic.nonEmpty || composable.nonEmpty || aesthetic.nonEmpty || incantations then "cuda" else "cpu"
     lines += s"""hr_rng = make_rng("$randomAlgorithm", seed = $seed)"""
     if h.upscaler.startsWith("Latent") then
       lines += s"hr_base = tensor::interpolate(latent, size = [${width/8},${height/8}], mode = ${q(method)}, antialias = $aa)"
     else
       val saturation = cdTuner.fold("")(_.decoderArgs)
-      val floatPixels = characteristic.nonEmpty || aesthetic.nonEmpty || segPasses
+      val floatPixels = characteristic.nonEmpty || aesthetic.nonEmpty || incantations
       val dtype = if floatPixels then ", dtype = \"f32\"" else ""
       lines += s"hr_pixels = vae_decode(vae, unet_to_vae_latents(vae, latent)$tiled$saturation$dtype)"
       val pixelModel = req.upscalerPaths.get(h.upscaler)
@@ -124,6 +125,7 @@ private[vulkan] object VulkanHiresGraph:
     loraPlan.foreach(plan => lines ++= VulkanComposableLora.prepare(plan, req, "hr_clora", unet, text, encoding,
       concat, supportsBlank = true, tracePass = composable.filter(VulkanComposableLora.plotRequested).map(_ => "hires"),
       runtimeWeights = runtimeLoraWeights))
+    var pagGraph = Vector.empty[String]
     for (name,prompt) <- Seq("pos" -> positivePrompt, "neg" -> negativePrompt) if loraPlan.isEmpty do
       val grown = areaRatio > 1
       val cdt = cdTuner.fold("")(t => t.args(t.weights(areaRatio, baseSteps), "cdt_map", name == "neg",
@@ -135,11 +137,13 @@ private[vulkan] object VulkanHiresGraph:
       val blank = if name != "neg" || aesthetic.fold(prompt.nonEmpty)(_ => prompt.trim.nonEmpty) then ""
         else if lllite.nonEmpty then ", lllite_blank_negative = true"
         else if llul.nonEmpty then ", llul_blank_negative = true"
-        else if characteristic.nonEmpty || aesthetic.nonEmpty || segPasses then ", sdxl_blank_negative = true"
+        else if characteristic.nonEmpty || aesthetic.nonEmpty || incantations then ", sdxl_blank_negative = true"
         else ""
       val condition = controlWeight.fold(encoded)(weight =>
         s"controlnet::apply($encoded, control_model, hr_control_hint, strength = $weight)")
       lines += s"hr_$name = predictor($unet, $condition$concat$cdt$cacheArgs$ref$agentArgs$llliteArgs$llulArgs$blank$segArgs)"
+      if name == "pos" && pag then
+        pagGraph = VulkanIncantations.pagGraph(p.hooks, count, unet, condition, concat, "hr_pos", "hr_incantations_base", "hr_guided")
     val sampler = h.samplerName.getOrElse(p.samplerName)
     val nativeMethod = VulkanProtocol.samplers.getOrElse(sampler,unsupported(s"hires sampler $sampler"))
     val schedule = h.scheduler.getOrElse(p.scheduler)
@@ -151,7 +155,9 @@ private[vulkan] object VulkanHiresGraph:
     val chgArgs = characteristic.fold("")(_.args(p.steps, cfg))
     val branchNames = if composable.nonEmpty then "hr_clora_branch0, hr_clora_neg" else "hr_pos, hr_neg"
     val cloraArgs = loraPlan.fold("")(_.guidance("hr_clora"))
-    lines += s"hr_guided = cfg($branchNames, scale = $cfg$cfgTiming$chgArgs$cloraArgs)"
+    val target = if pag then "hr_incantations_base" else "hr_guided"
+    lines += s"$target = cfg($branchNames, scale = $cfg$cfgTiming$chgArgs$cloraArgs)"
+    lines ++= pagGraph
     val schedulePredictor = if composable.nonEmpty then "hr_clora_schedule" else "hr_guided"
     lines += s"hr_full = make_sigmas($schedulePredictor, latent = hr_base, scheduler = ${q(scheduler)}, steps = $full)"
     lines += s"hr_sigmas = hr_full[${full-count}:]"

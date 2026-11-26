@@ -528,6 +528,8 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
     if isGeneration(job.kind) && ((job.kind == "img2img") != p.isImg2Img) then invalid("img2img requests require an init image and the img2img operation")
     if VulkanIncantations.seg(p.hooks).nonEmpty && !backend.supportsSeg() then
       unsupported("This Vulkan runtime lacks Incantations SEG")
+    if VulkanIncantations.pag(p.hooks).nonEmpty && !backend.supportsIncantationsPag() then
+      unsupported("This Vulkan runtime lacks Incantations PAG")
     val hires = VulkanImageInputs.hires(req)
     val separateHires = VulkanImageInputs.separateHires(req)
     val refinement = Img2ImgHiresMetadata.active(p.hooks)
@@ -563,7 +565,7 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
           (key != VulkanCdTuner.id || cdTuner.nonEmpty) &&
           (key != VulkanUnetHooks.tiledDiffusion || VulkanUnetHooks.needsTiles(config,p.width,p.height)) => key })
       .orElse(VulkanLatentModifier.config(p).map(_ => VulkanLatentModifier.id))
-      .orElse(Option.when(VulkanIncantations.segPasses(p))(VulkanIncantations.id))
+      .orElse(Option.when(VulkanIncantations.attentionPasses(p))(VulkanIncantations.id))
       .orElse(Option.when(tweak.nonEmpty || separateHires && p.hires.upscaler.startsWith("Latent"))(VulkanGraph.latentHires))
     def cdFollowup(width: Int, height: Int): Option[VulkanCdTuner.Options] =
       graph.filter(_ == VulkanCdTuner.id).flatMap { _ =>
@@ -709,8 +711,8 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
               unsupported("U-Net hooks and custom text conditioning in the same refinement")
             val modifier = VulkanLatentModifier.config(refinementParams).map(VulkanLatentModifier.id -> _)
             val cdRefinement = cdFollowup(w, ht)
-            val segRefinement = VulkanIncantations.seg(p.hooks).exists(_.canApply(
-              VulkanImageInputs.img2imgSteps(refinementParams.steps, strength)))
+            val attentionRefinement = VulkanIncantations.attentionAt(p.hooks,
+              VulkanImageInputs.img2imgSteps(refinementParams.steps, strength))
             val otherRefinement = clip.map(value => VulkanClipIo.id -> Map(VulkanClipIo.id -> value))
               .orElse(textGraph.map(_ -> scheduleHooks))
               .orElse(unetHooks.keysIterator.nextOption().map(_ -> unetHooks))
@@ -725,9 +727,9 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
                 aestheticHash.foreach(hash => config("embedding_sha256") = hash)
                 key -> Map(key -> config)
               })
-            if segRefinement && otherRefinement.nonEmpty then
-              unsupported("Incantations SEG with other sampling hooks in img2img Hires Fix")
-            val refinementGraph = otherRefinement.orElse(Option.when(segRefinement) {
+            if attentionRefinement && otherRefinement.nonEmpty then
+              unsupported("Incantations with other sampling hooks in img2img Hires Fix")
+            val refinementGraph = otherRefinement.orElse(Option.when(attentionRefinement) {
               val key = VulkanIncantations.id
               key -> Map(key -> p.hooks(key))
             })

@@ -144,6 +144,18 @@ class VulkanWorkerSuite extends munit.FunSuite:
     assert(error.message.contains("SEG with sampler Heun"))
   }
 
+  test("Incantations PAG adds a windowed perturbed positive branch only when reachable") {
+    val hooks = Map("incantations" -> ujson.Obj("pag_active" -> "yes", "pag_scale" -> 1.75,
+      "pag_sanf" -> true, "pag_start_step" -> 2, "pag_end_step" -> 6))
+    assertEquals(VulkanIncantations.pagGraph(hooks, 4, "unet", "controlled", "", "pos", "base", "guided"),
+      Vector(
+        "guided_perturbed = predictor(unet, controlled, pag_regions = 512)",
+        "guided = incantations_pag(base, pos, guided_perturbed, scale = 1.75, start_step = 2, end_step = 6, sanf = true)"
+      ))
+    assertEquals(VulkanIncantations.pagGraph(hooks, 3, "unet", "controlled", "", "pos", "base", "guided"),
+      Vector("guided = base"))
+  }
+
   test("Incantations CFG follows the lagged source clock and its noise interval") {
     val config = ujson.Obj("cfg_interval_enable" -> true, "cfg_interval_schedule" -> "Linear")
     assertEquals(VulkanIncantations.schedule(config, 8, 6, 5), Vector(12f, 12f, 10.5f, 9f, 7.5f))

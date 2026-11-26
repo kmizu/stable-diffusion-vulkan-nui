@@ -3,6 +3,16 @@
 
 
 
+## Windows v0.68 — Incantations PAG and SANF
+
+The native SANF calculation matched an independent reflect-Gaussian and per-pixel channel-softmax reference across 160 values in two rectangular batches. The maximum absolute error was `1.2e-7`. A tied softmax selected the CFG residual.
+
+On RTX 3090, SDXL masked img2img at 768 × 768 with Euler reproduced the hook-disabled image when the window was unreachable. Additive PAG and SANF produced different edits. Moving additive PAG to the last evaluation changed the result again. Repeating SANF with the same seed reproduced every pixel. Every image retained the original RGB values outside the mask.
+
+Radeon 780M also ran both modes and the inactive comparison with SD1.5 at 512 × 512 using Euler a. RTX 3090 combined SANF, SEG and the Linear CFG Scheduler in both regular Latent Hires and the independent Img2Img Hires Fix at 832 × 832. Visual inspection found a hard boundary with zero mask blur and strong saturation in the short independent refinement. All 74 Vulkan worker tests and six Incantations plugin tests passed.
+
+The staged `SDV-NUI.exe` ran additive PAG on Radeon 780M and SANF on RTX 3090 through MCP with a system-only PATH. Both reported `cuda=false`, preserved every unmasked pixel and stored the PAG mode and scale in the PNG. The Windows ZIP SHA-256 is `d30a3475572f962e4ac192ef37fdfa7976322b1a0209f197b8dc1eb1539d7ee0`. Its launcher, desktop JAR, Vulkan worker JAR and inference DLL matched the tested staging files byte for byte.
+
 ## Windows v0.67 — Incantations Smoothed Energy Guidance
 
 A native numerical check compared the middle-attention Query graph on two rectangular batches with an independent two-dimensional reflection convolution and a spatial mean. With blur exponents 0.5, 2.5 and 11, the maximum absolute error was `1.19e-7`. The same check confirmed that an out-of-window evaluation and a non-middle attention region returned the original Query.

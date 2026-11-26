@@ -35,44 +35,69 @@ private[vulkan] object VulkanIncantations:
   def cfg(hooks: Map[String, Value]): Option[Value] =
     configured(hooks).filter(flag(_, "cfg_interval_enable"))
 
-  final case class Seg(blur: Double, start: Int, end: Int):
-    def canApply(count: Int): Boolean =
+  private def step(config: Value, field: String, default: Int): Int =
+    val value = number(config, field, default)
+    if !value.isValidInt then VulkanProtocol.invalid(s"Incantations: $field must be an integer")
+    value.toInt
+
+  sealed trait StepWindow:
+    def start: Int
+    def end: Int
+    final def canApply(count: Int): Boolean =
       count > 0 && end >= 0 && start <= end && start <= math.max(0, count - 2)
+
+  final case class Seg(blur: Double, start: Int, end: Int) extends StepWindow
+  final case class Pag(scale: Float, start: Int, end: Int, sanf: Boolean) extends StepWindow
 
   def seg(hooks: Map[String, Value]): Option[Seg] =
     configured(hooks).filter(flag(_, "seg_active")).flatMap { config =>
-      def step(field: String, default: Int): Int =
-        val value = number(config, field, default)
-        if !value.isValidInt then VulkanProtocol.invalid(s"Incantations: $field must be an integer")
-        value.toInt
       val blur = number(config, "seg_blur_sigma", 11)
-      Option.when(blur != 0)(Seg(blur.max(-64).min(11), step("seg_start_step", 0), step("seg_end_step", 150)))
+      Option.when(blur != 0)(Seg(blur.max(-64).min(11), step(config, "seg_start_step", 0), step(config, "seg_end_step", 150)))
     }
 
-  def segPasses(p: GenerationParams): Boolean = seg(p.hooks).exists { config =>
+  def pag(hooks: Map[String, Value]): Option[Pag] =
+    configured(hooks).filter(flag(_, "pag_active")).flatMap { config =>
+      val scale = number(config, "pag_scale", 0).toFloat
+      if !scale.isFinite then VulkanProtocol.invalid("Incantations PAG scale must fit in float32")
+      Option.when(scale > 0)(Pag(scale, step(config, "pag_start_step", 0), step(config, "pag_end_step", 150),
+        flag(config, "pag_sanf")))
+    }
+
+  def attentionAt(hooks: Map[String, Value], count: Int): Boolean =
+    seg(hooks).exists(_.canApply(count)) || pag(hooks).exists(_.canApply(count))
+
+  def attentionPasses(p: GenerationParams): Boolean =
     val base = p.img2img.fold(p.steps)(i => VulkanImageInputs.img2imgSteps(p.steps, i.denoisingStrength))
-    config.canApply(base) || (p.hires.enabled && config.canApply(VulkanHiresGraph.refinementSteps(p)))
-  }
+    attentionAt(p.hooks, base) || (p.hires.enabled && attentionAt(p.hooks, VulkanHiresGraph.refinementSteps(p)))
 
   def segArguments(hooks: Map[String, Value], width: Int, height: Int, count: Int): String =
     seg(hooks).filter(_.canApply(count)).fold("") { config =>
       s", seg_blur = ${config.blur}, seg_start = ${config.start}, seg_end = ${config.end}, seg_width = $width, seg_height = $height"
     }
 
+  def pagGraph(hooks: Map[String, Value], count: Int, unet: String, condition: String, args: String,
+      positive: String, base: String, output: String): Vector[String] =
+    pag(hooks).filter(_.canApply(count)).fold(Vector(s"$output = $base")) { config =>
+      val branch = s"${output}_perturbed"
+      Vector(s"$branch = predictor($unet, $condition$args, pag_regions = 512)",
+        s"$output = incantations_pag($base, $positive, $branch, scale = ${config.scale}, start_step = ${config.start}, end_step = ${config.end}, sanf = ${config.sanf})")
+    }
+
   def validate(p: GenerationParams): Unit = configured(p.hooks).foreach { config =>
-    val unsupported = Seq("scfg_active" -> "S-CFG",
-      "pag_active" -> "PAG", "t2i0_active" -> "Multi-Concept T2I-Zero").collect {
+    val unsupported = Seq("scfg_active" -> "S-CFG", "t2i0_active" -> "Multi-Concept T2I-Zero").collect {
       case (field, name) if flag(config, field) => name
     }
     if unsupported.nonEmpty then VulkanProtocol.unsupported(s"Incantations ${unsupported.mkString(", ")}")
-    if seg(p.hooks).nonEmpty then
+    val attention = Option.when(seg(p.hooks).nonEmpty)("SEG").orElse(Option.when(pag(p.hooks).nonEmpty)("PAG"))
+    attention.foreach { feature =>
       val refinement = Img2ImgHiresMetadata.active(p.hooks).filter(_("denoise").num > 0)
       if p.cfgScale <= 1 || p.hires.enabled && p.hires.cfgScale.exists(_ <= 1) ||
           refinement.exists(pass => pass("cfg").num > 0 && pass("cfg").num <= 1) then
-        VulkanProtocol.unsupported("Incantations SEG requires CFG scale greater than 1")
-      validateSampler(p.samplerName, "SEG")
-      if p.hires.enabled then p.hires.samplerName.foreach(validateSampler(_, "SEG"))
-      refinement.map(_("sampler").str).filterNot(_ == "Use same sampler").foreach(validateSampler(_, "SEG"))
+        VulkanProtocol.unsupported(s"Incantations $feature requires CFG scale greater than 1")
+      validateSampler(p.samplerName, feature)
+      if p.hires.enabled then p.hires.samplerName.foreach(validateSampler(_, feature))
+      refinement.map(_("sampler").str).filterNot(_ == "Use same sampler").foreach(validateSampler(_, feature))
+    }
     if flag(config, "cfg_interval_enable") then
       val conflicts = Set("cfg_schedule", "apg", "mahiro", "latent_modifier", "dynamic_thresholding",
         "rescale_cfg", "cd_tuner", "detail_daemon", "cads", "semantic_guidance", "multidiffusion",

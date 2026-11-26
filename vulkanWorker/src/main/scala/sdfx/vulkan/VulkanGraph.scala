@@ -159,11 +159,12 @@ private[vulkan] object VulkanGraph:
       VulkanLatentModifier.config(p)).flatten
     if modifier.nonEmpty && !engine.supportsLatentModifier() then unsupported("This Vulkan runtime lacks Latent Modifier")
     val patchedAttention = reference.nonEmpty || lllite.nonEmpty || agent.nonEmpty || llul.nonEmpty
-    val seg = hook == VulkanIncantations.id && VulkanIncantations.segPasses(p)
-    val segArgs = if seg then VulkanIncantations.segArguments(p.hooks, p.width, p.height, passSteps) else ""
-    val patchedInputs = customText || unetGraph || modifier.nonEmpty || fooocus.nonEmpty || cdTuner.nonEmpty || cacheGraph || patchedAttention || characteristic.nonEmpty || composable.nonEmpty || aesthetic.nonEmpty || seg
-    val supportsControl = unetGraph || cdTuner.nonEmpty || tgate.nonEmpty || patchedAttention || aesthetic.nonEmpty || seg || modifier.nonEmpty && !customText
-    val hiresPass = hook == latentHires || (cdTuner.nonEmpty || cacheGraph || patchedAttention || characteristic.nonEmpty || composable.nonEmpty || aesthetic.nonEmpty || seg) && p.hires.enabled
+    val incantations = hook == VulkanIncantations.id && VulkanIncantations.attentionPasses(p)
+    val segArgs = if incantations then VulkanIncantations.segArguments(p.hooks, p.width, p.height, passSteps) else ""
+    val incantationsPag = incantations && VulkanIncantations.pag(p.hooks).exists(_.canApply(passSteps))
+    val patchedInputs = customText || unetGraph || modifier.nonEmpty || fooocus.nonEmpty || cdTuner.nonEmpty || cacheGraph || patchedAttention || characteristic.nonEmpty || composable.nonEmpty || aesthetic.nonEmpty || incantations
+    val supportsControl = unetGraph || cdTuner.nonEmpty || tgate.nonEmpty || patchedAttention || aesthetic.nonEmpty || incantations || modifier.nonEmpty && !customText
+    val hiresPass = hook == latentHires || (cdTuner.nonEmpty || cacheGraph || patchedAttention || characteristic.nonEmpty || composable.nonEmpty || aesthetic.nonEmpty || incantations) && p.hires.enabled
     val h = if hiresPass then ujson.Obj() else p.hooks(hook)
     val latentHook = VulkanLatentGraph.hooks(hook)
     if p.hooks.get("dynamic_thresholding").exists(!_.obj.get("enabled").contains(ujson.Bool(false))) &&
@@ -191,11 +192,11 @@ private[vulkan] object VulkanGraph:
       else if signedText then Set(VulkanWeightGradient.id)
       else Set.empty[String]
     val permitted = Set(hook,"nsfw_checker","aesthetic_score","model_keyword","pnginfo_injection","adetailer","batch_face_swap") ++ imageHooks ++ textHooks ++
-      Option.when(hook == latentHires && !VulkanIncantations.segPasses(p))(VulkanIncantations.id) ++
+      Option.when(hook == latentHires && !VulkanIncantations.attentionPasses(p))(VulkanIncantations.id) ++
       Option.when(reference.nonEmpty)(VulkanReference.id) ++ Option.when(lllite.nonEmpty)(VulkanLLLite.id) ++ Option.when(hiresPass)("hires_fix_tweaks") ++ (if cacheGraph then cacheHooks ++ cacheGuidanceHooks else Set.empty[String]) ++ Option.when(modifier.nonEmpty)(VulkanLatentModifier.id) ++ (if latentHook then VulkanLatentGraph.hooks else Set.empty[String]) ++ (if unetHooks.nonEmpty then VulkanUnetHooks.hooks else Set.empty[String])
     val other = p.hooks.filterNot { (key, value) =>
       value.obj.get("enabled").contains(ujson.Bool(false)) || !VulkanFusionPrompt.applies(key,p.prompt,p.negativePrompt) ||
-        key == VulkanIncantations.id && VulkanIncantations.cfg(p.hooks).isEmpty && !VulkanIncantations.segPasses(p) ||
+        key == VulkanIncantations.id && VulkanIncantations.cfg(p.hooks).isEmpty && !VulkanIncantations.attentionPasses(p) ||
         key == VulkanUnetHooks.tiledDiffusion && !needsTiles ||
         key == VulkanLatentModifier.id && VulkanLatentModifier.config(p).isEmpty ||
         key == VulkanNegPip.id && !VulkanNegPip.applies(p,prompt,p.negativePrompt) ||
@@ -209,10 +210,10 @@ private[vulkan] object VulkanGraph:
     if hook == "photomaker" && (model.kind != "sdxl" || p.isImg2Img) then unsupported("PhotoMaker outside SDXL txt2img")
     if fusionScratch.nonEmpty && !unetFamilies(model.kind) then
       unsupported("Prompt Fusion with this checkpoint family")
-    val sd2 = fusionScratch.nonEmpty || signedText || unetGraph || modifier.nonEmpty || cdTuner.nonEmpty || cacheGraph || patchedAttention || characteristic.nonEmpty || composable.nonEmpty || seg
+    val sd2 = fusionScratch.nonEmpty || signedText || unetGraph || modifier.nonEmpty || cdTuner.nonEmpty || cacheGraph || patchedAttention || characteristic.nonEmpty || composable.nonEmpty || incantations
     val inpaint = patchedInputs && (Set("SD 1.x Inpaint", "SDXL Inpaint")(model.kind) ||
       sd2 && model.kind == "SD 2.x Inpaint")
-    if (unetGraph || signedText || modifier.nonEmpty || seg) && !unetFamilies(model.kind) then
+    if (unetGraph || signedText || modifier.nonEmpty || incantations) && !unetFamilies(model.kind) then
       unsupported(s"$hook with this checkpoint family")
     val family = model.kind match
       case "SDXL Inpaint" if inpaint => "sdxl_inpaint"
@@ -318,7 +319,7 @@ private[vulkan] object VulkanGraph:
       lines += s"unet = $unet"
       1
     else if composable.nonEmpty then 1
-    else if unetHooks.nonEmpty || modifier.nonEmpty || fooocus.nonEmpty || cdTuner.nonEmpty || cacheGraph || patchedAttention || characteristic.nonEmpty || aesthetic.nonEmpty || seg || Set("sonar","semantic_guidance","neutral_prompt")(hook) || latentHook || up.nonEmpty || hiresPass || soft.nonEmpty || inverse || postDiff.nonEmpty then
+    else if unetHooks.nonEmpty || modifier.nonEmpty || fooocus.nonEmpty || cdTuner.nonEmpty || cacheGraph || patchedAttention || characteristic.nonEmpty || aesthetic.nonEmpty || incantations || Set("sonar","semantic_guidance","neutral_prompt")(hook) || latentHook || up.nonEmpty || hiresPass || soft.nonEmpty || inverse || postDiff.nonEmpty then
       lines += s"unet = $unet"
       condition("latent_pos", prompt, negative = false)
       if !patchedInputs then lines += s"pos = predictor(unet, latent_pos$unetArgs)"
@@ -396,14 +397,15 @@ private[vulkan] object VulkanGraph:
       else VulkanIncantations.graphArguments(p, passSteps)
     val chgArgs = characteristic.fold("")(_.args(p.steps, p.cfgScale))
     val cloraArgs = loraPlan.fold("")(_.guidance("clora"))
-    val guidance = unetHooks.fold(s"guided = cfg($positive, $negative, scale = ${p.cfgScale}$post$cfgTiming$chgArgs$cloraArgs)")(_.guidance(p.cfgScale,concat,positiveInput,post))
+    val target = if incantationsPag then "incantations_base" else "guided"
+    val guidance = unetHooks.fold(s"$target = cfg($positive, $negative, scale = ${p.cfgScale}$post$cfgTiming$chgArgs$cloraArgs)")(_.guidance(p.cfgScale,concat,positiveInput,post))
     if !patchedInputs then lines += guidance
     val maskGraph = patchedInputs && (inpaint || difference.nonEmpty || p.img2img.exists(_.mask.nonEmpty) ||
       preparedInput.exists(_.mask.nonEmpty))
     // The native image pipeline defaults to the CPU implementation of the CUDA-compatible RNG.
-    val randomAlgorithm = if maskGraph || agent.nonEmpty || lllite.nonEmpty || llul.nonEmpty || characteristic.nonEmpty || composable.nonEmpty || aesthetic.nonEmpty || seg then "cuda" else "cpu"
+    val randomAlgorithm = if maskGraph || agent.nonEmpty || lllite.nonEmpty || llul.nonEmpty || characteristic.nonEmpty || composable.nonEmpty || aesthetic.nonEmpty || incantations then "cuda" else "cpu"
     lines += s"rng = make_rng(\"$randomAlgorithm\", seed = $seed)"
-    val encodeRng = if maskGraph || (characteristic.nonEmpty || composable.nonEmpty || aesthetic.nonEmpty || seg) && p.isImg2Img then
+    val encodeRng = if maskGraph || (characteristic.nonEmpty || composable.nonEmpty || aesthetic.nonEmpty || incantations) && p.isImg2Img then
       lines += s"encode_rng = make_rng(\"$randomAlgorithm\", seed = $seed)"
       "encode_rng"
     else "rng"
@@ -509,10 +511,12 @@ private[vulkan] object VulkanGraph:
             else if lllite.nonEmpty then ", lllite_blank_negative = true"
             else if llul.nonEmpty then ", llul_blank_negative = true"
             else if characteristic.nonEmpty then ", sdxl_blank_negative = true"
-            else if aesthetic.nonEmpty || seg then ", sdxl_blank_negative = true"
+            else if aesthetic.nonEmpty || incantations then ", sdxl_blank_negative = true"
             else ""
           lines += s"neg = predictor(unet, $negativeInput$concat$unetArgs$fooocusArgs${cdArgs(true)}$negRef$llliteArgs$llulArgs$blank$segArgs)"
       lines += guidance
+      if incantationsPag then
+        lines ++= VulkanIncantations.pagGraph(p.hooks, passSteps, unet, positiveInput, concat, positive, target, "guided")
     val fullSteps = up.fold(p.steps)(_.fullSteps)
     val scheduleName = up.fold(schedule)(_.scheduler)
     val schedulePredictor = if composable.nonEmpty then "clora_schedule" else "guided"

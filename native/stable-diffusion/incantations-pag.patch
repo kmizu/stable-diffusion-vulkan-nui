@@ -1,0 +1,197 @@
+--- a/src/dgl/bindings/predictor.cpp
++++ b/src/dgl/bindings/predictor.cpp
+@@ -479,6 +479,20 @@
+         });
+     }
+
++    Value make_incantations_pag(Values& args, RunState&) {
++        auto base = object<Predictor>(args, "base");
++        auto positive = object<Predictor>(args, "positive");
++        const auto* cfg = std::get_if<ops::CfgPredictor>(&base->node);
++        if (!cfg || cfg->branches.positive != positive || cfg->branches.image_only)
++            throw std::runtime_error("Incantations PAG needs a CFG base with the same positive predictor");
++        return predictor_value(SkipLayerPredictor{
++            std::move(base), std::move(positive), object<Predictor>(args, "perturbed"),
++            float(get_number(args, "scale")), {}, {},
++            SkipLayerPredictor::IncantationsWindow{int(get_int(args, "start_step")),
++                                                  int(get_int(args, "end_step")), get_bool(args, "sanf")}
++        });
++    }
++
+     Value switch_predictor(Values& args, RunState&) {
+         return predictor_value(SwitchPredictor{
+             object<Predictor>(args, "before"),
+--- a/src/dgl/bindings/predictor.h
++++ b/src/dgl/bindings/predictor.h
+@@ -14,6 +14,7 @@
+     Value make_cfg(Values& args, RunState&);
+     Value make_apg(Values& args, RunState&);
+     Value make_slg(Values& args, RunState&);
++    Value make_incantations_pag(Values& args, RunState&);
+     Value switch_predictor(Values& args, RunState&);
+ }  // namespace sd::dgl
+
+--- a/src/dgl/bindings/registration.cpp
++++ b/src/dgl/bindings/registration.cpp
+@@ -642,7 +642,7 @@
+              integer("shrink_down_mode",0,3,2), integer("shrink_up_mode",0,3,2), optional("shrink_after_skip",Kind::Boolean,true),
+              integer("diffusion_tile_width",0,512,0), integer("diffusion_tile_height",0,512,0),
+              integer("diffusion_tile_overlap",0,512,0), optional("gaussian_tile_blending", Kind::Boolean, false),
+-             integer("pag_regions",0,511,0),
++             integer("pag_regions",0,1023,0),
+              number("seg_blur",-64,11,0), integer("seg_start",INT_MIN,INT_MAX,0), integer("seg_end",INT_MIN,INT_MAX,150),
+              integer("seg_width",1,INT_MAX,1), integer("seg_height",1,INT_MAX,1),
+              std::move(transform), optional("transform_args", Kind::Dict)},
+@@ -671,6 +671,11 @@
+             {required("base", Kind::Predictor), required("positive", Kind::Predictor), required("skipped", Kind::Predictor),
+              number("scale", 0, 1000), start_sigma, end_sigma, std::move(start_step_fraction), std::move(stop_step_fraction)},
+             {Kind::Predictor}, make_slg);
++        registry["incantations_pag"] = make_operation(
++            {required("base", Kind::Predictor), required("positive", Kind::Predictor), required("perturbed", Kind::Predictor),
++             number("scale", 0, std::numeric_limits<float>::max()), integer("start_step", INT_MIN, INT_MAX, 0),
++             integer("end_step", INT_MIN, INT_MAX, 150), optional("sanf", Kind::Boolean, false)},
++            {Kind::Predictor}, make_incantations_pag);
+         registry["preview"] = make_operation(
+             {optional("decoder", Kind::VAE), optional("circular_x", Kind::Boolean, false), optional("circular_y", Kind::Boolean, false)},
+             {Kind::SamplingObserver}, make_preview);
+--- /dev/null
++++ b/src/dgl/ops/nui_pag.h
+@@ -0,0 +1,60 @@
++#pragma once
++
++#include <algorithm>
++#include <cmath>
++#include <stdexcept>
++#include <vector>
++
++#include "core/tensor.hpp"
++
++namespace sd::nui {
++    inline void pag_spatial_choice(const Tensor<float>& cfg, const Tensor<float>& pag, Tensor<float>& result) {
++        const auto& shape = cfg.shape();
++        if (shape.size() != 4 || shape[0] < 2 || shape[1] < 2)
++            throw std::runtime_error("Incantations SANF needs a spatial latent of at least 2 by 2");
++        const int64_t width = shape[0], height = shape[1], channels = shape[2];
++        const auto plane = width * height;
++        const float edge = std::exp(-0.5f);
++        const float center = 1.f / (1.f + 2.f * edge);
++        const float weights[] = {edge * center, center, edge * center};
++        std::vector<float> cfg_weights(channels), pag_weights(channels);
++        auto reflect = [](int64_t value, int64_t size) {
++            return value < 0 ? -value : (value >= size ? 2 * size - 2 - value : value);
++        };
++        auto logits = [&](const float* data, int64_t x, int64_t y) {
++            float total = 0.f;
++            for (int dy = -1; dy <= 1; ++dy)
++                for (int dx = -1; dx <= 1; ++dx)
++                    total += weights[dx + 1] * weights[dy + 1] *
++                             std::abs(data[reflect(y + dy, height) * width + reflect(x + dx, width)]);
++            return total;
++        };
++        auto normalize = [](std::vector<float>& values) {
++            const float peak = *std::max_element(values.begin(), values.end());
++            float total = 0.f;
++            for (auto& value : values) {
++                value = std::exp(value - peak);
++                total += value;
++            }
++            for (auto& value : values)
++                value /= total;
++        };
++        for (int64_t b = 0; b < shape[3]; ++b) {
++            for (int64_t y = 0; y < height; ++y) {
++                for (int64_t x = 0; x < width; ++x) {
++                    for (int64_t c = 0; c < channels; ++c) {
++                        const auto offset = (b * channels + c) * plane;
++                        cfg_weights[c] = logits(cfg.data() + offset, x, y);
++                        pag_weights[c] = logits(pag.data() + offset, x, y);
++                    }
++                    normalize(cfg_weights);
++                    normalize(pag_weights);
++                    for (int64_t c = 0; c < channels; ++c) {
++                        const auto i = (b * channels + c) * plane + y * width + x;
++                        result.data()[i] += cfg_weights[c] >= pag_weights[c] ? cfg.data()[i] : pag.data()[i];
++                    }
++                }
++            }
++        }
++    }
++}
+--- a/src/dgl/ops/predictor.cpp
++++ b/src/dgl/ops/predictor.cpp
+@@ -10,6 +10,7 @@
+ #include "dgl/models/fwd.h"
+ #include "dgl/models/ip_adapter.h"
+ #include "dgl/models/pulid.h"
++#include "dgl/ops/nui_pag.h"
+ #include "dgl/ops/spectrum_cache.h"
+ #include "dgl/run_events.h"
+ #include "runtime/denoiser.hpp"
+@@ -29,6 +30,10 @@
+     }
+
+     bool SkipLayerPredictor::active(float sigma, const models::DiffusionPredictionStep& step) const {
++        if (incantations) {
++            const auto index = std::max(0, int(step.index) - 2);
++            return scale != 0.f && incantations->start <= index && index <= incantations->end;
++        }
+         return scale != 0.f && sigmas.active(sigma) && (!steps || steps->active(step));
+     }
+
+@@ -868,6 +873,14 @@
+             const auto& pred    = denoised(base);
+             const auto& pos     = denoised(*node.positive);
+             const auto& skipped = denoised(*node.skipped);
++            if (node.incantations && node.incantations->sanf) {
++                const auto& branches = std::get<CfgPredictor>(node.base->node).branches;
++                const auto& neg = denoised(*branches.negative);
++                auto result = neg;
++                sd::nui::pag_spatial_choice((pos - neg) * branches.scale_at(step_.index),
++                                           (pos - skipped) * node.scale, result);
++                return {{}, std::move(result)};
++            }
+             return {{}, pred + (pos - skipped) * node.scale};
+         }
+
+--- a/src/dgl/ops/predictor.h
++++ b/src/dgl/ops/predictor.h
+@@ -88,10 +88,16 @@
+     };
+
+     struct SkipLayerPredictor {
++        struct IncantationsWindow {
++            int start, end;
++            bool sanf;
++        };
++
+         std::shared_ptr<Predictor> base, positive, skipped;
+         float scale;
+         SigmaWindow sigmas;
+         std::optional<StepWindow> steps;
++        std::optional<IncantationsWindow> incantations;
+
+         bool active(float sigma, const models::DiffusionPredictionStep& step) const;
+     };
+--- a/src/model/common/block.hpp
++++ b/src/model/common/block.hpp
+@@ -1,5 +1,7 @@
+ #ifndef __SD_MODEL_COMMON_BLOCK_HPP__
+ #define __SD_MODEL_COMMON_BLOCK_HPP__
++
++#include <string_view>
+
+ #include "model/common/nui_unet_hooks.hpp"
+ #include "core/ggml_extend.h"
+@@ -439,6 +441,12 @@
+             auto mask = ggml_step(ctx->ggml_ctx,ggml_scale_bias(ctx->ggml_ctx,mass,1.f/n_head,-1.f));
+             sd::nui::active.attention_mask = ggml_reshape_4d(ctx->ggml_ctx,mask,pass.spatial_w,pass.spatial_h,1,x->ne[2]);
+             return x;
++        }
++        constexpr std::string_view incantations_layer = "middle_block.1.transformer_blocks.0.attn1";
++        if (pass.options && (pass.options->pag_regions & 512) && pass.region == 256 &&
++            layer_name.size() >= incantations_layer.size() &&
++            layer_name.compare(layer_name.size() - incantations_layer.size(), incantations_layer.size(), incantations_layer) == 0) {
++            return std::dynamic_pointer_cast<Linear>(blocks["to_v"])->forward(ctx, x);
+         }
+         if (pass.options && (pass.options->pag_regions & pass.region)) {
+             auto value = std::dynamic_pointer_cast<Linear>(blocks["to_v"])->forward(ctx,x);

@@ -166,7 +166,9 @@ The CFG Scheduler supports the 17 legacy curves, a snapped noise interval, and t
 
 Smoothed Energy Guidance (SEG) supports Euler and Euler a on the SD 1.x, SD 2.x and SDXL U-Nets. It smooths the unconditional Query projection in middle-block self-attention with the legacy reflected Gaussian or spatial mean. Its inclusive step range follows the legacy lag. A zero blur or a window outside all sampling evaluations leaves generation on the usual path. The regular Hires pass reuses the base aspect ratio. The separate Img2Img Hires Fix uses its own dimensions, strength and step count.
 
-S-CFG, Incantations PAG and Multi-Concept T2I-Zero remain open. The `compile` hook also remains open.
+Incantations PAG has additive guidance and Saliency-Adaptive Noise Fusion (SANF), with an inclusive window on Euler and Euler a. It replaces the first middle-block self-attention output with its raw Value projection in a separate positive prediction. It combines with SEG and the Incantations CFG Scheduler, including regular Hires and the independent Img2Img Hires Fix. The window follows the Vulkan sampler's retained evaluations. Plain img2img can retain one more evaluation than the old Diffusers path at fractional strength.
+
+S-CFG and Multi-Concept T2I-Zero remain open. The `compile` hook also remains open.
 
 ### Boundaries of the port
 
