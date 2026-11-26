@@ -112,7 +112,13 @@ Radeon 780M ran masked SD1.5 at 512 × 512 and RTX 3090 ran masked SDXL at 768 �
 
 Fast Mode combines DeepCache, T-GATE, fixed-interval CFG-Cache and scheduled CFG in one sampler. It refreshes both CFG branches at scheduled DeepCache refreshes and at the T-GATE capture step. On conditional-only steps the positive stream can read its own slice of the paired DeepCache feature. The combined masked tests ran on SD1.5 at 512 × 512 on Radeon 780M and SDXL at 768 × 768 on RTX 3090. Both reproduced the same-seed image on replay and kept all unmasked pixels unchanged. RTX 3090 also completed an 832 × 832 latent Hires pass with all four hooks. Adaptive CFG-Cache and high-frequency boosting remain unavailable.
 
-Further Python generation hooks without a corresponding verified implementation in this inventory include `aesthetic_gradients`, `agent_attention`, `characteristic_guidance`, `compile`, `composable_lora`, `controllllite`, `incantations`, `llul`, `reference`.
+### Reference only
+
+The worker crops the reference to the pass dimensions, encodes the VAE posterior mean and keeps a separate fixed noise tensor. Each evaluation captures the noised reference's normalized self-attention inputs on the Vulkan device. The target pass attends to both its own tokens and the weighted reference tokens. Style fidelity blends plain and reference attention on the positive branch. Reference only uses the existing checkpoint and VAE. It needs no adapter weights. The [original Reference-only description](https://github.com/Mikubill/sd-webui-controlnet/discussions/1236) explains the conditioning mechanism.
+
+SDXL masked img2img on RTX 3090 exercised 70 self-attention layers per CFG branch and SD1.5 on Radeon 780M exercised 16. Reference selection and style fidelity changed the edited area in the SDXL test, and each masked output preserved the unmasked pixels. RTX 3090 also ran the nine-channel SDXL Inpaint checkpoint and a standard SDXL latent Hires pass. Reference-only captures add a U-Net pass per active CFG branch, and reference-active branches currently run separately.
+
+Further Python generation hooks without a corresponding verified implementation in this inventory include `aesthetic_gradients`, `agent_attention`, `characteristic_guidance`, `compile`, `composable_lora`, `controllllite`, `incantations` and `llul`.
 
 ### Boundaries of the port
 

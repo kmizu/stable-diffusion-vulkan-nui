@@ -9,7 +9,8 @@ private[vulkan] object VulkanHiresGraph:
   /** The first pass leaves its diffusion latent in `latent`; sample again at the target resolution. */
   def refinement(req: GenerationRequest, firstPrompt: String, firstLoras: Seq[LoraRef], seed: Long,
       baseUnet: String, baseText: String, eta: String, device: String, customNoise: Boolean, tiled: String,
-      cdTuner: Option[VulkanCdTuner.Options] = None, cacheArgs: String = ""): Vector[String] =
+      cdTuner: Option[VulkanCdTuner.Options] = None, cacheArgs: String = "",
+      reference: Option[VulkanReference.Config] = None): Vector[String] =
     import VulkanProtocol.{invalid,unsupported}
     val p = req.params
     val h = p.hires
@@ -45,11 +46,13 @@ private[vulkan] object VulkanHiresGraph:
     def selected(value: String, fallback: String) = if resolved || value.nonEmpty then value else fallback
     val areaRatio = width.toDouble * height / (p.width.toDouble * p.height)
     val baseSteps = p.img2img.fold(p.steps)(i => ((p.steps * i.denoisingStrength).toInt + 1).min(p.steps))
+    reference.foreach(config => lines ++= config.prepare("hr_ref", tiled))
     for (name,prompt) <- Seq("pos" -> selected(h.prompt,firstPrompt), "neg" -> selected(h.negativePrompt,p.negativePrompt)) do
       val grown = areaRatio > 1
       val cdt = cdTuner.fold("")(t => t.args(t.weights(areaRatio, baseSteps), "cdt_map", name == "neg",
         colorShift = grown, high = true, colorMapped = grown))
-      lines += s"hr_$name = predictor($unet, encode_prompt($text, ${q(prompt)}, $encoding)$cdt$cacheArgs)"
+      val ref = reference.fold("")(_.args("hr_ref", positive = name == "pos"))
+      lines += s"hr_$name = predictor($unet, encode_prompt($text, ${q(prompt)}, $encoding)$cdt$cacheArgs$ref)"
     val aa = h.upscaler.contains("antialiased")
     lines += s"""hr_rng = make_rng("cpu", seed = $seed)"""
     if h.upscaler.startsWith("Latent") then

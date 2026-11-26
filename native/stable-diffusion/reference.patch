@@ -1,0 +1,162 @@
+--- a/src/dgl/models/diffusion_prediction.h
++++ b/src/dgl/models/diffusion_prediction.h
+@@ -36,6 +36,7 @@
+
+     struct DiffusionPredictionOptions {
+         sd::nui::UNetOptions unet_hooks;
++        std::shared_ptr<const sd::Tensor<float>> reference_latent, reference_noise;
+         std::shared_ptr<const sd::Tensor<float>> cdt_regions;
+         std::array<float, 4> cdt_shifts{};
+         float cdt_shift_delay = 0.f, cdt_map_strength = 0.f;
+--- a/src/model/common/nui_unet_hooks.hpp
++++ b/src/model/common/nui_unet_hooks.hpp
+@@ -29,6 +29,8 @@
+         int tgate_step = 0;
+         uintptr_t tgate_branch = 0;
+         bool tgate_pair = false;
++        float reference_weight = 0.f, reference_style = 0.5f;
++        bool reference_positive = false;
+         float cdt_detail = 0.f, cdt_detail2 = 0.f, cdt_contrast = 0.f, cdt_stop = 0.f;
+     };
+
+@@ -42,6 +44,8 @@
+         int tgate_step = 0;
+         bool tgate_substep = false;
+         int tgate_captures = 0, tgate_reuses = 0;
++        bool capture_reference = false;
++        int reference_layers = 0;
+         bool deepcache_reused = false, deepcache_saved = false;
+         bool deepcache_d1 = false, deepcache_d2 = false;
+     };
+--- a/src/dgl/bindings/registration.cpp
++++ b/src/dgl/bindings/registration.cpp
+@@ -600,6 +600,9 @@
+              number("fps", 0.01, 100000, 24), number("video_sigma_shift", 0.001, 1000, 12), number("audio_sigma_shift", 0.001, 1000, 3),
+              optional("circular_x", Kind::Boolean, false), optional("circular_y", Kind::Boolean, false),
+              integer("tgate_step", 0, 1000, 0),
++             optional("reference_latent", Kind::Tensor), optional("reference_noise", Kind::Tensor),
++             number("reference_weight", 0, 2, 0), number("reference_style", 0, 1, 0.5),
++             optional("reference_positive", Kind::Boolean, false),
+              integer("deepcache_interval", 0, 10, 0), integer("deepcache_branch", 0, 3, 0),
+              integer("deepcache_first", 0, 50, 5), integer("deepcache_order", 0, 2, 0),
+              number("deepcache_contraction", 0, 1, 1),
+--- a/src/dgl/bindings/predictor.cpp
++++ b/src/dgl/bindings/predictor.cpp
+@@ -66,6 +66,17 @@
+         options.cdt_map_sign = int(get_int(args, "cdt_map_sign"));
+         auto& hooks = options.unet_hooks;
+         hooks.tgate_step = int(get_int(args, "tgate_step"));
++        hooks.reference_weight = float(get_number(args, "reference_weight"));
++        hooks.reference_style = float(get_number(args, "reference_style"));
++        hooks.reference_positive = get_bool(args, "reference_positive");
++        if (hooks.reference_weight > 0.f) {
++            if (!args.count("reference_latent") || !args.count("reference_noise"))
++                throw std::runtime_error("Reference only requires both a latent and noise");
++            options.reference_latent = std::shared_ptr<const sd::Tensor<float>>(
++                object<sd_tensor_t>(args, "reference_latent"), &float_tensor(args, "reference_latent"));
++            options.reference_noise = std::shared_ptr<const sd::Tensor<float>>(
++                object<sd_tensor_t>(args, "reference_noise"), &float_tensor(args, "reference_noise"));
++        }
+         hooks.deepcache_interval = int(get_int(args, "deepcache_interval"));
+         hooks.deepcache_branch = int(get_int(args, "deepcache_branch"));
+         hooks.deepcache_first = int(get_int(args, "deepcache_first"));
+--- a/src/dgl/ops/predictor.cpp
++++ b/src/dgl/ops/predictor.cpp
+@@ -530,6 +530,7 @@
+                 pos->model->motion || neg->model->motion || pos->controls || neg->controls ||
+                 pos->ip_adapters || neg->ip_adapters || pos->pulid || neg->pulid ||
+                 pos->options.transform || neg->options.transform ||
++                pos->options.reference_latent || neg->options.reference_latent ||
+                 pos->options.cdt_regions || neg->options.cdt_regions ||
+                 pos->options.unet_hooks.pag_regions != neg->options.unet_hooks.pag_regions ||
+                 !pos->references.empty() || !neg->references.empty() ||
+--- a/src/model/common/block.hpp
++++ b/src/model/common/block.hpp
+@@ -365,7 +365,29 @@
+     }
+
+     ggml_tensor* self_attention(GGMLRunnerContext* ctx, ggml_tensor* x) {
+-        const auto& pass = sd::nui::active;
++        auto& pass = sd::nui::active;
++        if (pass.options && pass.options->reference_weight > 0.f) {
++            const auto key = "reference." + std::to_string(reinterpret_cast<uintptr_t>(this));
++            if (pass.capture_reference) {
++                ctx->persist_cache_tensor(key, x);
++                return forward(ctx, x, x);
++            }
++            auto* reference = ctx->load_cache_tensor(key);
++            if (!reference || reference->ne[0] != x->ne[0] || reference->ne[2] != x->ne[2])
++                throw std::runtime_error("Reference self-attention capture did not match the prediction");
++
++            auto* graph = ctx->ggml_ctx;
++            const auto style = pass.options->reference_positive ? pass.options->reference_style : 0.f;
++            ++pass.reference_layers;
++            if (style == 1.f)
++                return forward(ctx, x, x);
++            auto* context = ggml_concat(graph, x, ggml_scale(graph, reference, pass.options->reference_weight), 1);
++            auto* guided = forward(ctx, x, context);
++            if (style == 0.f)
++                return guided;
++            return ggml_add(graph, ggml_scale(graph, guided, 1.f - style),
++                            ggml_scale(graph, forward(ctx, x, x), style));
++        }
+         if (pass.options && pass.options->sag_capture && pass.region == 256) {
+             // Per-key incoming self-attention mass, averaged over heads.
+             auto projection = [&](const char* name) {
+--- a/src/model/diffusion/unet.hpp
++++ b/src/model/diffusion/unet.hpp
+@@ -946,7 +946,8 @@
+         }
+
+         auto runner_ctx            = get_context(sd::nui::active.tgate_step > 0 ||
+-                                                        (sd::nui::active.options && sd::nui::active.options->deepcache_history) ? gf : nullptr);
++                                                        (sd::nui::active.options && sd::nui::active.options->deepcache_history) ||
++                                                        sd::nui::active.capture_reference ? gf : nullptr);
+         runner_ctx.ip_context      = ip_context;
+         runner_ctx.ip_scale        = ip_scale;
+         runner_ctx.attn2_processor = attn2_processor;
+--- a/src/dgl/models/dit.cpp
++++ b/src/dgl/models/dit.cpp
+@@ -475,17 +475,35 @@
+                            (shape[0] > options.diffusion_tile_width || shape[1] > options.diffusion_tile_height);
+         if (tiled && (!sd_version_is_unet(version()) || shape.size() != 4 || options.unet_hooks.sag_capture))
+             throw std::runtime_error("MultiDiffusion requires a 2D U-Net without SAG capture");
++        const auto compute_error = [&]() {
++            const auto& error = diffusion_model->device_memory_error();
++            if (!error.empty())
++                throw Error(SD_STATUS_OUT_OF_MEMORY, error);
++            throw std::runtime_error("diffusion compute failed");
++        };
++        if (options.reference_latent) {
++            if (!sd_version_is_unet(version()) || tiled || shape != options.reference_latent->shape() ||
++                shape != options.reference_noise->shape())
++                throw std::runtime_error("Reference only requires reference and noise matching a single U-Net latent");
++            auto reference = parameterization.add_noise(sigma, *options.reference_noise, *options.reference_latent) * scaling[2];
++            auto capture = params;
++            capture.x = &reference;
++            auto& extra = std::get<UNetDiffusionExtra>(capture.extra);
++            extra.controls = nullptr;
++            sd::nui::active.capture_reference = true;
++            if (compute(capture).empty())
++                compute_error();
++            sd::nui::active.capture_reference = false;
++        }
+         auto result = tiled
+             ? predict_unet_tiles(params, options, down_factor, sd::nui::active, compute)
+             : compute(params);
+-        if (result.empty()) {
+-            const auto& error = diffusion_model->device_memory_error();
+-            if (!error.empty()) {
+-                throw Error(SD_STATUS_OUT_OF_MEMORY, error);
+-            }
+-            throw std::runtime_error("diffusion compute failed");
+-        }
++        if (result.empty())
++            compute_error();
+         const auto& attention = sd::nui::active;
++        if (attention.reference_layers && step.index == 1)
++            LOG_INFO("Reference only applied to %d self-attention layers (%s)",
++                     attention.reference_layers, options.unet_hooks.reference_positive ? "positive" : "negative");
+         if (auto* history = options.unet_hooks.deepcache_history) {
+             if (attention.deepcache_saved) {
+                 if (history->last != step.index - 1)

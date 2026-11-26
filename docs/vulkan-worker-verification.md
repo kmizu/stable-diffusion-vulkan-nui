@@ -3,6 +3,12 @@
 
 
 
+## Windows v0.50 — Reference only
+
+The ZIP SHA-256 is `aa8c4b162ae40ace9e345ae4dff09c64086094cdb52521f5e4e92232e06fc338`. The staged `SDV-NUI.exe` accepted a base64 reference over MCP, generated masked SDXL img2img on RTX 3090 with a system-only PATH, recorded the settings in the PNG and preserved every unmasked pixel. The trace showed the reference self-attention path in 70 layers of each CFG branch. The archive contains the tested launcher, worker JAR and inference DLL byte for byte.
+
+Direct tests used SDXL at 768 × 768 on RTX 3090 and SD1.5 at 512 × 512 on Radeon 780M. Both ran masked img2img and kept the original RGB outside the edit. Zero weight made reference selection a no-op. On RTX 3090, changing the reference or style fidelity changed the edited region. Replaying the original reference matched all pixels. The SDXL Inpaint checkpoint with nine U-Net input channels also passed, and standard SDXL completed a latent Hires pass at 832 × 832. Radeon 780M logged 16 reference self-attention layers per branch. All 41 worker tests passed.
+
 ## Windows v0.49 — DeepCache and Fast Mode
 
 The ZIP SHA-256 is `387dced983db138a660837ae738f624ea696d0eb6fb93179bbcedb51b3ee71d9`. The staged `SDV-NUI.exe` ran masked SDXL img2img over MCP on RTX 3090 and masked SD1.5 img2img on Radeon 780M with a system-only PATH and reported `cuda=false`. The sampler logged reuse from all three caches and recorded Fast Mode settings in the PNG. Every unmasked pixel matched the input. The ZIP contains the tested launcher, worker JAR and native inference DLL byte for byte.

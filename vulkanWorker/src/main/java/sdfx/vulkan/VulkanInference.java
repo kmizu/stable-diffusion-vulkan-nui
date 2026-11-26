@@ -683,6 +683,10 @@ public final class VulkanInference implements AutoCloseable {
         return cString(ptr("sd_dgl_builtin_catalog")).contains("`tgate_step?");
     }
 
+    public boolean supportsReferenceOnly() {
+        return cString(ptr("sd_dgl_builtin_catalog")).contains("`reference_latent?");
+    }
+
     public boolean supportsDeepCache() {
         return cString(ptr("sd_dgl_builtin_catalog")).contains("`deepcache_interval?");
     }

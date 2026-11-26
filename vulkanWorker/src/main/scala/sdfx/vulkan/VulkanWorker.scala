@@ -97,6 +97,7 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
       Option.when(backend.supportsCdTuner())(VulkanCdTuner.id).toVector ++
       Option.when(backend.supportsTGate())(VulkanTGate.id).toVector ++
       Option.when(backend.supportsDeepCache())(VulkanDeepCache.id).toVector ++
+      Option.when(backend.supportsReferenceOnly())(VulkanReference.id).toVector ++
       Option.when(backend.supportsDynamicThreshold())("dynamic_thresholding") ++
       (if backend.supportsSvd() then Vector("img2vid","novel_view") else Vector.empty) ++ Option.when(sdfx.vulkan.tools.VulkanCharaImport.available)("chara_searcher") ++ Option.when(sdfx.vulkan.tools.VulkanBlip.available && !sdfx.vulkan.tools.VulkanWdTagger.available)("caption") ++ Option.when(sdfx.vulkan.tools.VulkanCustomCode.enabled)("custom_code") ++ sdfx.vulkan.tools.VulkanWdTagger.features ++ Option.when(sdfx.vulkan.tools.VulkanFaceRestore.available)("face_restore") ++ Vector("vulkan_nsfw") ++ Option.when(sdfx.vulkan.tools.VulkanSafety.available)("nsfw_checker")))
 
@@ -638,6 +639,7 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
               .orElse(unetHooks.keysIterator.nextOption().map(_ -> unetHooks))
               .orElse(modifier.map(entry => VulkanLatentModifier.id -> Map(entry)))
               .orElse(cdRefinement.map(_ => VulkanCdTuner.id -> Map(VulkanCdTuner.id -> p.hooks(VulkanCdTuner.id))))
+              .orElse(graph.filter(_ == VulkanReference.id).map(key => key -> Map(key -> p.hooks(key))))
               .orElse(graph.filter(VulkanGraph.cacheHooks).map(key =>
                 key -> p.hooks.filter((k, _) => VulkanGraph.cacheHooks(k) || VulkanGraph.cacheGuidanceHooks(k))))
               .map((key,hooks) => key -> (hooks ++ modifier))
