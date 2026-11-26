@@ -109,7 +109,7 @@ private[vulkan] object VulkanHiresGraph:
       config.args(path, "hr_lllite_hint")
     }
     loraPlan.foreach(plan => lines ++= VulkanComposableLora.prepare(plan, req, "hr_clora", unet, text, encoding,
-      concat, supportsBlank = true))
+      concat, supportsBlank = true, tracePass = composable.filter(VulkanComposableLora.plotRequested).map(_ => "hires")))
     for (name,prompt) <- Seq("pos" -> positivePrompt, "neg" -> negativePrompt) if loraPlan.isEmpty do
       val grown = areaRatio > 1
       val cdt = cdTuner.fold("")(t => t.args(t.weights(areaRatio, baseSteps), "cdt_map", name == "neg",

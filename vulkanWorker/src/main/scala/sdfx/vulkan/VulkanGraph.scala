@@ -435,7 +435,8 @@ private[vulkan] object VulkanGraph:
       textSchedule match
         case Some(schedule) => schedule.predictors(concat,lines)
         case None if loraPlan.nonEmpty =>
-          lines ++= VulkanComposableLora.prepare(loraPlan.get, req, "clora", unet, text, enc, concat, supportsBlank = true)
+          lines ++= VulkanComposableLora.prepare(loraPlan.get, req, "clora", unet, text, enc, concat, supportsBlank = true,
+            tracePass = composable.filter(VulkanComposableLora.plotRequested).map(_ => "base"))
         case None =>
           val fooocusArgs = fooocus.fold("")(_.predictorArgs)
           def cdArgs(negative: Boolean): String =

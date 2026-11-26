@@ -3,6 +3,14 @@
 
 
 
+## Windows v0.58 — Composable LoRA weight plots
+
+The staged `SDV-NUI.exe` returned the generated image and a 1200 × 680 plot PNG through MCP for masked SDXL img2img at 768 × 768 on RTX 3090 and SD1.5 img2img at 512 × 512 on Radeon 780M. Both reported `cuda=false` and preserved every source pixel outside the mask. Each trace recorded a U-Net adapter weight of 0.45 in the selected branch at steps 1 and 2, zero thereafter, and zero in the other evaluated branches. The short runs showed distortions inside the masked area.
+
+Direct SDXL on RTX 3090 verified that an adapter window beyond the last step reported zero weight for each evaluation. Two 576 × 576 Latent Hires runs verified independent base and refinement clocks at CFG 1 and CFG 6. CFG 1 skipped the negative branch. The CFG 6 run used 12 base steps and 8 Hires steps and produced a recognizable watercolor fox. The trace reports the count of model evaluations per row.
+
+All 60 Vulkan worker tests, 46 engine tests and the Composable LoRA plugin test passed. One engine test was skipped. The ZIP SHA-256 is `196566862116ce432c7370ac9f80f7bc5fa3ab59463778d7384a3d03a5f371bc`. The archived launcher, desktop JAR, worker JAR and inference DLL matched the tested staging files.
+
 ## Windows v0.57 — Composable LoRA step controls
 
 Direct masked SDXL img2img at 768 × 768 on RTX 3090 and SD1.5 at 512 × 512 on Radeon 780M produced different edited pixels for early and late LoRA windows. A window beyond the pass matched the branch without an adapter pixel for pixel on both devices. RTX 3090 reproduced the early-window seed exactly. These cases retained all source pixels outside the mask, and the images were inspected.

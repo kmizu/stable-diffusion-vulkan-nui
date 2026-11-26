@@ -17,6 +17,9 @@ private[vulkan] object VulkanComposableLora:
     case ujson.Str(value) => Set("enable", "enabled", "true", "yes", "on", "1")(value.trim.toLowerCase(java.util.Locale.ROOT))
     case _ => false
   }
+  def plotRequested(config: Value): Boolean = !config.obj.get("enabled").contains(ujson.Bool(false)) &&
+    flag(config, "plot_weights")
+
   def clock(p: GenerationParams, config: Value, actual: Int, hires: Boolean): (Int, Int) =
     val global = flag(config, "hires_global_step")
     val offset = if global && hires then p.steps else 0
@@ -28,7 +31,7 @@ private[vulkan] object VulkanComposableLora:
     (offset, total)
   final case class Branch(text: String, coefficient: Double, textAdapters: Vector[(String, Double)],
       unetAdapters: Vector[(String, Double)], unetSchedule: Vector[Vector[(String, Double)]] = Vector.empty)
-  final case class Plan(negative: Branch, positive: Vector[Branch]):
+  final case class Plan(negative: Branch, positive: Vector[Branch], traceCandidates: Vector[String]):
     def guidance(prefix: String): String =
       if positive.size == 1 && positive.head.coefficient == 1 then ""
       else positive.zipWithIndex.map { (branch, i) =>
@@ -63,7 +66,6 @@ private[vulkan] object VulkanComposableLora:
     import VulkanProtocol.{invalid, unsupported}
     val useSteps = flag(config, "with_step")
     val total = if clockTotal > 0 then clockTotal else steps
-    if flag(config, "plot_weights") then unsupported("Composable LoRA weight plots")
     val leaves = Vector.newBuilder[(String, Double)]
     def visit(node: Node, scale: Double): Unit =
       if node.kind != "AND" then unsupported("extended AND operators with Composable LoRA")
@@ -128,10 +130,10 @@ private[vulkan] object VulkanComposableLora:
       Branch(cleanPrompt(program.fold(text)(_.prompt)), coefficient,
         weights(local, false, program.map(_.weights(-1, total))),
         timeline.headOption.getOrElse(weights(local, true)), timeline)
-    })
+    }, (promptTags ++ shared).map(_.name).distinct.toVector)
 
   def prepare(plan: Plan, req: GenerationRequest, prefix: String, unet: String, text: String, enc: String,
-      concat: String, supportsBlank: Boolean): Vector[String] =
+      concat: String, supportsBlank: Boolean, tracePass: Option[String] = None): Vector[String] =
     def quoted(value: String): String = ujson.write(ujson.Str(value))
     val lines = Vector.newBuilder[String]
     val branches = (s"${prefix}_neg" -> plan.negative) +:
@@ -139,16 +141,27 @@ private[vulkan] object VulkanComposableLora:
     val names = branches.flatMap { (_, branch) =>
       (branch.textAdapters ++ branch.unetAdapters ++ branch.unetSchedule.flatten).map(_._1)
     }.distinct
+    def modelComponents(path: String): (Boolean, Boolean) =
+      if path.toLowerCase(java.util.Locale.ROOT).endsWith(".safetensors") then
+        Using.resource(sdfx.vulkan.tools.CheckpointIO.open(Path.of(path)))(file => components(file.tensors.keys))
+      else (true, true)
     val adapters = names.zipWithIndex.map { (name, i) =>
       val path = VulkanConditioning.file(req.loraPaths.getOrElse(name,
         VulkanProtocol.invalid(s"Unresolved Composable LoRA adapter: $name")), "LoRA")
       val key = s"${prefix}_adapter$i"
       lines += s"$key = load_lora(${quoted(path)})"
-      val (textWeights, unetWeights) = if path.toLowerCase(java.util.Locale.ROOT).endsWith(".safetensors") then
-        Using.resource(sdfx.vulkan.tools.CheckpointIO.open(Path.of(path)))(file => components(file.tensors.keys))
-      else (true, true)
+      val (textWeights, unetWeights) = modelComponents(path)
       name -> (key, textWeights, unetWeights)
     }.toMap
+    val tracedNames = tracePass.toVector.flatMap { _ =>
+      plan.traceCandidates.sorted.filter { name =>
+        adapters.get(name).fold {
+          req.loraPaths.get(name).exists { path =>
+            scala.util.Try(modelComponents(VulkanConditioning.file(path, "LoRA"))._2).getOrElse(false)
+          }
+        }(_._3)
+      }
+    }
     val models = scala.collection.mutable.Map.empty[(String, Vector[(String, Double)]), String]
     def applyAdapters(model: String, weights: Vector[(String, Double)]): String =
       models.getOrElseUpdate((model, weights), weights.foldLeft(model) { case (base, (name, weight)) =>
@@ -162,11 +175,20 @@ private[vulkan] object VulkanComposableLora:
       val blank = if supportsBlank && name.endsWith("_neg") && branch.text.isEmpty then ", sdxl_blank_negative = true" else ""
       val condition = s"${name}_cond"
       lines += s"$condition = encode_prompt($encoder, ${quoted(branch.text)}, $enc)"
-      def predict(symbol: String, weights: Vector[(String, Double)]): String =
-        val denoiser = applyAdapters(unet, weights.filter(entry => adapters(entry._1)._3))
-        lines += s"$symbol = predictor($denoiser, $condition$concat$blank)"
-        symbol
+      def unetWeights(weights: Vector[(String, Double)]): Vector[(String, Double)] =
+        weights.filter(entry => adapters(entry._1)._3)
       val timeline = branch.unetSchedule
+      def predict(symbol: String, weights: Vector[(String, Double)]): String =
+        val active = unetWeights(weights)
+        val denoiser = applyAdapters(unet, active)
+        val effective = active.toMap
+        val trace = tracePass.filter(_ => tracedNames.nonEmpty).fold("") { pass =>
+          val label = VulkanLoraTrace.label(pass, name, branch.text, name.endsWith("_neg"),
+            tracedNames.map(adapter => adapter -> effective.getOrElse(adapter, 0.0).toFloat.toDouble))
+          s", lora_trace = ${quoted(label)}"
+        }
+        lines += s"$symbol = predictor($denoiser, $condition$concat$blank$trace)"
+        symbol
       val distinct = timeline.distinct
       val scheduleSource = if distinct.size <= 1 then
         predict(name, timeline.headOption.getOrElse(branch.unetAdapters))

@@ -1,0 +1,63 @@
+--- a/src/dgl/ops/predictor.h
++++ b/src/dgl/ops/predictor.h
+@@ -38,6 +38,7 @@
+         std::shared_ptr<PuLIDBindings> pulid;
+         models::DiffusionPredictionOptions options;
+         std::vector<sd::Tensor<float>> references;
++        std::string lora_trace;
+         bool circular_x = false;
+         bool circular_y = false;
+
+--- a/src/dgl/bindings/registration.cpp
++++ b/src/dgl/bindings/registration.cpp
+@@ -599,7 +599,7 @@
+              integer("audio_length", 0, INT_MAX, 0),
+              number("fps", 0.01, 100000, 24), number("video_sigma_shift", 0.001, 1000, 12), number("audio_sigma_shift", 0.001, 1000, 3),
+              optional("circular_x", Kind::Boolean, false), optional("circular_y", Kind::Boolean, false),
+-             integer("tgate_step", 0, 1000, 0),
++             optional("lora_trace", Kind::String), integer("tgate_step", 0, 1000, 0),
+              optional("reference_latent", Kind::Tensor), optional("reference_noise", Kind::Tensor),
+              optional("lllite_path", Kind::String), optional("lllite_hint", Kind::Tensor),
+              optional("lllite_blank_negative", Kind::Boolean, false),
+--- a/src/dgl/bindings/predictor.cpp
++++ b/src/dgl/bindings/predictor.cpp
+@@ -236,6 +236,8 @@
+                                                                            : Rope::RefRoPEAnchor::MODEL_DEFAULT;
+         output.options.guidance        = float(get_number(args, "guidance"));
+         bind_predictor_options(output, args);
++        if (args.count("lora_trace"))
++            output.lora_trace = get_string(args, "lora_trace");
+         if (args.count("lllite_path") || args.count("lllite_hint")) {
+             if (!args.count("lllite_path") || !args.count("lllite_hint") || !sd_version_is_sdxl(engine.version()))
+                 throw std::runtime_error("ControlNet-LLLite requires an SDXL denoiser, model path and RGB hint");
+--- a/src/dgl/ops/predictor.cpp
++++ b/src/dgl/ops/predictor.cpp
+@@ -417,6 +417,11 @@
+         return check(check, predictor);
+     }
+
++    static void record_lora_prediction(const ModelPredictor& leaf, int step) {
++        if (!leaf.lora_trace.empty())
++            LOG_INFO("SDV_LORA_PREDICTION %d %s", step, leaf.lora_trace.c_str());
++    }
++
+     models::DiffusionPrediction PredictionExecution::Resources::predict_model(const ModelPredictor& leaf, const Tensor<float>& x, float sigma, models::DiffusionPredictionStep step, EvaluationState& state, bool sag_mask) {
+         auto& engine = leaf.dit();
+         prepare_predictor(leaf);
+@@ -486,6 +491,7 @@
+                                                    options, step);
+         if (prediction.output.empty())
+             throw std::runtime_error("diffusion prediction failed");
++        record_lora_prediction(leaf, step.index);
+         return prediction;
+     }
+
+@@ -594,6 +600,8 @@
+                 LOG_VERBOSE("batching compatible positive and negative UNet branches");
+             }
+             auto prediction = resources.predict_batch(*pos, packed->second, x_, sigma_, step_);
++            record_lora_prediction(*pos, step_.index);
++            record_lora_prediction(*neg, step_.index);
+             auto parts      = sd::ops::chunk(prediction.output, 2, 3);
+             results_.emplace(&positive, Result{{std::move(parts[0]), prediction.skip_scale, prediction.output_scale}});
+             results_.emplace(&negative, Result{{std::move(parts[1]), prediction.skip_scale, prediction.output_scale}});

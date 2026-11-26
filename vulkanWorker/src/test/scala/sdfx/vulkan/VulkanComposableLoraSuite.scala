@@ -22,6 +22,7 @@ class VulkanComposableLoraSuite extends munit.FunSuite:
     val local = VulkanComposableLora.plan("fox [<lora:fur:1>:3]", "", Some(Nil), Nil,
       ujson.Obj("with_step" -> true), steps = 2)
     assert(local.positive.head.unetSchedule.forall(_.isEmpty))
+    assertEquals(local.traceCandidates, Vector("fur"))
     val repeated = VulkanComposableLora.plan("fox [<lora:fur:.2><lora:fur:.8>:2]", "", Some(Nil), Nil,
       ujson.Obj("with_step" -> true), steps = 2)
     assertEquals(repeated.positive.head.textAdapters, Vector("fur" -> .8))
@@ -73,4 +74,41 @@ class VulkanComposableLoraSuite extends munit.FunSuite:
     import sdfx.core.protocol.GenerationRequest
     assert(!VulkanComposableLora.needsGraph(GenerationRequest(GenerationParams(prompt = "fox:0.5"), "outputs")))
     assert(VulkanComposableLora.needsGraph(GenerationRequest(GenerationParams(prompt = "fox AND owl"), "outputs")))
+  }
+
+  test("weight trace keeps repeated evaluations, inactive weights, image indices, and passes") {
+    import java.nio.file.{Files, Path}
+    import javax.imageio.ImageIO
+    import sdfx.core.protocol.GeneratedImage
+
+    VulkanClipIo.withScratch("clora-trace-test-") { directory =>
+      val run = new VulkanLoraTrace.Run(ujson.Obj())
+      val prompt = "雪の森 \"fox\""
+      def record(pass: String, step: Int, weight: Double): Unit =
+        val label = VulkanLoraTrace.label(pass, "branch0", prompt, false, Seq("fur" -> weight))
+        run.record(s"$step $label")
+      record("base", 1, .25)
+      record("base", 1, .75)
+      record("base", 2, 0)
+      record("hires", 1, .5)
+      run.imageIndex = 1
+      record("base", 1, 1)
+
+      val first = GeneratedImage("first.png", seed = 17, width = 64, height = 64)
+      val (plot, manifest) = run.finish(directory, first, None, _ => ())
+      val trace = Path.of(manifest.path)
+      assertEquals(plot.seed, 17L)
+      assertEquals(ImageIO.read(Path.of(plot.path).toFile).getWidth, 1200)
+      val rows = ujson.read(Files.readString(trace))("records").arr.toVector
+      Files.delete(trace)
+      Files.delete(trace.getParent)
+      Files.delete(trace.getParent.getParent)
+      assertEquals(rows.map(r => (r("image_index").num.toInt, r("pass_name").str, r("step").num.toInt)),
+        Vector((0, "base", 1), (0, "base", 2), (0, "hires", 1), (1, "base", 1)))
+      assertEquals(rows.map(_("mean_weight").num), Vector(.5, 0.0, .5, 1.0))
+      assertEquals(rows.head("min_weight").num, .25)
+      assertEquals(rows.head("max_weight").num, .75)
+      assertEquals(rows.head("model_evaluations").num, 2.0)
+      assertEquals(rows.head("prompt").str, prompt)
+    }
   }

@@ -471,11 +471,16 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
     val fooocus = gen.request.params.hooks.get(VulkanFooocusInpaint.id)
       .exists(!_.obj.get("enabled").contains(ujson.Bool(false)))
     if fooocus then VulkanClipIo.withScratch("sdv-fooocus-") { dir =>
-      Using.resource(backend.temporaryDglModelFiles())(_ => generate(job, gen, Some(dir)))
+      Using.resource(backend.temporaryDglModelFiles())(_ => generate(job, gen, Some(dir), None))
     }
-    else generate(job, gen, None)
+    else gen.request.params.hooks.get(VulkanComposableLora.id).filter(VulkanComposableLora.plotRequested) match
+      case None => generate(job, gen, None, None)
+      case Some(config) =>
+        if !backend.supportsComposableLoraTrace() then unsupported("This Vulkan runtime lacks Composable LoRA tracing")
+        val trace = new VulkanLoraTrace.Run(config)
+        Using.resource(VulkanInference.traceLoraPredictions(trace.record))(_ => generate(job, gen, None, Some(trace)))
 
-  private def generate(job: Job, gen: Generation, fooocusDir: Option[Path]): Value =
+  private def generate(job: Job, gen: Generation, fooocusDir: Option[Path], loraTrace: Option[VulkanLoraTrace.Run]): Value =
     val model = currentModel
     val requested = gen.request.params
     val sag = requested.hooks.get("sag").filterNot(_.obj.get("enabled").contains(ujson.Bool(false)))
@@ -578,6 +583,7 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
     var outputIndex = 0
     val imgs = order.zipWithIndex.flatMap { case ((i,pass),index) =>
       job.check()
+      loraTrace.foreach(_.imageIndex = index)
       val seed = Math.addExact(firstSeed, i.toLong)
       job.frames.foreach(_.begin(index,seed))
       val inputs = p.img2img.filter(_ => graph.isEmpty).map(VulkanImageInputs.prepare(_, p.width, p.height, seed, difference, () => job.cancelled))
@@ -756,8 +762,15 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
           infotextFields = Seq("Vulkan device" -> display(device)) ++ score.toSeq.flatMap(_.fields), pngChunks = score.toSeq.flatMap(_.chunks))
       }
     }
-    Json.toJs(GenerationResult(imgs, (System.nanoTime() - start) / 1e9, Some(model.name), Some(model.hash),
+    val diagnostics = for
+      trace <- loraTrace
+      first <- imgs.headOption
+    yield
+      job.check()
+      trace.finish(dir, first, job.imagePassword, path => { job.files += path; () })
+    Json.toJs(GenerationResult(imgs ++ diagnostics.map(_._1), (System.nanoTime() - start) / 1e9, Some(model.name), Some(model.hash),
       auxiliaryImages = auxiliary.toSeq, intermediateArtifacts = job.frames.toSeq.flatMap(_.finish()),
+      composableLoraTrace = diagnostics.map(_._2),
       systemInfo = Option.when(req.systemInfoFields.nonEmpty)(VulkanDiagnostics.metadata(status, req.systemInfoFields)),
       scheduler = Some(gen.scheduler), warnings = gen.warnings ++ sagWarnings ++ resources.toSeq.flatMap(_.warnings),
       resourceHashes = resources.map(r => r.hashes ++ Map("model" -> model.hash) ++ model.vaeHash.map("vae" -> _)).getOrElse(Map.empty)))

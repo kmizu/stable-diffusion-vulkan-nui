@@ -11,6 +11,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Function;
+import java.util.function.Consumer;
 import java.util.concurrent.CancellationException;
 
 import static java.lang.foreign.ValueLayout.*;
@@ -189,9 +190,27 @@ public final class VulkanInference implements AutoCloseable {
         }
     }
 
+    private static final String LORA_TRACE_PREFIX = "SDV_LORA_PREDICTION ";
+    private static final ThreadLocal<Consumer<String>> LORA_TRACE = new ThreadLocal<>();
+
+    static AutoCloseable traceLoraPredictions(Consumer<String> sink) {
+        if (LORA_TRACE.get() != null) throw new IllegalStateException("A LoRA trace is already active");
+        LORA_TRACE.set(sink);
+        return LORA_TRACE::remove;
+    }
+
     private static void onLog(int level, MemorySegment message, MemorySegment unused) {
         try {
-            if (level >= 2) System.err.println(cString(message).stripTrailing());
+            if (level < 2) return;
+            String text = cString(message).stripTrailing();
+            if (text.startsWith(LORA_TRACE_PREFIX)) {
+                var sink = LORA_TRACE.get();
+                int origin = text.lastIndexOf(" --- ");
+                if (sink != null && origin > LORA_TRACE_PREFIX.length())
+                    sink.accept(text.substring(LORA_TRACE_PREFIX.length(), origin));
+            } else {
+                System.err.println(text);
+            }
         } catch (Throwable ignored) { /* Exceptions must never cross native callbacks. */ }
     }
 
@@ -693,6 +712,10 @@ public final class VulkanInference implements AutoCloseable {
 
     public boolean supportsComposableLora() {
         return cString(ptr("sd_dgl_builtin_catalog")).contains("`composable?");
+    }
+
+    public boolean supportsComposableLoraTrace() {
+        return cString(ptr("sd_dgl_builtin_catalog")).contains("`lora_trace?");
     }
 
     public boolean supportsLLLite() {
