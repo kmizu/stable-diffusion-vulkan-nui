@@ -3,6 +3,10 @@
 
 
 
+## Windows v0.41
+
+The ZIP SHA-256 is `e1facd1ce694e230076b37a1fcea8ed64bedc1197b92e507a23db757f670dc4c`. The Windows executable ran the Weight Gradient hook through the MCP `img2img` tool using the bundled Vulkan DLL and JDK 25 with a system-only PATH. The staged package completed an SD1.5 run on Radeon 780M at 512 × 512. The executable from a fresh ZIP extraction completed an SDXL run on RTX 3090 at 768 × 768. Both workers reported `cuda=false`.
+
 ## Windows v0.40
 
 The ZIP SHA-256 is `e08c17493fe1be4a16b4b4f347889fcac30818c2abcc9f0c627064653c1027ef`. The executable ran Prompt Fusion through the MCP `img2img` tool using the bundled JDK 25 and Vulkan DLL with a system-only PATH. The staged package generated at 512 × 512 on Radeon 780M with SD1.5 and at 768 × 768 on RTX 3090 with SDXL. A fresh ZIP extraction repeated the SDXL test on RTX 3090. The worker reported a Vulkan device and `cuda=false` in all three runs.
