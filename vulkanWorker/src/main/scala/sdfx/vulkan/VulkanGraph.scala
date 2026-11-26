@@ -82,7 +82,8 @@ private[vulkan] object VulkanGraph:
       val sdxl = Set("sdxl", "SDXL Inpaint")(model.kind)
       if !sdxl && !Set("sd15", "SD 1.x Inpaint")(model.kind) then
         unsupported("Aesthetic Gradients requires an SD1.x or SDXL CLIP-L encoder")
-      if loras.nonEmpty then unsupported("Aesthetic Gradients with LoRA")
+      if loras.nonEmpty || p.hires.enabled && req.hiresLoras.exists(_.nonEmpty) then
+        unsupported("Aesthetic Gradients with LoRA")
       val config = VulkanAestheticTraining.settings(p.hooks(aestheticHook))
       (config, scratch, sdxl)
     }
@@ -161,8 +162,8 @@ private[vulkan] object VulkanGraph:
     if modifier.nonEmpty && !engine.supportsLatentModifier() then unsupported("This Vulkan runtime lacks Latent Modifier")
     val patchedAttention = reference.nonEmpty || lllite.nonEmpty || agent.nonEmpty || llul.nonEmpty
     val patchedInputs = customText || unetGraph || modifier.nonEmpty || fooocus.nonEmpty || cdTuner.nonEmpty || cacheGraph || patchedAttention || characteristic.nonEmpty || composable.nonEmpty || aesthetic.nonEmpty
-    val supportsControl = unetGraph || cdTuner.nonEmpty || tgate.nonEmpty || patchedAttention || modifier.nonEmpty && !customText
-    val hiresPass = hook == latentHires || (cdTuner.nonEmpty || cacheGraph || patchedAttention || characteristic.nonEmpty || composable.nonEmpty) && p.hires.enabled
+    val supportsControl = unetGraph || cdTuner.nonEmpty || tgate.nonEmpty || patchedAttention || aesthetic.nonEmpty || modifier.nonEmpty && !customText
+    val hiresPass = hook == latentHires || (cdTuner.nonEmpty || cacheGraph || patchedAttention || characteristic.nonEmpty || composable.nonEmpty || aesthetic.nonEmpty) && p.hires.enabled
     val h = if hiresPass then ujson.Obj() else p.hooks(hook)
     val latentHook = VulkanLatentGraph.hooks(hook)
     if p.hooks.get("dynamic_thresholding").exists(!_.obj.get("enabled").contains(ujson.Bool(false))) &&
@@ -185,7 +186,7 @@ private[vulkan] object VulkanGraph:
     if soft.nonEmpty && !p.img2img.exists(_.mask.nonEmpty) then invalid("Soft Inpainting needs an img2img mask")
     if inverse && p.img2img.isEmpty then invalid("img2img Alternative needs an input image")
     val imageHooks = if patchedInputs then Set("conditioning_highres_fix", "inpaint_difference") ++
-      Option.when(characteristic.isEmpty && composable.isEmpty && aesthetic.isEmpty)("img2img_hires_fix") else Set.empty[String]
+      Option.when(characteristic.isEmpty && composable.isEmpty)("img2img_hires_fix") else Set.empty[String]
     val textHooks = if fusionScratch.nonEmpty then VulkanFusionPrompt.textHooks
       else if signedText then Set(VulkanWeightGradient.id)
       else Set.empty[String]
@@ -228,11 +229,18 @@ private[vulkan] object VulkanGraph:
     val loadText = s"text0 = load_text_encoder(${path(model.path)}, $common)"
     lines += loadText
     textSetup += loadText
-    aesthetic.foreach { (config, scratch, sdxl) =>
-      val (tuned, digest) = VulkanAestheticTraining.train(engine, device, Path.of(model.path), sdxl,
-        if config.negative then p.negativePrompt else prompt, config, scratch, cancelled, aestheticProgress)
-      aestheticDigest(digest)
-      lines += s"text_aesthetic = load_text_encoder(${path(model.path)}, backend = ${quoted(device)}$placement, wtype = \"f32\", family = ${quoted(family)}, clip_l_path = ${path(tuned.toString)})"
+    val aestheticConditioning = aesthetic.map { (config, scratch, sdxl) =>
+      val trained = scala.collection.mutable.Map.empty[String, String]
+      var fingerprint = config.sha256
+      VulkanAestheticTraining.Conditioning(config, sdxl, caption => trained.getOrElseUpdate(caption, {
+        val name = s"text_aesthetic_${trained.size}"
+        val (tuned, digest) = VulkanAestheticTraining.train(engine, device, Path.of(model.path), sdxl,
+          caption, config.copy(sha256 = fingerprint), scratch, cancelled, aestheticProgress)
+        fingerprint = digest
+        aestheticDigest(digest)
+        lines += s"$name = load_text_encoder(${path(model.path)}, backend = ${quoted(device)}$placement, wtype = \"f32\", family = ${quoted(family)}, clip_l_path = ${path(tuned.toString)})"
+        name
+      }))
     }
     val scale = if family.startsWith("sdxl") && model.vaePath.isEmpty then ", conv_scale = 0.03125" else ""
     lines += s"vae = load_vae(${path(model.vaePath.getOrElse(model.path))}, $common$scale)"
@@ -259,19 +267,9 @@ private[vulkan] object VulkanGraph:
     val size = s"width = $width, height = $height"
     val enc = s"$size, clip_skip = ${p.clipSkip}"
     def condition(label: String, caption: String, negative: Boolean): Unit =
-      val source = s"encode_prompt($text, ${quoted(caption)}, $enc)"
-      aesthetic.filter(_._1.negative == negative) match
-        case None => lines += s"$label = $source"
-        case Some((config, _, sdxl)) =>
-          val base = s"${label}_base"
-          val trained = s"${label}_trained"
-          lines += s"$base = $source"
-          lines += s"$trained = encode_prompt(text_aesthetic, ${quoted(caption)}, $enc)"
-          if sdxl then
-            val left = s"${label}_l"
-            lines += s"$left = tensor::lerp(tensor::crop($base.crossattn, axes = [0], start = [0], size = [768]), tensor::crop($trained.crossattn, axes = [0], start = [0], size = [768]), ${config.weight})"
-            lines += s"$label = {crossattn = tensor::replace_slice($base.crossattn, $left, axis = 0, start = 0), vector = $base.vector}"
-          else lines += s"$label = {crossattn = tensor::lerp($base.crossattn, $trained.crossattn, ${config.weight})}"
+      aestheticConditioning match
+        case None => lines += s"$label = encode_prompt($text, ${quoted(caption)}, $enc)"
+        case Some(conditioning) => conditioning.encode(label, text, caption, enc, negative, lines)
     def onCanvas(image: BufferedImage): BufferedImage =
       if (image.getWidth, image.getHeight) == (width, height) then image
       else VulkanImageInputs.resize(image, width, height, 0)
@@ -489,11 +487,11 @@ private[vulkan] object VulkanGraph:
           val llliteArgs = lllite.fold("")((config, path) => config.args(path, "lllite_hint"))
           val llulArgs = llul.filter(_.canApply(p.steps)).fold("")(_.args(p.width, p.height, "llul_mask", p.steps))
           lines += s"pos = predictor(unet, $positiveInput$concat$unetArgs$fooocusArgs${cdArgs(false)}$posRef$llliteArgs$llulArgs)"
-          val blank = if p.negativePrompt.nonEmpty then ""
+          val blank = if aesthetic.fold(p.negativePrompt.nonEmpty)(_ => p.negativePrompt.trim.nonEmpty) then ""
             else if lllite.nonEmpty then ", lllite_blank_negative = true"
             else if llul.nonEmpty then ", llul_blank_negative = true"
             else if characteristic.nonEmpty then ", sdxl_blank_negative = true"
-            else if aesthetic.exists(!_._1.negative) then ", sdxl_blank_negative = true"
+            else if aesthetic.nonEmpty then ", sdxl_blank_negative = true"
             else ""
           lines += s"neg = predictor(unet, $negativeInput$concat$unetArgs$fooocusArgs${cdArgs(true)}$negRef$llliteArgs$llulArgs$blank)"
       lines += guidance
@@ -531,7 +529,7 @@ private[vulkan] object VulkanGraph:
       }
       lines ++= VulkanHiresGraph.refinement(req,prompt,loras,tweak.fold(seed)(_.seed),unet,text,eta,device,
         noise.nonEmpty,tiled,cdTuner,cacheArgs,reference,agent,controlWeight,inpaint,lllite,llul,characteristic,composable,
-        runtimeLoraWeights = runtimeLoraWeights)
+        runtimeLoraWeights = runtimeLoraWeights, aesthetic = aestheticConditioning, masked = overlay.nonEmpty)
     val resultLatent = if hiresPass then "hr_latent" else "latent"
     val saturation = cdTuner.filter(_ => refinementImage.isEmpty).fold("")(_.decoderArgs)
     lines += s"return {output = vae_decode(vae, unet_to_vae_latents(vae, $resultLatent)$tiled$saturation)}"

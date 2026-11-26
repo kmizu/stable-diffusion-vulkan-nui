@@ -607,15 +607,18 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
         prepareConditioning(adapted, job, resources)
       }
       var aestheticHash = Option.empty[String]
+      def recordAesthetic(hash: String): Unit =
+        if aestheticHash.exists(_ != hash) then invalid("Aesthetic Gradients embedding changed during the job")
+        aestheticHash = Some(hash)
+      def aestheticProgress(step: Int, loss: Float): Unit =
+        emit(Obj("id" -> job.id, "type" -> "event", "event" -> "progress", "step" -> step,
+          "total" -> sdfx.vulkan.tools.VulkanAestheticTraining.settings(p.hooks(VulkanGraph.aestheticHook)).steps,
+          "pass" -> "aesthetic_gradients", "loss" -> loss.toDouble, "image" -> index,
+          "images" -> order.size, "batch_size" -> 1))
       val rendered = graph match
         case Some(hook) => VulkanGraph.render(backend, device.id(), model, loadRequest.get, graphRequest, hook,
           activePrompt, planned.fold(p.loras)(_.loras), seed, gen.scheduler, () => job.cancelled, pass, difference,
-          fooocus = fooocusAssets, aestheticDigest = hash => aestheticHash = Some(hash),
-          aestheticProgress = (step, loss) =>
-            emit(Obj("id" -> job.id, "type" -> "event", "event" -> "progress", "step" -> step,
-              "total" -> sdfx.vulkan.tools.VulkanAestheticTraining.settings(p.hooks(VulkanGraph.aestheticHook)).steps,
-              "pass" -> "aesthetic_gradients", "loss" -> loss.toDouble, "image" -> index,
-              "images" -> order.size, "batch_size" -> 1)))
+          fooocus = fooocusAssets, aestheticDigest = recordAesthetic, aestheticProgress = aestheticProgress)
         case None =>
           val generated = backend.generate(activePrompt, p.negativePrompt, p.width, p.height, p.steps, p.cfgScale, seed,
             samplers(p.samplerName), schedulers(gen.scheduler), p.clipSkip, imageOptions, activeConditioning, progress(None))
@@ -695,6 +698,11 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
                 key -> p.hooks.filter((k, _) => VulkanGraph.imageAttentionHooks(k))))
               .orElse(graph.filter(VulkanGraph.cacheHooks).map(key =>
                 key -> p.hooks.filter((k, _) => VulkanGraph.cacheHooks(k) || VulkanGraph.cacheGuidanceHooks(k))))
+              .orElse(graph.filter(_ == VulkanGraph.aestheticHook).map { key =>
+                val config = ujson.Obj.from(p.hooks(key).obj)
+                aestheticHash.foreach(hash => config("embedding_sha256") = hash)
+                key -> Map(key -> config)
+              })
               .map((key,hooks) => key -> (hooks ++ modifier))
             refinementGraph match
               case Some((hook, hooks)) =>
@@ -704,7 +712,8 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
                   hooks = hooks)
                 VulkanGraph.render(backend, device.id(), model, loadRequest.get, graphRequest.copy(params = params),
                   hook, prompt, params.loras, seed, actualSchedule, () => job.cancelled,
-                  refinementImage = Some(resized), cdRefinement = cdRefinement).head
+                  refinementImage = Some(resized), cdRefinement = cdRefinement, aestheticDigest = recordAesthetic,
+                  aestheticProgress = aestheticProgress).head
               case None =>
                 val conditioning2 = prepareConditioning(req.copy(params = refinementParams.copy(prompt = prompt)), job, resources)
                 backend.generate(prompt, negative, w, ht, refinementParams.steps, refinementParams.cfgScale,

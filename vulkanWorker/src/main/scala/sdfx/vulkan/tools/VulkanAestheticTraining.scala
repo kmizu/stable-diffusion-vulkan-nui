@@ -4,6 +4,7 @@ import java.io.{BufferedInputStream, BufferedOutputStream, DataOutputStream}
 import java.nio.file.{Files, Path}
 import java.security.MessageDigest
 import java.util.HexFormat
+import scala.collection.mutable.Builder
 import scala.util.Using
 import scala.util.boundary, boundary.break
 import sdfx.vulkan.{VulkanInference, VulkanPromptAttention, VulkanProtocol}
@@ -18,6 +19,26 @@ private[vulkan] object VulkanAestheticTraining:
   final case class Settings(embedding: String, sha256: String, weight: Double, steps: Int, rate: Float,
       negative: Boolean, slerp: Boolean, angle: Double, style: String):
     def active: Boolean = weight != 0 && steps != 0 && rate != 0
+
+  final case class Conditioning(settings: Settings, sdxl: Boolean, trainedEncoder: String => String):
+    def encode(label: String, text: String, caption: String, options: String, negative: Boolean,
+        lines: Builder[String, Vector[String]]): String =
+      val blankNegative = negative && caption.trim.isEmpty
+      val quoted = ujson.write(ujson.Str(if blankNegative then "" else caption))
+      def encoded(encoder: String): String = s"encode_prompt($encoder, $quoted, $options)"
+      if settings.negative != negative || blankNegative then
+        lines += s"$label = ${encoded(text)}"
+      else
+        val base = s"${label}_base"
+        val trained = s"${label}_trained"
+        lines += s"$base = ${encoded(text)}"
+        lines += s"$trained = ${encoded(trainedEncoder(caption))}"
+        if sdxl then
+          val left = s"${label}_l"
+          lines += s"$left = tensor::lerp(tensor::crop($base.crossattn, axes = [0], start = [0], size = [768]), tensor::crop($trained.crossattn, axes = [0], start = [0], size = [768]), ${settings.weight})"
+          lines += s"$label = {crossattn = tensor::replace_slice($base.crossattn, $left, axis = 0, start = 0), vector = $base.vector}"
+        else lines += s"$label = {crossattn = tensor::lerp($base.crossattn, $trained.crossattn, ${settings.weight})}"
+      label
 
   def settings(value: Value): Settings =
     def number(key: String, default: Double): Double =
@@ -156,7 +177,7 @@ private[vulkan] object VulkanAestheticTraining:
     engine.trainAesthetic(device, input, trained, config.steps, config.rate, (step, loss) =>
       if step > 0 && !cancelled() then progress(step, loss)
       !cancelled())
-    val output = folder.resolve("trained-clip-l.safetensors")
+    val output = Files.createTempFile(folder, "trained-clip-l-", ".safetensors")
     Using.resource(new BufferedInputStream(Files.newInputStream(trained))) { input =>
       val plans = parameters.map { p =>
         p.name -> CheckpointIO.Plan("F32", p.shape, p.bytes.toLong, () => input.readNBytes(p.bytes))

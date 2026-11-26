@@ -46,10 +46,10 @@ class VulkanWorkerSuite extends munit.FunSuite:
     import sdfx.core.model.{HiresParams, Img2ImgParams}
     val p = GenerationParams(width = 800, height = 776, samplerName = "Euler", scheduler = "Karras",
       hires = HiresParams(enabled = true, resizeX = 864, resizeY = 808, upscaler = "Latent"),
-      img2img = Some(Img2ImgParams("source", Some("mask"))))
+      img2img = Some(Img2ImgParams("source")))
     assertEquals(VulkanGraph.nativeSize(p.width, p.height), (832, 768))
     val graph = VulkanHiresGraph.refinement(GenerationRequest(p, "outputs"), "test", Nil, 3,
-      "unet", "text", "", "Vulkan0", customNoise = false, tiled = "", inpaint = true)
+      "unet", "text", "", "Vulkan0", customNoise = false, tiled = "", inpaint = true, masked = true)
     for prefix <- Seq("hr_base", "hr_inpaint_condition", "hr_mask") do
       assert(graph.exists(line => line.startsWith(prefix + " =") && line.contains("size = [112,104]")), prefix)
   }

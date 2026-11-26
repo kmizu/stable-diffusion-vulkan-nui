@@ -3,6 +3,7 @@ package sdfx.vulkan
 import sdfx.core.model.LoraRef
 import sdfx.core.model.GenerationParams
 import sdfx.core.protocol.GenerationRequest
+import sdfx.vulkan.tools.VulkanAestheticTraining
 
 private[vulkan] object VulkanHiresGraph:
   private def q(value: String) = ujson.write(ujson.Str(value))
@@ -22,7 +23,8 @@ private[vulkan] object VulkanHiresGraph:
       inpaint: Boolean = false, lllite: Option[(VulkanLLLite.Config, String)] = None,
       llul: Option[VulkanLlul.Config] = None,
       characteristic: Option[VulkanCharacteristic.Config] = None,
-      composable: Option[ujson.Value] = None, runtimeLoraWeights: Boolean = false): Vector[String] =
+      composable: Option[ujson.Value] = None, runtimeLoraWeights: Boolean = false,
+      aesthetic: Option[VulkanAestheticTraining.Conditioning] = None, masked: Boolean = false): Vector[String] =
     import VulkanProtocol.{invalid,unsupported}
     val p = req.params
     val h = p.hires
@@ -78,13 +80,13 @@ private[vulkan] object VulkanHiresGraph:
       ", concat = hr_inpaint_condition"
     else ""
     val aa = h.upscaler.contains("antialiased")
-    val randomAlgorithm = if llul.nonEmpty || characteristic.nonEmpty || composable.nonEmpty then "cuda" else "cpu"
+    val randomAlgorithm = if llul.nonEmpty || characteristic.nonEmpty || composable.nonEmpty || aesthetic.nonEmpty then "cuda" else "cpu"
     lines += s"""hr_rng = make_rng("$randomAlgorithm", seed = $seed)"""
     if h.upscaler.startsWith("Latent") then
       lines += s"hr_base = tensor::interpolate(latent, size = [${width/8},${height/8}], mode = ${q(method)}, antialias = $aa)"
     else
       val saturation = cdTuner.fold("")(_.decoderArgs)
-      val floatPixels = characteristic.nonEmpty
+      val floatPixels = characteristic.nonEmpty || aesthetic.nonEmpty
       val dtype = if floatPixels then ", dtype = \"f32\"" else ""
       lines += s"hr_pixels = vae_decode(vae, unet_to_vae_latents(vae, latent)$tiled$saturation$dtype)"
       val pixelModel = req.upscalerPaths.get(h.upscaler)
@@ -116,11 +118,12 @@ private[vulkan] object VulkanHiresGraph:
       val cdt = cdTuner.fold("")(t => t.args(t.weights(areaRatio, baseSteps), "cdt_map", name == "neg",
         colorShift = grown, high = true, colorMapped = grown))
       val ref = reference.fold("")(_.args("hr_ref", positive = name == "pos"))
-      val encoded = s"encode_prompt($text, ${q(prompt)}, $encoding)"
-      val blank = if name != "neg" || prompt.nonEmpty then ""
+      val encoded = aesthetic.fold(s"encode_prompt($text, ${q(prompt)}, $encoding)")(
+        _.encode(s"hr_${name}_condition", text, prompt, encoding, name == "neg", lines))
+      val blank = if name != "neg" || aesthetic.fold(prompt.nonEmpty)(_ => prompt.trim.nonEmpty) then ""
         else if lllite.nonEmpty then ", lllite_blank_negative = true"
         else if llul.nonEmpty then ", llul_blank_negative = true"
-        else if characteristic.nonEmpty then ", sdxl_blank_negative = true"
+        else if characteristic.nonEmpty || aesthetic.nonEmpty then ", sdxl_blank_negative = true"
         else ""
       val condition = controlWeight.fold(encoded)(weight =>
         s"controlnet::apply($encoded, control_model, hr_control_hint, strength = $weight)")
@@ -141,7 +144,7 @@ private[vulkan] object VulkanHiresGraph:
     lines += s"hr_sigmas = hr_full[${full-count}:]"
     val noise = if customNoise then "hr_noise" else "tensor::randn_like(hr_base, rng = hr_rng)"
     lines += s"hr_start = add_noise($schedulePredictor, hr_base, $noise, sigma = hr_sigmas[0])"
-    val mask = if p.img2img.exists(_.mask.nonEmpty) then
+    val mask = if masked then
       val sourceMask = if inpaint then "denoise_mask" else "latent_mask"
       lines += s"""hr_mask = tensor::interpolate($sourceMask, size = [${width/8},${height/8}], mode = "nearest_max")"""
       ", base = hr_base, denoise_mask = hr_mask"

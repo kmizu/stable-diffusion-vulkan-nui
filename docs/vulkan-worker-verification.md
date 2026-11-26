@@ -3,6 +3,16 @@
 
 
 
+## Windows v0.63 — Aesthetic Gradients with ControlNet and Hires
+
+Matched-seed masked img2img ran with a balanced Canny unit on Radeon 780M using SD1.5 at 512 × 512 and RTX 3090 using SDXL at 768 × 768. Removing the unit or changing the Aesthetic blend weight from 0.85 to 0.01 changed the generated region on both adapters. All three comparisons on each adapter preserved every unmasked RGB channel.
+
+RTX 3090 also ran SD1.5 from 512 × 512 to 576 × 576 through built-in Latent Hires and through the separate Img2Img Hires Fix. Both used Canny and different prompts for the two passes. The Latent Hires result preserved the Lanczos-resized source wherever the resized mask was zero. Radeon 780M ran built-in Lanczos Hires with the same prompt in both passes and reused one trained overlay. The separate refinement operates on the resized result of the base pass. The short test images were inspected. Zero mask blur left visible edges on the masked images.
+
+The staged `SDV-NUI.exe` ran the separate Img2Img Hires Fix through MCP on Radeon 780M with SD1.5 at 576 × 576 and on RTX 3090 with SDXL at 832 × 832. Both used Canny and a different refinement prompt. The runtime reported `cuda=false`, loaded two distinct CLIP-L overlays and wrote the embedding fingerprint and refinement settings to the PNG. The short packaged outputs retained a recognizable subject with visible texture artifacts.
+
+All 69 Vulkan worker tests and 15 aesthetic and Img2Img Hires plugin tests passed. The ZIP SHA-256 is `c6fa30988ce15b6c3c5bbd36169562b202c4459a2393095e3015dd5779b3fd0f`. The archived launcher, desktop JAR, worker JAR and inference DLL matched the tested staging files.
+
 ## Windows v0.62 — Aesthetic text interpolation
 
 Both Vulkan adapters projected the first style chunk and trained CLIP-L for three Adam steps with an interpolated target. Independent CPU PyTorch used the same checkpoint tensors, tokens and fractions. At fraction 0.35 with SD1.5, the maximum absolute loss differences were 0.000128 on Radeon 780M and 0.000249 on RTX 3090. At fraction 1.0 with SDXL, they were 0.000162 and 0.002650 respectively. The largest difference came at the first SDXL step on RTX 3090. The v0.61 inference DLL returned an explicit unsupported error for a nonzero style fraction when paired with the new worker.

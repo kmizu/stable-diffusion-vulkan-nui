@@ -35,3 +35,21 @@ class VulkanAestheticTrainingSuite extends munit.FunSuite:
     assertEquals(VulkanAestheticTraining.styleChunk(config.copy(style = "  ")), None)
     assertEquals(VulkanAestheticTraining.styleChunk(config.copy(slerp = false)), None)
   }
+
+  test("personalization leaves a blank negative untouched and uses each refinement caption") {
+    val config = VulkanAestheticTraining.settings(ujson.Obj("embedding" -> "style", "negative" -> true))
+    val captions = Vector.newBuilder[String]
+    val conditioning = VulkanAestheticTraining.Conditioning(config, sdxl = true, caption => {
+      captions += caption
+      "trained"
+    })
+    val lines = Vector.newBuilder[String]
+    conditioning.encode("neg", "base", "   ", "width = 512", negative = true, lines)
+    conditioning.encode("pos", "base", "red fox", "width = 512", negative = false, lines)
+    conditioning.encode("hr_neg", "base", "blue sky", "width = 576", negative = true, lines)
+    val program = lines.result()
+    assertEquals(captions.result(), Vector("blue sky"))
+    assertEquals(program.head, "neg = encode_prompt(base, \"\", width = 512)")
+    assert(program.contains("hr_neg_trained = encode_prompt(trained, \"blue sky\", width = 576)"))
+    assert(program.last.contains("vector = hr_neg_base.vector"))
+  }
