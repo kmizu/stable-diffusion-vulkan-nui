@@ -22,7 +22,7 @@ if ((git -C $source rev-parse --verify --quiet HEAD) -ne $revision) {
 }
 Run git @('-C',$source,'submodule','update','--init','--depth','1','ggml')
 $patchDir=Split-Path $patch
-$patches = @('clip-vision.patch','svd.patch','conditioning-stats.patch','mask-conditioning.patch','unet-hooks.patch','dynamic-threshold.patch','clip-io-options.patch','clip-io-tokens.patch')
+$patches = @('clip-vision.patch','svd.patch','conditioning-stats.patch','mask-conditioning.patch','unet-hooks.patch','dynamic-threshold.patch','clip-io-options.patch','clip-io-tokens.patch','multidiffusion.patch')
 # Compose the patches against the pinned Git tree. Only rewrite sources whose blob changes.
 $oldIndex = $env:GIT_INDEX_FILE
 $patchIndex = Join-Path $Cache ("patches-" + [guid]::NewGuid() + ".index")

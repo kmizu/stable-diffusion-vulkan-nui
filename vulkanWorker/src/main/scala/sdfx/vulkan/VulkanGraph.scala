@@ -32,7 +32,7 @@ private[vulkan] object VulkanGraph:
         renderGraph(engine, device, model, settings, req, hook, prompt, loras, seed, schedule,
           cancelled, tweak, None, Some(scratch), difference, refinementImage)
       }
-    else renderGraph(engine, device, model, settings, req, hook, prompt, loras, seed, schedule, cancelled, tweak, None, None, None, None)
+    else renderGraph(engine, device, model, settings, req, hook, prompt, loras, seed, schedule, cancelled, tweak, None, None, difference, refinementImage)
 
   private def renderGraph(engine: VulkanInference, device: String, model: LoadedModel, settings: LoadModelRequest,
       req: GenerationRequest, hook: String, prompt: String, loras: Seq[LoraRef], seed: Long, schedule: String,
@@ -43,6 +43,10 @@ private[vulkan] object VulkanGraph:
     def check(): Unit = if cancelled() then throw new java.util.concurrent.CancellationException()
     val p = req.params
     val customText = clipIo.nonEmpty || fusionScratch.nonEmpty
+    val tileConfig = p.hooks.get(VulkanUnetHooks.tiledDiffusion).filterNot(_.obj.get("enabled").contains(ujson.Bool(false)))
+    val needsTiles = tileConfig.exists(VulkanUnetHooks.needsTiles(_,p.width,p.height))
+    val tiledDiffusion = VulkanUnetHooks.hooks(hook) && needsTiles
+    val patchedInputs = customText || tiledDiffusion
     val hiresPass = hook == latentHires
     val h = if hiresPass then ujson.Obj() else p.hooks(hook)
     val latentHook = VulkanLatentGraph.hooks(hook)
@@ -53,36 +57,42 @@ private[vulkan] object VulkanGraph:
     val postDiff = Option.when(hook == "postdiff")(new VulkanPostDiff(h,p,model.kind == "sdxl"))
     val unetHooks = Option.when(VulkanUnetHooks.hooks(hook)) {
       if !engine.supportsUnetHooks() then unsupported("This Vulkan runtime lacks U-Net attention and skip hooks")
+      if tiledDiffusion && !engine.supportsTiledDiffusion() then unsupported("This Vulkan runtime lacks MultiDiffusion")
       if !engine.supportsUnetResize() && p.hooks.exists((k,v) => VulkanUnetHooks.resizeHooks(k) && !v.obj.get("enabled").contains(ujson.Bool(false))) then
         unsupported("This Vulkan runtime lacks U-Net resizing hooks")
-      VulkanUnetHooks.parse(p,model.kind=="sdxl",seed)
+      val params = if tiledDiffusion then p else p.copy(hooks = p.hooks - VulkanUnetHooks.tiledDiffusion)
+      VulkanUnetHooks.parse(params,model.kind=="sdxl",seed)
     }
     val unetArgs = unetHooks.fold("")(_.args)
     val sonar = Option.when(hook=="sonar")(new VulkanSonar(h,p,seed))
     val inverse = hook == "img2imgalt"
     if soft.nonEmpty && !p.img2img.exists(_.mask.nonEmpty) then invalid("Soft Inpainting needs an img2img mask")
     if inverse && p.img2img.isEmpty then invalid("img2img Alternative needs an input image")
-    val imageHooks = if customText then Set("conditioning_highres_fix", "inpaint_difference", "img2img_hires_fix") else Set.empty[String]
+    val imageHooks = if patchedInputs then Set("conditioning_highres_fix", "inpaint_difference", "img2img_hires_fix") else Set.empty[String]
     val textHooks = if fusionScratch.nonEmpty then VulkanFusionPrompt.textHooks else Set.empty[String]
     val permitted = Set(hook,"nsfw_checker","aesthetic_score","model_keyword","pnginfo_injection","adetailer","batch_face_swap") ++ imageHooks ++ textHooks ++ Option.when(hiresPass)("hires_fix_tweaks") ++ (if latentHook then VulkanLatentGraph.hooks else Set.empty[String]) ++ (if unetHooks.nonEmpty then VulkanUnetHooks.hooks else Set.empty[String])
     val other = p.hooks.filterNot { (key, value) =>
-      value.obj.get("enabled").contains(ujson.Bool(false)) || !VulkanFusionPrompt.applies(key,p.prompt,p.negativePrompt)
+      value.obj.get("enabled").contains(ujson.Bool(false)) || !VulkanFusionPrompt.applies(key,p.prompt,p.negativePrompt) ||
+        key == VulkanUnetHooks.tiledDiffusion && !needsTiles
     }.keySet -- permitted
-    if other.nonEmpty || p.hires.enabled && !hiresPass || p.controlnet.exists(_.enabled) || VulkanConditioning.activeEmbeddings(req).nonEmpty then
+    if other.nonEmpty || p.hires.enabled && !hiresPass || !tiledDiffusion && p.controlnet.exists(_.enabled) || VulkanConditioning.activeEmbeddings(req).nonEmpty then
       unsupported(s"$hook with other sampling hooks, hires, embeddings or ControlNet")
-    if !customText && up.isEmpty && soft.isEmpty && !hiresPass && p.img2img.exists(_.mask.nonEmpty) then unsupported(s"masked $hook generation")
+    if !patchedInputs && up.isEmpty && soft.isEmpty && !hiresPass && p.img2img.exists(_.mask.nonEmpty) then unsupported(s"masked $hook generation")
     val isVideo = hook == "animatediff"
     if isVideo && model.kind != "sd15" then unsupported("AnimateDiff motion models outside SD1.x")
     if hook == "photomaker" && (model.kind != "sdxl" || p.isImg2Img) then unsupported("PhotoMaker outside SDXL txt2img")
     if fusionScratch.nonEmpty && !Set("sd15", "sdxl", "SD 2.x", "SD 1.x Inpaint", "SD 2.x Inpaint", "SDXL Inpaint")(model.kind) then
       unsupported("Prompt Fusion with this checkpoint family")
-    val inpaint = customText && (Set("SD 1.x Inpaint", "SDXL Inpaint")(model.kind) ||
-      fusionScratch.nonEmpty && model.kind == "SD 2.x Inpaint")
+    val sd2 = fusionScratch.nonEmpty || tiledDiffusion
+    val inpaint = patchedInputs && (Set("SD 1.x Inpaint", "SDXL Inpaint")(model.kind) ||
+      sd2 && model.kind == "SD 2.x Inpaint")
+    if tiledDiffusion && !Set("sd15", "sdxl", "SD 2.x", "SD 1.x Inpaint", "SD 2.x Inpaint", "SDXL Inpaint")(model.kind) then
+      unsupported("MultiDiffusion with this checkpoint family")
     val family = model.kind match
       case "SDXL Inpaint" if inpaint => "sdxl_inpaint"
       case "SD 1.x Inpaint" if inpaint => "sd1_inpaint"
-      case "SD 2.x Inpaint" if inpaint && fusionScratch.nonEmpty => "sd2_inpaint"
-      case "SD 2.x" if fusionScratch.nonEmpty => "sd2"
+      case "SD 2.x Inpaint" if inpaint && sd2 => "sd2_inpaint"
+      case "SD 2.x" if sd2 => "sd2"
       case "sdxl" => "sdxl"
       case _ => "sd1"
     val options = VulkanConditioning.options(settings, device)
@@ -142,7 +152,7 @@ private[vulkan] object VulkanGraph:
     else if unetHooks.nonEmpty || Set("sonar","semantic_guidance","neutral_prompt")(hook) || latentHook || up.nonEmpty || hiresPass || soft.nonEmpty || inverse || postDiff.nonEmpty then
       lines += s"unet = $unet"
       lines += s"latent_pos = encode_prompt($text, ${quoted(prompt)}, $enc)"
-      lines += s"pos = predictor(unet, latent_pos$unetArgs)"
+      if !patchedInputs then lines += s"pos = predictor(unet, latent_pos$unetArgs)"
       1
     else if hook == "revision" then
       if family != "sdxl" then unsupported("Revision outside SDXL")
@@ -203,11 +213,15 @@ private[vulkan] object VulkanGraph:
       clipIo match
         case Some(session) => session.build("neg", p.negativePrompt, text, enc, textProgram, engine, () => check(), lines)
         case None => lines += s"latent_neg = encode_prompt($text, ${quoted(p.negativePrompt)}, $enc)"
-      if clipIo.isEmpty then lines += s"neg = predictor(unet, latent_neg$unetArgs)"
+      if !patchedInputs then lines += s"neg = predictor(unet, latent_neg$unetArgs)"
     val positive = if hook == "semantic_guidance" then VulkanSemanticGuidance.prepare(h,text,enc,family=="sdxl",lines) else "pos"
-    val guidance = unetHooks.fold(s"guided = cfg($positive, neg, scale = ${p.cfgScale})")(_.guidance(p.cfgScale))
-    if !customText then lines += guidance
-    val maskGraph = customText && (inpaint || difference.nonEmpty || p.img2img.exists(_.mask.nonEmpty))
+    val concat = if inpaint then ", concat = inpaint_condition" else ""
+    val control = Option.when(tiledDiffusion)(VulkanConditioning.control(req,cancelled)).flatten
+    val positiveInput = if control.nonEmpty then "controlled_pos" else "latent_pos"
+    val negativeInput = if control.nonEmpty then "controlled_neg" else "latent_neg"
+    val guidance = unetHooks.fold(s"guided = cfg($positive, neg, scale = ${p.cfgScale})")(_.guidance(p.cfgScale,concat,positiveInput))
+    if !patchedInputs then lines += guidance
+    val maskGraph = patchedInputs && (inpaint || difference.nonEmpty || p.img2img.exists(_.mask.nonEmpty))
     // The native image pipeline defaults to the CPU implementation of the CUDA-compatible RNG.
     val randomAlgorithm = if maskGraph then "cuda" else "cpu"
     lines += s"rng = make_rng(\"$randomAlgorithm\", seed = $seed)"
@@ -261,13 +275,19 @@ private[vulkan] object VulkanGraph:
         case None => lines += "masked_latent = tensor::zeros_like(base)"
       lines += "inpaint_condition = tensor::concat([latent_mask, masked_latent], axis = 2)"
       lines += "denoise_mask = tensor::max_pool2d(latent_mask, kernel = [3,3], padding_before = [1,1], padding_after = [1,1])"
-    if customText then
-      val extra = if inpaint then ", concat = inpaint_condition" else ""
+    if patchedInputs then
+      control.foreach { (modelPath, image, weight) =>
+        inputs("control_image") = image
+        lines += s"control_model = controlnet::load(${quoted(modelPath)}, $common)"
+        lines += "control_hint = image::to_f32(control_image)"
+        lines += s"controlled_pos = controlnet::apply(latent_pos, control_model, control_hint, strength = $weight)"
+        lines += s"controlled_neg = controlnet::apply(latent_neg, control_model, control_hint, strength = $weight)"
+      }
       fusion match
-        case Some(schedule) => schedule.predictors(extra,lines)
+        case Some(schedule) => schedule.predictors(concat,lines)
         case None =>
-          lines += s"pos = predictor(unet, latent_pos$extra)"
-          lines += s"neg = predictor(unet, latent_neg$extra)"
+          lines += s"pos = predictor(unet, $positiveInput$concat$unetArgs)"
+          lines += s"neg = predictor(unet, $negativeInput$concat$unetArgs)"
       lines += guidance
     val fullSteps = up.fold(p.steps)(_.fullSteps)
     val scheduleName = up.fold(schedule)(_.scheduler)

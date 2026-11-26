@@ -1,0 +1,184 @@
+diff --git a/src/dgl/models/diffusion_prediction.h b/src/dgl/models/diffusion_prediction.h
+--- a/src/dgl/models/diffusion_prediction.h
++++ b/src/dgl/models/diffusion_prediction.h
+@@ -35,6 +35,8 @@
+
+     struct DiffusionPredictionOptions {
+         sd::nui::UNetOptions unet_hooks;
++        int diffusion_tile_width = 0, diffusion_tile_height = 0, diffusion_tile_overlap = 0;
++        bool gaussian_tile_blending = false;
+         sd::Tensor<float> vace_context, audio_embedding, video_positions;
+         std::vector<int> skip_layers;
+         float guidance                      = 3.5f;
+diff --git a/src/dgl/bindings/predictor.cpp b/src/dgl/bindings/predictor.cpp
+--- a/src/dgl/bindings/predictor.cpp
++++ b/src/dgl/bindings/predictor.cpp
+@@ -30,6 +30,10 @@
+         predictor.circular_x = get_bool(args, "circular_x");
+         predictor.circular_y = get_bool(args, "circular_y");
+         auto& options        = predictor.options;
++        options.diffusion_tile_width = int(get_int(args, "diffusion_tile_width"));
++        options.diffusion_tile_height = int(get_int(args, "diffusion_tile_height"));
++        options.diffusion_tile_overlap = int(get_int(args, "diffusion_tile_overlap"));
++        options.gaussian_tile_blending = get_bool(args, "gaussian_tile_blending");
+         auto& hooks = options.unet_hooks;
+         hooks.backbone[0] = float(get_number(args,"freeu_b1"));
+         hooks.backbone[1] = float(get_number(args,"freeu_b2"));
+diff --git a/src/dgl/bindings/registration.cpp b/src/dgl/bindings/registration.cpp
+--- a/src/dgl/bindings/registration.cpp
++++ b/src/dgl/bindings/registration.cpp
+@@ -603,6 +603,8 @@
+              number("token_factor",1,5,1), number("token_factor2",1,5,1), integer("token_depth",1,2,1), integer("token_evaluations",0,10000,0),
+              integer("shrink_block",0,32,0), number("shrink_factor",0.1,9,1), number("shrink_t_lo",0,999,0), number("shrink_t_hi",0,999,999),
+              integer("shrink_down_mode",0,3,2), integer("shrink_up_mode",0,3,2), optional("shrink_after_skip",Kind::Boolean,true),
++             integer("diffusion_tile_width",0,512,0), integer("diffusion_tile_height",0,512,0),
++             integer("diffusion_tile_overlap",0,512,0), optional("gaussian_tile_blending", Kind::Boolean, false),
+              integer("pag_regions",0,511,0), std::move(transform), optional("transform_args", Kind::Dict)},
+             {Kind::Predictor}, make_predictor);
+         const std::vector<Argument> guidance_branches{
+diff --git a/src/dgl/models/dit.cpp b/src/dgl/models/dit.cpp
+--- a/src/dgl/models/dit.cpp
++++ b/src/dgl/models/dit.cpp
+@@ -11,6 +11,7 @@
+ #include "dgl/models/control.h"
+ #include "dgl/models/denoising_parameterization.h"
+ #include "dgl/models/diffusion_prediction.h"
++#include "dgl/models/tiled_unet.h"
+ #include "model/diffusion/animatediff.hpp"
+ #include "model/diffusion/minimax_h3.hpp"
+ #include "model/diffusion/z_image.hpp"
+@@ -411,7 +412,16 @@
+             params.extra = ZImageDiffusionExtra{nullptr, 1.f, &z_image_controls};
+         }
+         diffusion_model->clear_device_memory_error();
+-        auto result = diffusion_model->compute(n_threads, params);
++        auto compute = [&](const DiffusionParams& local) {
++            return diffusion_model->compute(n_threads, local);
++        };
++        const bool tiled = options.diffusion_tile_width > 0 && options.diffusion_tile_height > 0 &&
++                           (shape[0] > options.diffusion_tile_width || shape[1] > options.diffusion_tile_height);
++        if (tiled && (!sd_version_is_unet(version()) || shape.size() != 4 || options.unet_hooks.sag_capture))
++            throw std::runtime_error("MultiDiffusion requires a 2D U-Net without SAG capture");
++        auto result = tiled
++            ? predict_unet_tiles(params, options, down_factor, sd::nui::active, compute)
++            : compute(params);
+         if (result.empty()) {
+             const auto& error = diffusion_model->device_memory_error();
+             if (!error.empty()) {
+diff --git a/src/dgl/models/tiled_unet.h b/src/dgl/models/tiled_unet.h
+new file mode 100644
+--- /dev/null
++++ b/src/dgl/models/tiled_unet.h
+@@ -0,0 +1,112 @@
++#ifndef __SD_DGL_MODELS_TILED_UNET_H__
++#define __SD_DGL_MODELS_TILED_UNET_H__
++
++#include <algorithm>
++#include <cmath>
++#include <stdexcept>
++#include <vector>
++
++#include "dgl/models/diffusion_prediction.h"
++#include "model/diffusion/model.hpp"
++
++namespace sd::dgl::models {
++    inline std::vector<int64_t> diffusion_tile_offsets(int64_t size, int64_t tile, int overlap) {
++        const auto extent = size - tile;
++        if (extent == 0)
++            return {0};
++        const auto stride = std::max<int64_t>(1, tile - overlap);
++        const auto intervals = (extent + stride - 1) / stride;
++        std::vector<int64_t> offsets;
++        offsets.reserve(intervals + 1);
++        for (int64_t i = 0; i <= intervals; ++i) {
++            const auto numerator = i * extent;
++            const auto floor = numerator / intervals;
++            const auto twice_remainder = 2 * (numerator % intervals);
++            offsets.push_back(floor + (twice_remainder > intervals ||
++                                       (twice_remainder == intervals && floor % 2 != 0)));
++        }
++        return offsets;
++    }
++
++    inline Tensor<float> crop_unet_tile(const Tensor<float>& tensor, int64_t x, int64_t y,
++                                        int64_t width, int64_t height, int64_t canvas_w, int64_t canvas_h) {
++        const auto w = tensor.shape()[0];
++        const auto h = tensor.shape()[1];
++        const auto x0 = x * w / canvas_w;
++        const auto y0 = y * h / canvas_h;
++        return ops::narrow(ops::narrow(tensor, 0, x0, std::max<int64_t>(1, width*w/canvas_w)),
++                           1, y0, std::max<int64_t>(1, height*h/canvas_h));
++    }
++
++    inline std::vector<float> diffusion_tile_weights(int64_t width, int64_t height, bool gaussian) {
++        std::vector<float> weights(width * height, 1.f);
++        if (gaussian) {
++            const auto exponent = [](int64_t i, int64_t size) {
++                const double delta = (i - (size - 1) / 2.) / size;
++                return -delta * delta / .02;
++            };
++            const double peak = std::exp(exponent(width/2,width) + exponent(height/2,height));
++            for (int64_t y = 0; y < height; ++y)
++                for (int64_t x = 0; x < width; ++x)
++                    weights[y*width+x] = float(std::max(peak*.001, std::exp(exponent(x,width) + exponent(y,height))));
++        }
++        return weights;
++    }
++
++    template <typename Active, typename Compute>
++    Tensor<float> predict_unet_tiles(const DiffusionParams& params, const DiffusionPredictionOptions& options,
++                                     int factor, Active& active, Compute compute) {
++        const auto& shape = params.x->shape();
++        const auto w = shape[0], h = shape[1];
++        const auto tw = std::min<int64_t>(w, options.diffusion_tile_width);
++        const auto th = std::min<int64_t>(h, options.diffusion_tile_height);
++        if (tw % factor || th % factor)
++            throw std::runtime_error("MultiDiffusion tile size is incompatible with the U-Net downsampling factor");
++        const auto xs = diffusion_tile_offsets(w, tw, options.diffusion_tile_overlap);
++        const auto ys = diffusion_tile_offsets(h, th, options.diffusion_tile_overlap);
++        const auto weights = diffusion_tile_weights(tw,th,options.gaussian_tile_blending);
++        Tensor<float> result(shape);
++        std::vector<float> total(w*h,0.f);
++        const auto planes = shape[2]*shape[3];
++        for (const auto y : ys) {
++            for (const auto x : xs) {
++                auto crop = [&](const Tensor<float>& input) { return crop_unet_tile(input,x,y,tw,th,w,h); };
++                auto local = params;
++                const auto tile = crop(*params.x);
++                const auto concat = params.c_concat ? crop(*params.c_concat) : Tensor<float>{};
++                local.x = &tile;
++                local.c_concat = params.c_concat ? &concat : nullptr;
++                std::vector<Tensor<float>> residuals;
++                auto& extra = std::get<UNetDiffusionExtra>(local.extra);
++                if (extra.controls) {
++                    residuals.reserve(extra.controls->size());
++                    for (const auto& control : *extra.controls)
++                        residuals.push_back(control.empty() ? Tensor<float>{} : crop(control));
++                    extra.controls = &residuals;
++                }
++                active.spatial_w = int(tw);
++                active.spatial_h = int(th);
++                const auto prediction = compute(local);
++                if (prediction.empty())
++                    return {};
++                if (prediction.shape() != tile.shape())
++                    throw std::runtime_error("MultiDiffusion U-Net returned a mismatched tile");
++                for (int64_t row = 0; row < th; ++row) {
++                    const auto canvas_row = (y+row)*w+x;
++                    const auto tile_row = row*tw;
++                    for (int64_t col = 0; col < tw; ++col) {
++                        const auto src = tile_row+col, dst = canvas_row+col;
++                        const auto weight = weights[src];
++                        total[dst] += weight;
++                        for (int64_t plane = 0; plane < planes; ++plane)
++                            result.data()[plane*w*h+dst] += prediction.data()[plane*tw*th+src]*weight;
++                    }
++                }
++            }
++        }
++        tensor_for_each(result.numel(), [&](int64_t i) { result.data()[i] /= total[i % (w*h)]; });
++        return result;
++    }
++}
++
++#endif

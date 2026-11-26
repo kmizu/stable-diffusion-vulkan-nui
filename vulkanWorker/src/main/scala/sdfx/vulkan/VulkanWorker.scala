@@ -90,6 +90,7 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
     "features" -> Arr.from(Vector("txt2img", "aesthetic_embedding", "aesthetic_score", "lora", "embeddings", "external_vae", "controlnet", "img2img", "animatediff", "animatediff_encode", "photomaker", "inpaint", "hires_fix", "img2img_hires_fix", "temporal_lab", "vae_tools", "list_devices", "system_info", "vram_estimator", "prevent_interrupt", VulkanClipIo.id, VulkanFusionPrompt.id, VulkanWeightGradient.id) ++ VulkanTools.features ++
       (if backend.supportsUnetHooks() then VulkanUnetHooks.attentionHooks.toVector.sorted else Vector.empty) ++
       (if backend.supportsUnetResize() then VulkanUnetHooks.resizeHooks.toVector.sorted else Vector.empty) ++
+      Option.when(backend.supportsTiledDiffusion())(VulkanUnetHooks.tiledDiffusion).toVector ++
       Option.when(backend.supportsDynamicThreshold())("dynamic_thresholding") ++
       (if backend.supportsSvd() then Vector("img2vid","novel_view") else Vector.empty) ++ Option.when(sdfx.vulkan.tools.VulkanCharaImport.available)("chara_searcher") ++ Option.when(sdfx.vulkan.tools.VulkanBlip.available && !sdfx.vulkan.tools.VulkanWdTagger.available)("caption") ++ Option.when(sdfx.vulkan.tools.VulkanCustomCode.enabled)("custom_code") ++ sdfx.vulkan.tools.VulkanWdTagger.features ++ Option.when(sdfx.vulkan.tools.VulkanFaceRestore.available)("face_restore") ++ Vector("vulkan_nsfw") ++ Option.when(sdfx.vulkan.tools.VulkanSafety.available)("nsfw_checker")))
 
@@ -401,6 +402,12 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
       case e: VulkanInference.NativeFailure => throw e
       case NonFatal(e) => throw EngineError("model_load_failed", s"${display(device)}: ${e.getMessage}")
 
+  private def resolveControls(req: GenerationRequest, job: Job): Map[String,String] =
+    val selected = req.params.controlnet.iterator.filter(_.enabled).map(_.model).toSet
+    req.controlnetPaths.collect { case (name,path) if selected(name) =>
+      name -> controlModels.resolve(path,currentModel.kind,() => job.cancelled)
+    }
+
   private def prepareConditioning(req: GenerationRequest, job: Job, resources: Option[VulkanHashes.Run] = None): VulkanInference.Conditioning =
     val previous = loadRequest.get
     req.params.vae.filter(_.nonEmpty).foreach { name =>
@@ -408,10 +415,7 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
         else previous.vaePath.exists(path => path == name || VulkanConditioning.stem(path) == name.replace('\\', '/').split('/').last)
       if !matches then invalid(s"Select VAE '$name' with set_vae before generation")
     }
-    val selected = req.params.controlnet.filter(_.enabled).map(_.model).toSet
-    val controls = req.controlnetPaths.collect { case (name,path) if selected(name) =>
-      name -> controlModels.resolve(path,currentModel.kind,() => job.cancelled)
-    }
+    val controls = resolveControls(req,job)
     val (control, conditioning) = VulkanConditioning.prepare(req.copy(controlnetPaths = controls), previous, () => job.cancelled)
     val names = req.embeddingPaths.map(VulkanConditioning.stem).toSet
     val extra = toolSession.embeddingPaths(currentModel).filterNot(p => names(VulkanConditioning.stem(p)))
@@ -484,9 +488,11 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
       val image = sdfx.vulkan.tools.DiffusionImageInput.readRgb(Path.of(path), maxBytes = 200000000L)
       (image, VulkanTools.differenceMask(config, image, () => job.cancelled))
     }
-    val graph = p.hooks.keysIterator.find(k => VulkanGraph.hooks(k) &&
-      !p.hooks(k).obj.get("enabled").contains(ujson.Bool(false)) && VulkanFusionPrompt.applies(k,p.prompt,p.negativePrompt))
+    val graph = p.hooks.iterator.collectFirst { case (key, config) if VulkanGraph.hooks(key) &&
+      !config.obj.get("enabled").contains(ujson.Bool(false)) && VulkanFusionPrompt.applies(key,p.prompt,p.negativePrompt) &&
+      (key != VulkanUnetHooks.tiledDiffusion || VulkanUnetHooks.needsTiles(config,p.width,p.height)) => key }
       .orElse(Option.when(tweak.nonEmpty || separateHires && p.hires.upscaler.startsWith("Latent"))(VulkanGraph.latentHires))
+    val graphRequest = if graph.nonEmpty || refinement.nonEmpty then req.copy(controlnetPaths = resolveControls(req,job)) else req
     val temperature = p.hooks.get("gpu_temperature_guard").filterNot(_.obj.get("enabled").contains(ujson.Bool(false))).map { h =>
       if graph.nonEmpty then unsupported("GPU temperature guard in custom DGL graphs")
       val tools = sdfx.vulkan.tools.NativeTemperatureGuard
@@ -522,7 +528,7 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
         prepareConditioning(adapted, job, resources)
       }
       val rendered = graph match
-        case Some(hook) => VulkanGraph.render(backend, device.id(), model, loadRequest.get, req, hook,
+        case Some(hook) => VulkanGraph.render(backend, device.id(), model, loadRequest.get, graphRequest, hook,
           activePrompt, planned.fold(p.loras)(_.loras), seed, gen.scheduler, () => job.cancelled, pass, difference)
         case None =>
           val generated = backend.generate(activePrompt, p.negativePrompt, p.width, p.height, p.steps, p.cfgScale, seed,
@@ -583,15 +589,21 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
             }
             val textGraph = scheduleHooks.keysIterator.find(key => VulkanFusionPrompt.applies(key,prompt,negative))
             if clip.nonEmpty && textGraph.nonEmpty then unsupported("Clip I/O and prompt scheduling in the same refinement")
+            val unetHooks = p.hooks.filter { (key, value) =>
+              VulkanUnetHooks.hooks(key) && !value.obj.get("enabled").contains(ujson.Bool(false))
+            }
+            val tiled = unetHooks.get(VulkanUnetHooks.tiledDiffusion).exists(VulkanUnetHooks.needsTiles(_,w,ht))
+            if tiled && (clip.nonEmpty || textGraph.nonEmpty) then unsupported("MultiDiffusion and custom text conditioning in the same refinement")
             val refinementGraph = clip.map(value => VulkanClipIo.id -> Map(VulkanClipIo.id -> value))
               .orElse(textGraph.map(_ -> scheduleHooks))
+              .orElse(Option.when(tiled)(VulkanUnetHooks.tiledDiffusion -> unetHooks))
             refinementGraph match
               case Some((hook, hooks)) =>
                 val params = refinementParams.copy(prompt = prompt, negativePrompt = negative,
                   samplerName = sampler, scheduler = actualSchedule,
                   img2img = p.img2img.map(_.copy(mask = None, denoisingStrength = strength)),
                   hooks = hooks)
-                VulkanGraph.render(backend, device.id(), model, loadRequest.get, req.copy(params = params),
+                VulkanGraph.render(backend, device.id(), model, loadRequest.get, graphRequest.copy(params = params),
                   hook, prompt, params.loras, seed, actualSchedule, () => job.cancelled,
                   refinementImage = Some(resized)).head
               case None =>

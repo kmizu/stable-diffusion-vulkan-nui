@@ -6,15 +6,26 @@ import ujson.Value
 private[vulkan] object VulkanUnetHooks:
   val attentionHooks = Set("freeu","hypertile","pag","sag")
   val resizeHooks = Set("kohya_hrfix","token_downsampling")
-  val hooks = attentionHooks ++ resizeHooks
+  val tiledDiffusion = "multidiffusion"
+  val hooks = attentionHooks ++ resizeHooks + tiledDiffusion
+
+  private def tileSize(options: Value, key: String): Int =
+    val value = options.obj.get(key).fold(768.0)(_.num)
+    require(value.isWhole && value >= 1 && value <= 4096, s"Invalid $key")
+    math.max(8,value.toInt/8)
+
+  def needsTiles(options: Value, width: Int, height: Int): Boolean =
+    val tw = tileSize(options,"tile_width")
+    val th = tileSize(options,"tile_height")
+    width/8 > tw || height/8 > th
 
   final case class Settings(args: String, regions: Int, pagScale: Double, adaptive: Double, sagScale: Double):
-    def guidance(cfg: Double): String =
+    def guidance(cfg: Double, concat: String, condition: String): String =
       if pagScale == 0 then s"guided = cfg(pos, neg, scale = $cfg, sag_scale = $sagScale)"
       else
         val g = math.max(1.0,cfg)
         val guided = if cfg > 1 then s"cfg(enhanced,neg,scale=$cfg)" else "enhanced"
-        s"perturbed = predictor(unet,latent_pos$args,pag_regions=$regions)\n" +
+        s"perturbed = predictor(unet,$condition$concat$args,pag_regions=$regions)\n" +
           s"enhanced = cfg(pos,perturbed,scale=${1+pagScale/g},pag_adaptive_decay=${adaptive/g})\n" +
           s"guided = $guided"
 
@@ -29,6 +40,15 @@ private[vulkan] object VulkanUnetHooks:
       require(v.isWhole,s"$k must be an integer")
       v.toInt
     val args = new StringBuilder
+    enabled(tiledDiffusion).foreach { o =>
+      val method = o.obj.get("method").fold("MultiDiffusion")(_.str)
+      require(Set("MultiDiffusion", "Mixture of Diffusers")(method), "Invalid MultiDiffusion method")
+      val width = tileSize(o,"tile_width")
+      val height = tileSize(o,"tile_height")
+      val overlap = int(o,"tile_overlap",64,0,4096)/8
+      args ++= s",diffusion_tile_width=$width,diffusion_tile_height=$height,diffusion_tile_overlap=$overlap"
+      args ++= s",gaussian_tile_blending=${method == "Mixture of Diffusers"}"
+    }
     enabled("freeu").foreach { o =>
       Seq(("b1",if xl then 1.3 else 1.5,2),("b2",if xl then 1.4 else 1.6,2),("s1",0.9,4),("s2",0.2,4))
         .foreach { (k,d,max) => args ++= s",freeu_$k=${num(o,k,d,0,max)}" }

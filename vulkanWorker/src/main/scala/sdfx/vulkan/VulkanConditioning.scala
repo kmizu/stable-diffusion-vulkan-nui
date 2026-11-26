@@ -83,6 +83,20 @@ private[vulkan] object VulkanConditioning:
     }
     args.result().mkString(",")
 
+  def control(req: GenerationRequest, cancelled: () => Boolean): Option[(String, BufferedImage, Double)] =
+    val p = req.params
+    val units = p.controlnet.filter(_.enabled)
+    if units.size > 1 then unsupported("multiple simultaneous ControlNet units")
+    units.headOption.map { u =>
+      if u.guidanceStart != 0 || u.guidanceEnd != 1 || u.controlMode != "Balanced" then
+        unsupported("ControlNet guidance intervals and unbalanced control modes")
+      if !u.weight.toFloat.isFinite then invalid("Invalid ControlNet weight")
+      val model = file(req.controlnetPaths.getOrElse(u.model, invalid(s"Unresolved ControlNet: ${u.model}")), "ControlNet")
+      val source = u.image.orElse(p.img2img.map(_.initImage)).getOrElse(invalid("ControlNet requires a condition image"))
+      val image = sdfx.vulkan.tools.VulkanTools.controlImage(u, source, p.width, p.height, cancelled)
+      (model, image, u.weight)
+    }
+
   def prepare(req: GenerationRequest, load: LoadModelRequest, cancelled: () => Boolean = () => false): (String, VulkanInference.Conditioning) =
     val p = req.params
     if p.hires.enabled && !VulkanImageInputs.separateHires(req) && req.hiresLoras.exists(_ != p.loras) then unsupported("different LoRAs for the hires pass")
@@ -92,17 +106,7 @@ private[vulkan] object VulkanConditioning:
         unsupported(s"separate text/U-Net, block, timing or dynamic LoRA settings for ${l.name}")
       new VulkanInference.Lora(file(req.loraPaths.getOrElse(l.name, invalid(s"Unresolved LoRA: ${l.name}")), "LoRA"), l.weight.toFloat)
     }
-    val units = p.controlnet.filter(_.enabled)
-    if units.size > 1 then unsupported("multiple simultaneous ControlNet units")
-    val control = units.headOption.map { u =>
-      if u.guidanceStart != 0 || u.guidanceEnd != 1 || u.controlMode != "Balanced" then
-        unsupported("ControlNet guidance intervals and unbalanced control modes")
-      if !u.weight.toFloat.isFinite then invalid("Invalid ControlNet weight")
-      val model = file(req.controlnetPaths.getOrElse(u.model, invalid(s"Unresolved ControlNet: ${u.model}")), "ControlNet")
-      val source = u.image.orElse(p.img2img.map(_.initImage)).getOrElse(invalid("ControlNet requires a condition image"))
-      val image = sdfx.vulkan.tools.VulkanTools.controlImage(u, source, p.width, p.height, cancelled)
-      (model, image, u.weight)
-    }
+    val controlInput = control(req, cancelled)
     val tiling = activeHook(p.hooks,"tiling")
     def tile(key: String) = tiling.exists(_.obj.get(key).forall(_.bool))
     tiling.foreach { options =>
@@ -111,5 +115,5 @@ private[vulkan] object VulkanConditioning:
       if start > 0 || (stop >= 0 && stop < p.steps) then unsupported("step-limited circular padding")
     }
     val tiledVae = activeHook(p.hooks,"neveroom").flatMap(_.obj.get("vae_tiling")).exists(_.bool)
-    (control.fold("")(_._1), new VulkanInference.Conditioning(loras.asJava, control.map(_._2).orNull,
-      control.fold(1.0)(_._3), load.vaeTiling || tiledVae, load.vaeAuto, tile("tile_x"), tile("tile_y"),sampleArgs(p)))
+    (controlInput.fold("")(_._1), new VulkanInference.Conditioning(loras.asJava, controlInput.map(_._2).orNull,
+      controlInput.fold(1.0)(_._3), load.vaeTiling || tiledVae, load.vaeAuto, tile("tile_x"), tile("tile_y"),sampleArgs(p)))

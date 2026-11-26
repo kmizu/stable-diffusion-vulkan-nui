@@ -657,6 +657,10 @@ public final class VulkanInference implements AutoCloseable {
         return symbols.find("sd_nui_unet_resize_supported").isPresent();
     }
 
+    public boolean supportsTiledDiffusion() {
+        return cString(ptr("sd_dgl_builtin_catalog")).contains("`diffusion_tile_width?");
+    }
+
     public boolean supportsDynamicThreshold() {
         return cString(ptr("sd_dgl_builtin_catalog")).contains("| `dynthresh_scale` |");
     }
