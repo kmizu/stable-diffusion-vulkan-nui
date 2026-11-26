@@ -10,7 +10,9 @@ private[vulkan] object VulkanHiresGraph:
   def refinement(req: GenerationRequest, firstPrompt: String, firstLoras: Seq[LoraRef], seed: Long,
       baseUnet: String, baseText: String, eta: String, device: String, customNoise: Boolean, tiled: String,
       cdTuner: Option[VulkanCdTuner.Options] = None, cacheArgs: String = "",
-      reference: Option[VulkanReference.Config] = None): Vector[String] =
+      reference: Option[VulkanReference.Config] = None,
+      agent: Option[VulkanAgentAttention.Config] = None, controlWeight: Option[Double] = None,
+      inpaint: Boolean = false): Vector[String] =
     import VulkanProtocol.{invalid,unsupported}
     val p = req.params
     val h = p.hires
@@ -47,12 +49,21 @@ private[vulkan] object VulkanHiresGraph:
     val areaRatio = width.toDouble * height / (p.width.toDouble * p.height)
     val baseSteps = p.img2img.fold(p.steps)(i => ((p.steps * i.denoisingStrength).toInt + 1).min(p.steps))
     reference.foreach(config => lines ++= config.prepare("hr_ref", tiled))
+    val agentArgs = agent.fold("")(_.args(seed, hires = true))
+    controlWeight.foreach(_ => lines += "hr_control_hint = image::to_f32(hr_control_image)")
+    val concat = if inpaint then
+      lines += s"hr_inpaint_condition = tensor::interpolate(inpaint_condition, size = [${width/8},${height/8}])"
+      ", concat = hr_inpaint_condition"
+    else ""
     for (name,prompt) <- Seq("pos" -> selected(h.prompt,firstPrompt), "neg" -> selected(h.negativePrompt,p.negativePrompt)) do
       val grown = areaRatio > 1
       val cdt = cdTuner.fold("")(t => t.args(t.weights(areaRatio, baseSteps), "cdt_map", name == "neg",
         colorShift = grown, high = true, colorMapped = grown))
       val ref = reference.fold("")(_.args("hr_ref", positive = name == "pos"))
-      lines += s"hr_$name = predictor($unet, encode_prompt($text, ${q(prompt)}, $encoding)$cdt$cacheArgs$ref)"
+      val encoded = s"encode_prompt($text, ${q(prompt)}, $encoding)"
+      val condition = controlWeight.fold(encoded)(weight =>
+        s"controlnet::apply($encoded, control_model, hr_control_hint, strength = $weight)")
+      lines += s"hr_$name = predictor($unet, $condition$concat$cdt$cacheArgs$ref$agentArgs)"
     val aa = h.upscaler.contains("antialiased")
     lines += s"""hr_rng = make_rng("cpu", seed = $seed)"""
     if h.upscaler.startsWith("Latent") then
@@ -84,7 +95,8 @@ private[vulkan] object VulkanHiresGraph:
     val noise = if customNoise then "hr_noise" else "tensor::randn_like(hr_base, rng = hr_rng)"
     lines += s"hr_start = add_noise(hr_guided, hr_base, $noise, sigma = hr_sigmas[0])"
     val mask = if p.img2img.exists(_.mask.nonEmpty) then
-      lines += s"""hr_mask = tensor::interpolate(latent_mask, size = [${width/8},${height/8}], mode = "nearest_max")"""
+      val sourceMask = if inpaint then "denoise_mask" else "latent_mask"
+      lines += s"""hr_mask = tensor::interpolate($sourceMask, size = [${width/8},${height/8}], mode = "nearest_max")"""
       ", base = hr_base, denoise_mask = hr_mask"
     else ""
     lines += s"hr_latent = sample(hr_start, hr_sigmas, predict = hr_guided, method = ${q(nativeMethod)}, rng = hr_rng$eta$mask)"

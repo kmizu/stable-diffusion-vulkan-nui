@@ -1,0 +1,17 @@
+--- a/src/dgl/models/dit.cpp
++++ b/src/dgl/models/dit.cpp
+@@ -421,8 +421,13 @@
+         UNetControls unet_controls;
+         std::vector<ZImageControlInput> z_image_controls;
+         if (sd_version_is_unet(version()) || version() == VERSION_SVD) {
+-            if (step.compute_controls)
++            if (step.compute_controls) {
++                const sd::nui::UNetOptions neutral;
++                std::optional<sd::nui::UNetPassScope> control_scope;
++                if (options.reference_latent || options.unet_hooks.agent_timeline)
++                    control_scope.emplace(neutral, int(shape[0]), int(shape[1]), uint32_t(step.index));
+                 unet_controls = step.compute_controls(input, timesteps, condition);
++            }
+             const auto time = base_times.front();
+             const bool use_fooocus = options.fooocus_head &&
+                                      time >= 999.f * (1.f - options.fooocus_end) &&

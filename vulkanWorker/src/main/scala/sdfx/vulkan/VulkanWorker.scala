@@ -98,6 +98,7 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
       Option.when(backend.supportsTGate())(VulkanTGate.id).toVector ++
       Option.when(backend.supportsDeepCache())(VulkanDeepCache.id).toVector ++
       Option.when(backend.supportsReferenceOnly())(VulkanReference.id).toVector ++
+      Option.when(backend.supportsAgentAttention())(VulkanAgentAttention.id).toVector ++
       Option.when(backend.supportsDynamicThreshold())("dynamic_thresholding") ++
       (if backend.supportsSvd() then Vector("img2vid","novel_view") else Vector.empty) ++ Option.when(sdfx.vulkan.tools.VulkanCharaImport.available)("chara_searcher") ++ Option.when(sdfx.vulkan.tools.VulkanBlip.available && !sdfx.vulkan.tools.VulkanWdTagger.available)("caption") ++ Option.when(sdfx.vulkan.tools.VulkanCustomCode.enabled)("custom_code") ++ sdfx.vulkan.tools.VulkanWdTagger.features ++ Option.when(sdfx.vulkan.tools.VulkanFaceRestore.available)("face_restore") ++ Vector("vulkan_nsfw") ++ Option.when(sdfx.vulkan.tools.VulkanSafety.available)("nsfw_checker")))
 
@@ -480,7 +481,11 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
       if skipSag then Seq("SAG applies to SD1.x txt2img without ControlNet or PAG; ignored")
       else if sag.exists(_.obj.get("blur_sigma").exists(_.num != 2)) then Seq("The SAG reference uses a fixed Gaussian blur; blur sigma ignored")
       else Nil
-    val req = if skipSag then gen.request.copy(params=requested.copy(hooks=requested.hooks-"sag")) else gen.request
+    val skipAgent = requested.hooks.get(VulkanAgentAttention.id)
+      .filterNot(_.obj.get("enabled").contains(ujson.Bool(false)))
+      .exists(config => !VulkanAgentAttention.parse(config).applicable(model.kind, requested.hires.enabled))
+    val effectiveHooks = requested.hooks -- Option.when(skipSag)("sag") -- Option.when(skipAgent)(VulkanAgentAttention.id)
+    val req = if skipSag || skipAgent then gen.request.copy(params = requested.copy(hooks = effectiveHooks)) else gen.request
     val p = req.params
     if isGeneration(job.kind) && ((job.kind == "img2img") != p.isImg2Img) then invalid("img2img requests require an init image and the img2img operation")
     val hires = VulkanImageInputs.hires(req)

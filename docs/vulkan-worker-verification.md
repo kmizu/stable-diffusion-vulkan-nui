@@ -3,6 +3,12 @@
 
 
 
+## Windows v0.51 — Agent Attention
+
+The ZIP SHA-256 is `6d871d8f9ea4578da96791f98efb62607021ebf37931246e481f3696f65e2a64`. The staged `SDV-NUI.exe` ran masked img2img over MCP with SD1.5 on Radeon 780M and SDXL on RTX 3090 using a system-only PATH. It reported Vulkan with `cuda=false`, logged agent-token use, recorded Agent Attention settings in the PNG and preserved every unmasked pixel on both adapters. The archive contains the tested launcher, worker JAR and inference DLL byte for byte.
+
+The worker tested masked SDXL at 768 × 768 on RTX 3090 and SD1.5 at 512 × 512 on Radeon 780M. Native traces recorded ten and five layers respectively using agent tokens. SDXL also exercised ordinary attention on merged tokens, switched stage in FP32, stopped the hook after two evaluations, repeated a same-seed run exactly, and used the hook only during an 832 × 832 Latent Hires pass. Both GPUs preserved the source outside the mask. Test images were inspected. Masked SD1.5 also ran Agent Attention with Canny on RTX 3090 and Reference only with Canny on Radeon 780M. Additional RTX 3090 runs completed Agent Attention with Canny in the ordinary 576 × 576 Hires pass and with the nine-channel SDXL Inpaint checkpoint at 832 × 832. Disabled stages, missing Hires and a depth limit that excluded all SDXL attention layers each matched an unmodified unmasked img2img run pixel for pixel. Hires-only also matched an unmodified run through the separate Img2Img Hires Fix. All 43 worker tests and five Agent Attention plugin tests passed.
+
 ## Windows v0.50 — Reference only
 
 The ZIP SHA-256 is `aa8c4b162ae40ace9e345ae4dff09c64086094cdb52521f5e4e92232e06fc338`. The staged `SDV-NUI.exe` accepted a base64 reference over MCP, generated masked SDXL img2img on RTX 3090 with a system-only PATH, recorded the settings in the PNG and preserved every unmasked pixel. The trace showed the reference self-attention path in 70 layers of each CFG branch. The archive contains the tested launcher, worker JAR and inference DLL byte for byte.
