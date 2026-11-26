@@ -93,6 +93,7 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
       Option.when(backend.supportsTiledDiffusion())(VulkanUnetHooks.tiledDiffusion).toVector ++
       Option.when(backend.supportsLatentModifier())(VulkanLatentModifier.id).toVector ++
       Option.when(backend.supportsNegPip())(VulkanNegPip.id).toVector ++
+      Option.when(backend.supportsFooocusInpaint())(VulkanFooocusInpaint.id).toVector ++
       Option.when(backend.supportsDynamicThreshold())("dynamic_thresholding") ++
       (if backend.supportsSvd() then Vector("img2vid","novel_view") else Vector.empty) ++ Option.when(sdfx.vulkan.tools.VulkanCharaImport.available)("chara_searcher") ++ Option.when(sdfx.vulkan.tools.VulkanBlip.available && !sdfx.vulkan.tools.VulkanWdTagger.available)("caption") ++ Option.when(sdfx.vulkan.tools.VulkanCustomCode.enabled)("custom_code") ++ sdfx.vulkan.tools.VulkanWdTagger.features ++ Option.when(sdfx.vulkan.tools.VulkanFaceRestore.available)("face_restore") ++ Vector("vulkan_nsfw") ++ Option.when(sdfx.vulkan.tools.VulkanSafety.available)("nsfw_checker")))
 
@@ -458,6 +459,14 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
         activeOptions=Some(options)
 
   private def generate(job: Job, gen: Generation): Value =
+    val fooocus = gen.request.params.hooks.get(VulkanFooocusInpaint.id)
+      .exists(!_.obj.get("enabled").contains(ujson.Bool(false)))
+    if fooocus then VulkanClipIo.withScratch("sdv-fooocus-") { dir =>
+      Using.resource(backend.temporaryDglModelFiles())(_ => generate(job, gen, Some(dir)))
+    }
+    else generate(job, gen, None)
+
+  private def generate(job: Job, gen: Generation, fooocusDir: Option[Path]): Value =
     val model = currentModel
     val requested = gen.request.params
     val sag = requested.hooks.get("sag").filterNot(_.obj.get("enabled").contains(ujson.Bool(false)))
@@ -497,7 +506,13 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
           (key != VulkanUnetHooks.tiledDiffusion || VulkanUnetHooks.needsTiles(config,p.width,p.height)) => key })
       .orElse(VulkanLatentModifier.config(p).map(_ => VulkanLatentModifier.id))
       .orElse(Option.when(tweak.nonEmpty || separateHires && p.hires.upscaler.startsWith("Latent"))(VulkanGraph.latentHires))
-    val graphRequest = if graph.nonEmpty || refinement.nonEmpty then req.copy(controlnetPaths = resolveControls(req,job)) else req
+    val graphRequest = if graph.nonEmpty || refinement.nonEmpty then
+      val attachmentPaths = if graph.contains(VulkanFooocusInpaint.id) then req.controlnetPaths else Map.empty[String,String]
+      req.copy(controlnetPaths = attachmentPaths ++ resolveControls(req,job))
+    else req
+    val fooocusAssets = Option.when(graph.contains(VulkanFooocusInpaint.id)) {
+      VulkanFooocusInpaint.prepareAssets(backend, model, graphRequest, difference.nonEmpty, fooocusDir.get, () => job.cancelled)
+    }
     val temperature = p.hooks.get("gpu_temperature_guard").filterNot(_.obj.get("enabled").contains(ujson.Bool(false))).map { h =>
       if graph.nonEmpty then unsupported("GPU temperature guard in custom DGL graphs")
       val tools = sdfx.vulkan.tools.NativeTemperatureGuard
@@ -534,7 +549,7 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
       }
       val rendered = graph match
         case Some(hook) => VulkanGraph.render(backend, device.id(), model, loadRequest.get, graphRequest, hook,
-          activePrompt, planned.fold(p.loras)(_.loras), seed, gen.scheduler, () => job.cancelled, pass, difference)
+          activePrompt, planned.fold(p.loras)(_.loras), seed, gen.scheduler, () => job.cancelled, pass, difference, fooocus = fooocusAssets)
         case None =>
           val generated = backend.generate(activePrompt, p.negativePrompt, p.width, p.height, p.steps, p.cfgScale, seed,
             samplers(p.samplerName), schedulers(gen.scheduler), p.clipSkip, imageOptions, activeConditioning, progress(None))

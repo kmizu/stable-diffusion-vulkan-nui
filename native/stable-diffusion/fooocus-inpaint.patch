@@ -1,0 +1,136 @@
+--- a/src/dgl/bindings/predictor.cpp
++++ b/src/dgl/bindings/predictor.cpp
+@@ -35,4 +35,22 @@
+         options.diffusion_tile_overlap = int(get_int(args, "diffusion_tile_overlap"));
+         options.gaussian_tile_blending = get_bool(args, "gaussian_tile_blending");
++        if (args.count("fooocus_head") != args.count("fooocus_input"))
++            throw std::runtime_error("Fooocus requires both a head and a padded latent input");
++        if (args.count("fooocus_head")) {
++            for (const auto& [name, field] : {std::pair{"fooocus_head", &options.fooocus_head},
++                                             {"fooocus_input", &options.fooocus_input}}) {
++                *field = std::shared_ptr<const sd::Tensor<float>>(object<sd_tensor_t>(args, name), &float_tensor(args, name));
++            }
++            const auto& head = *options.fooocus_head;
++            const auto& input = *options.fooocus_input;
++            if (head.shape() != std::vector<int64_t>{3, 3, 5, 320} ||
++                input.dim() != 4 || input.shape()[0] < 3 || input.shape()[1] < 3 ||
++                input.shape()[2] != 5 || input.shape()[3] != 1)
++                throw std::runtime_error("Invalid Fooocus input or head dimensions");
++            options.fooocus_start = float(get_number(args, "fooocus_start"));
++            options.fooocus_end = float(get_number(args, "fooocus_end"));
++            if (options.fooocus_start > options.fooocus_end)
++                throw std::runtime_error("Fooocus start must precede end");
++        }
+         auto& hooks = options.unet_hooks;
+         hooks.backbone[0] = float(get_number(args,"freeu_b1"));
+--- a/src/dgl/bindings/registration.cpp
++++ b/src/dgl/bindings/registration.cpp
+@@ -599,4 +599,6 @@
+              number("fps", 0.01, 100000, 24), number("video_sigma_shift", 0.001, 1000, 12), number("audio_sigma_shift", 0.001, 1000, 3),
+              optional("circular_x", Kind::Boolean, false), optional("circular_y", Kind::Boolean, false),
++             optional("fooocus_head", Kind::Tensor), optional("fooocus_input", Kind::Tensor),
++             number("fooocus_start", 0, 1, 0), number("fooocus_end", 0, 1, 1),
+              number("freeu_b1",0,2,1), number("freeu_b2",0,2,1), number("freeu_s1",0,4,1), number("freeu_s2",0,4,1),
+              integer("hypertile_size",0,65536,0), integer("hypertile_swap",1,256,1), integer("hypertile_depth",0,10,0),
+--- a/src/dgl/models/diffusion_prediction.h
++++ b/src/dgl/models/diffusion_prediction.h
+@@ -36,4 +36,6 @@
+     struct DiffusionPredictionOptions {
+         sd::nui::UNetOptions unet_hooks;
++        std::shared_ptr<const sd::Tensor<float>> fooocus_head, fooocus_input;
++        float fooocus_start = 0.f, fooocus_end = 1.f;
+         int diffusion_tile_width = 0, diffusion_tile_height = 0, diffusion_tile_overlap = 0;
+         bool gaussian_tile_blending = false;
+--- a/src/dgl/models/dit.cpp
++++ b/src/dgl/models/dit.cpp
+@@ -372,6 +372,12 @@
+             if (step.compute_controls)
+                 unet_controls = step.compute_controls(input, timesteps, condition);
++            const auto time = base_times.front();
++            const bool use_fooocus = options.fooocus_head &&
++                                     time >= 999.f * (1.f - options.fooocus_end) &&
++                                     time <= 999.f * (1.f - options.fooocus_start);
+             params.extra = UNetDiffusionExtra{-1, &unet_controls.residuals, unet_controls.strength,
+-                                              nullptr, 1.f, step.attn2_processor, step.unet_block_processor};
++                                              nullptr, 1.f, step.attn2_processor, step.unet_block_processor,
++                                              use_fooocus ? options.fooocus_head.get() : nullptr,
++                                              use_fooocus ? options.fooocus_input.get() : nullptr};
+         } else if (sd_version_is_sd3(version()) || version() == VERSION_MOSS_IMAGE) {
+             params.extra = SkipLayerDiffusionExtra{present(options.skip_layers)};
+--- a/src/model/diffusion/model.hpp
++++ b/src/model/diffusion/model.hpp
+@@ -29,4 +29,6 @@
+     const AttentionProcessor* attn2_processor      = nullptr;
+     const UNetBlockProcessor* block_processor      = nullptr;
++    const sd::Tensor<float>* fooocus_head           = nullptr;
++    const sd::Tensor<float>* fooocus_input          = nullptr;
+ };
+
+--- a/src/model/diffusion/unet.hpp
++++ b/src/model/diffusion/unet.hpp
+@@ -541,5 +541,7 @@
+                          std::vector<ggml_tensor*> controls        = {},
+                          float control_strength                    = 0.f,
+-                         const UNetBlockProcessor* block_processor = nullptr) {
++                         const UNetBlockProcessor* block_processor = nullptr,
++                         ggml_tensor* fooocus_head = nullptr,
++                         ggml_tensor* fooocus_input = nullptr) {
+         // x: [N, in_channels, h, w] or [N, in_channels/2, h, w]
+         // timesteps: [N,]
+@@ -608,4 +610,13 @@
+         // input block 0
+         auto h = input_blocks_0_0->forward(ctx, x);
++        if (fooocus_head && fooocus_input) {
++            if (h->ne[0] + 2 != fooocus_input->ne[0] || h->ne[1] + 2 != fooocus_input->ne[1] ||
++                h->ne[2] != fooocus_head->ne[3])
++                throw std::runtime_error("Fooocus head does not match the U-Net activation");
++            auto* graph_ctx = ctx->ggml_ctx;
++            auto* kernel = ggml_cast(graph_ctx, fooocus_head, GGML_TYPE_F16);
++            auto* feature = ggml_conv_2d(graph_ctx, kernel, fooocus_input, 1, 1, 0, 0, 1, 1);
++            h = ggml_add(graph_ctx, h, ggml_repeat(graph_ctx, feature, h));
++        }
+         sd::ggml_graph_cut::mark_graph_cut(h, "unet.input_blocks.0", "h");
+
+@@ -834,5 +845,7 @@
+                              float ip_scale                                        = 1.f,
+                              const AttentionProcessor* attn2_processor             = nullptr,
+-                             const UNetBlockProcessor* block_processor             = nullptr) {
++                             const UNetBlockProcessor* block_processor             = nullptr,
++                             const sd::Tensor<float>& fooocus_head_tensor          = {},
++                             const sd::Tensor<float>& fooocus_input_tensor         = {}) {
+         ggml_cgraph* gf = new_graph_custom(UNET_GRAPH_SIZE + (block_processor ? block_processor->extra_graph_size() : 0));
+
+@@ -867,5 +880,7 @@
+                                         controls,
+                                         control_strength,
+-                                        block_processor);
++                                        block_processor,
++                                        make_optional_input(fooocus_head_tensor),
++                                        make_optional_input(fooocus_input_tensor));
+
+         ggml_build_forward_expand(gf, out);
+@@ -886,5 +901,7 @@
+                               float ip_scale                                 = 1.f,
+                               const AttentionProcessor* attn2_processor      = nullptr,
+-                              const UNetBlockProcessor* block_processor      = nullptr) {
++                              const UNetBlockProcessor* block_processor      = nullptr,
++                              const sd::Tensor<float>& fooocus_head            = {},
++                              const sd::Tensor<float>& fooocus_input           = {}) {
+         // x: [N, in_channels, h, w]
+         // timesteps: [N, ]
+@@ -894,5 +911,6 @@
+         auto get_graph = [&]() -> ggml_cgraph* {
+             return build_graph(x, timesteps, context, c_concat, y, num_video_frames, controls,
+-                               control_strength, ip_context, ip_scale, attn2_processor, block_processor);
++                               control_strength, ip_context, ip_scale, attn2_processor, block_processor,
++                               fooocus_head, fooocus_input);
+         };
+
+@@ -918,4 +936,6 @@
+                        extra->ip_scale,
+                        extra->attn2_processor,
+-                       extra->block_processor);
++                       extra->block_processor,
++                       tensor_or_empty(extra->fooocus_head),
++                       tensor_or_empty(extra->fooocus_input));
+     }

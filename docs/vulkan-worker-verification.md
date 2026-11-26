@@ -3,6 +3,16 @@
 
 
 
+## Windows v0.46 — Fooocus Inpaint
+
+The Windows ZIP SHA-256 is `f05760d224ed0bd8a5b63e3bbddd87517770584a98d01a790264bbaf29e7c962`. The Java 25 worker used the original Fooocus v2.6 patch and head with `animaPencilXL_v500` at 768 × 768 on Radeon 780M and RTX 3090. Both PNGs retained every pixel outside the mask and were visually inspected. The worker reported `cuda=false` on both GPUs. An independent archive read matched all 14,400 exported head values and eleven sampled weights after dequantization and FP16 merging.
+
+On RTX 3090, the same seed produced distinct results with Fooocus disabled, with the weight deltas alone and with the head active throughout sampling. The staged `SDV-NUI.exe` also found the patch by model name via MCP, ran a masked SDXL edit with a system-only PATH and preserved all unmasked pixels. The ZIP contains the tested worker JAR and inference DLL byte for byte. The user supplies the Fooocus weights separately.
+
+The nine-channel `sd_xl_base_1.0_inpainting_0.1` checkpoint completed on Radeon 780M and preserved every pixel outside the mask. The patched mask region showed strong color artifacts in this seven-step run. The stock patch targets a four-channel input convolution, so the worker leaves the nine-channel input weight unchanged when its shape differs. Image quality for this combination remains unverified.
+
+Each job wrote a 5,135,174,472-byte temporary U-Net. Both completed runs released that file. Early runs reached sampling but failed at cleanup on Windows while the native loader held a memory map. The current worker disables memory mapping for the scoped graph, unloads the temporary components and restores the usual setting when the job ends.
+
 ## Windows v0.45
 
 The ZIP SHA-256 is `8afb4687c47c1b01ab53fcec7a8a2546d9cd286505e0faa41b84a17a3208c0fd`. The bundled MCP `img2img` tool processed a negative-weight term through NegPiP on Radeon 780M with SD1.5 at 512 × 512. The executable from a fresh ZIP extraction repeated the test on RTX 3090 with SDXL at 768 × 768. Both workers reported `cuda=false` with a system-only PATH.

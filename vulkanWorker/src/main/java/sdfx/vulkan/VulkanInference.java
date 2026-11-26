@@ -164,6 +164,8 @@ public final class VulkanInference implements AutoCloseable {
             bind("sd_ctx_get_dgl_ctx", ADDRESS, ADDRESS);
             bind("sd_dgl_ctx_create", ADDRESS);
             bind("sd_dgl_ctx_free", null, ADDRESS);
+            bind("sd_dgl_ctx_set", JAVA_BOOLEAN, ADDRESS, ADDRESS, ADDRESS);
+            bind("sd_dgl_ctx_unload_models", JAVA_INT, ADDRESS);
             bind("sd_dgl_run", JAVA_INT, ADDRESS, ADDRESS, ADDRESS, JAVA_LONG, ADDRESS);
             bind("sd_dgl_ctx_cancel", JAVA_INT, ADDRESS);
             bind("sd_dgl_ctx_set_progress_callback", JAVA_INT, ADDRESS, ADDRESS, ADDRESS);
@@ -667,6 +669,29 @@ public final class VulkanInference implements AutoCloseable {
 
     public boolean supportsNegPip() {
         return cString(ptr("sd_dgl_builtin_catalog")).contains("`clip_negpip?");
+    }
+
+    public boolean supportsFooocusInpaint() {
+        return cString(ptr("sd_dgl_builtin_catalog")).contains("`fooocus_head?");
+    }
+
+    public AutoCloseable temporaryDglModelFiles() {
+        if (ctx.equals(NULL)) throw new IllegalStateException("Load a checkpoint before using DGL");
+        var dgl = ptr("sd_ctx_get_dgl_ctx", ctx);
+        setDglMmap(dgl, false);
+        return () -> {
+            try { check(call("sd_dgl_ctx_unload_models", dgl)); }
+            finally { setDglMmap(dgl, true); }
+        };
+    }
+
+    private void setDglMmap(MemorySegment dgl, boolean enabled) {
+        try (var arena = Arena.ofConfined()) {
+            if (!(boolean) call("sd_dgl_ctx_set", dgl, arena.allocateFrom("enable_mmap"),
+                    arena.allocateFrom(Boolean.toString(enabled)))) {
+                throw new IllegalStateException(cString(ptr("sd_dgl_error")));
+            }
+        }
     }
 
     public boolean supportsDynamicThreshold() {

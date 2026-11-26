@@ -8,6 +8,10 @@ Install the graphics manufacturer's Vulkan-capable Windows driver. The package i
 
 The worker supports SD1.5 and SDXL txt2img, img2img, masked inpainting, hires passes, external VAEs, LoRAs, textual inversion and single-network ControlNet. Sampler and scheduler choices come from the worker. See the [feature inventory](vulkan-parity.md) for individual commands, extension hooks and limits.
 
+For Fooocus Inpaint, put `inpaint_v26.fooocus.patch` and `fooocus_inpaint_head.pth` together in a configured ControlNet model directory. Enable **Fooocus Inpaint** in img2img, select the patch, and supply an image and mask with an SDXL checkpoint. An explicit head path overrides the sibling file. The start and end sliders control the head's denoising window. The patch's weight deltas apply throughout the masked pass.
+
+The worker writes a temporary patched U-Net, about 4.8 GiB for a typical FP16 SDXL checkpoint, once per job. It uses the original checkpoint for text and VAE and removes the temporary U-Net when the job ends. Supply the Fooocus model files separately.
+
 Temporal Lab reads and processes image sequences in the JVM. For **Extract frames from video**, install FFmpeg and put both `ffmpeg.exe` and `ffprobe.exe` on `PATH` before starting the app. The worker uses `ffprobe` to read the frame rate and dimensions, then `ffmpeg` to decode the selected video stream.
 
 

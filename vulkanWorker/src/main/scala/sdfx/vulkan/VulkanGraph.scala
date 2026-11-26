@@ -9,7 +9,7 @@ import ujson.Value
 
 /** Builds the motion/identity model graphs using the pinned library's DGL operations. */
 private[vulkan] object VulkanGraph:
-  val hooks = Set("animatediff", "photomaker", "ip_adapter", "revision","sonar","semantic_guidance","neutral_prompt","latent_upscale","soft_inpainting","img2imgalt","postdiff",VulkanClipIo.id,VulkanLatentModifier.id,VulkanNegPip.id) ++ VulkanFusionPrompt.textHooks ++ VulkanLatentGraph.hooks ++ VulkanUnetHooks.hooks
+  val hooks = Set("animatediff", "photomaker", "ip_adapter", "revision","sonar","semantic_guidance","neutral_prompt","latent_upscale","soft_inpainting","img2imgalt","postdiff",VulkanClipIo.id,VulkanLatentModifier.id,VulkanNegPip.id,VulkanFooocusInpaint.id) ++ VulkanFusionPrompt.textHooks ++ VulkanLatentGraph.hooks ++ VulkanUnetHooks.hooks
   val latentHires = "latent hires refinement"
   private def quoted(s: String): String = ujson.write(ujson.Str(s))
   private def path(s: String): String = quoted(VulkanConditioning.file(s, "DGL model"))
@@ -18,7 +18,8 @@ private[vulkan] object VulkanGraph:
       req: GenerationRequest, hook: String, prompt: String, loras: Seq[LoraRef], seed: Long, schedule: String,
       cancelled: () => Boolean, tweak: Option[VulkanHiresTweaks.Pass] = None,
       difference: Option[(BufferedImage, BufferedImage)] = None,
-      refinementImage: Option[BufferedImage] = None): Seq[BufferedImage] =
+      refinementImage: Option[BufferedImage] = None,
+      fooocus: Option[VulkanFooocusInpaint.Assets] = None): Seq[BufferedImage] =
     if hook == VulkanClipIo.id then
       VulkanClipIo.withSession(req.params.hooks(hook), if Set("sdxl", "SDXL Inpaint")(model.kind) then 2048 else 768) { session =>
         val images = renderGraph(engine, device, model, settings, req, hook, prompt, loras, seed, schedule,
@@ -32,13 +33,13 @@ private[vulkan] object VulkanGraph:
         renderGraph(engine, device, model, settings, req, hook, prompt, loras, seed, schedule,
           cancelled, tweak, None, Some(scratch), difference, refinementImage)
       }
-    else renderGraph(engine, device, model, settings, req, hook, prompt, loras, seed, schedule, cancelled, tweak, None, None, difference, refinementImage)
+    else renderGraph(engine, device, model, settings, req, hook, prompt, loras, seed, schedule, cancelled, tweak, None, None, difference, refinementImage, fooocus)
 
   private def renderGraph(engine: VulkanInference, device: String, model: LoadedModel, settings: LoadModelRequest,
       req: GenerationRequest, hook: String, prompt: String, loras: Seq[LoraRef], seed: Long, schedule: String,
       cancelled: () => Boolean, tweak: Option[VulkanHiresTweaks.Pass], clipIo: Option[VulkanClipIo.Session],
       fusionScratch: Option[Path], difference: Option[(BufferedImage, BufferedImage)],
-      refinementImage: Option[BufferedImage]): Seq[BufferedImage] =
+      refinementImage: Option[BufferedImage], fooocus: Option[VulkanFooocusInpaint.Assets] = None): Seq[BufferedImage] =
     import VulkanProtocol.{invalid, unsupported}
     def check(): Unit = if cancelled() then throw new java.util.concurrent.CancellationException()
     val p = req.params
@@ -52,7 +53,7 @@ private[vulkan] object VulkanGraph:
     val modifier = Option.when(customText || unetGraph || hook == VulkanLatentModifier.id)(
       VulkanLatentModifier.config(p)).flatten
     if modifier.nonEmpty && !engine.supportsLatentModifier() then unsupported("This Vulkan runtime lacks Latent Modifier")
-    val patchedInputs = customText || unetGraph || modifier.nonEmpty
+    val patchedInputs = customText || unetGraph || modifier.nonEmpty || fooocus.nonEmpty
     val supportsControl = unetGraph || modifier.nonEmpty && !customText
     val hiresPass = hook == latentHires
     val h = if hiresPass then ujson.Obj() else p.hooks(hook)
@@ -111,7 +112,8 @@ private[vulkan] object VulkanGraph:
     val common = s"backend = ${quoted(device)}$placement, wtype = ${quoted(options.weights())}, family = ${quoted(family)}"
     val lines = Vector.newBuilder[String]
     val textSetup = Vector.newBuilder[String]
-    lines += s"unet0 = load_unet(${path(model.path)}, $common)"
+    val unetPath = fooocus.fold(model.path)(_.unet.toString)
+    lines += s"unet0 = load_unet(${path(unetPath)}, $common)"
     val loadText = s"text0 = load_text_encoder(${path(model.path)}, $common)"
     lines += loadText
     textSetup += loadText
@@ -161,7 +163,7 @@ private[vulkan] object VulkanGraph:
     else if textSchedule.nonEmpty then
       lines += s"unet = $unet"
       1
-    else if unetHooks.nonEmpty || modifier.nonEmpty || Set("sonar","semantic_guidance","neutral_prompt")(hook) || latentHook || up.nonEmpty || hiresPass || soft.nonEmpty || inverse || postDiff.nonEmpty then
+    else if unetHooks.nonEmpty || modifier.nonEmpty || fooocus.nonEmpty || Set("sonar","semantic_guidance","neutral_prompt")(hook) || latentHook || up.nonEmpty || hiresPass || soft.nonEmpty || inverse || postDiff.nonEmpty then
       lines += s"unet = $unet"
       lines += s"latent_pos = encode_prompt($text, ${quoted(prompt)}, $enc)"
       if !patchedInputs then lines += s"pos = predictor(unet, latent_pos$unetArgs)"
@@ -202,7 +204,7 @@ private[vulkan] object VulkanGraph:
         lines += s"cond_$name = ip_adapter::apply(encode_prompt($text, ${quoted(value)}, $enc), adapter, tokens_$name, strength = $weight)"
         lines += s"$name = predictor($unet, cond_$name)"
       1
-    else
+    else if hook == "photomaker" then
       val refs = h("images").arr.map(_.str).toVector
       require(refs.nonEmpty && refs.size <= 32, "PhotoMaker needs 1 to 32 identity photos")
       refs.zipWithIndex.foreach((file,i) => inputs(s"ref$i") = VulkanImageInputs.read(file))
@@ -221,6 +223,7 @@ private[vulkan] object VulkanGraph:
       lines += "identity = photomaker::apply(conditions.condition, pm, ids, conditions.mask)"
       lines += s"pos = switch_predictor(predictor(unet, conditions.plain), predictor(unet, identity), after_steps = $merge)"
       1
+    else unsupported(s"Unknown graph hook: $hook")
     if textSchedule.isEmpty && !Set("ip_adapter","revision")(hook) then
       clipIo match
         case Some(session) => session.build("neg", p.negativePrompt, text, enc, textProgram, engine, () => check(), lines)
@@ -289,6 +292,10 @@ private[vulkan] object VulkanGraph:
       lines += "inpaint_condition = tensor::concat([latent_mask, masked_latent], axis = 2)"
       lines += "denoise_mask = tensor::max_pool2d(latent_mask, kernel = [3,3], padding_before = [1,1], padding_after = [1,1])"
     if patchedInputs then
+      fooocus.foreach { assets =>
+        if overlay.isEmpty then invalid("Fooocus Inpaint did not produce a prepared mask")
+        lines ++= assets.prepareInput(p.width, p.height, encodeRng, tiled)
+      }
       control.foreach { (modelPath, image, weight) =>
         inputs("control_image") = image
         lines += s"control_model = controlnet::load(${quoted(modelPath)}, $common)"
@@ -299,8 +306,9 @@ private[vulkan] object VulkanGraph:
       textSchedule match
         case Some(schedule) => schedule.predictors(concat,lines)
         case None =>
-          lines += s"pos = predictor(unet, $positiveInput$concat$unetArgs)"
-          lines += s"neg = predictor(unet, $negativeInput$concat$unetArgs)"
+          val fooocusArgs = fooocus.fold("")(_.predictorArgs)
+          lines += s"pos = predictor(unet, $positiveInput$concat$unetArgs$fooocusArgs)"
+          lines += s"neg = predictor(unet, $negativeInput$concat$unetArgs$fooocusArgs)"
       lines += guidance
     val fullSteps = up.fold(p.steps)(_.fullSteps)
     val scheduleName = up.fold(schedule)(_.scheduler)
