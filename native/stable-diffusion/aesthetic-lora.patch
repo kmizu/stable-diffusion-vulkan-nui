@@ -1,0 +1,161 @@
+--- a/src/extensions/aesthetic_train.cpp
++++ b/src/extensions/aesthetic_train.cpp
+@@ -13,6 +13,7 @@
+ #include "ggml-backend.h"
+ #include "stable-diffusion.h"
+ #include "core/util.h"
++#include "model/adapter/lora.hpp"
+
+ namespace {
+     constexpr int width = 768;
+@@ -36,6 +37,74 @@
+         std::array<Parameters, 4> attention;
+         Parameters norm2, fc1, fc2;
+     };
++
++    constexpr const char* clip_prefix = "cond_stage_model.transformer.text_model.";
++
++    void merge_aesthetic_lora(ggml_backend_t gpu, const std::map<std::string, Tensor>& weights,
++                              SDVersion version, const std::string& path, float multiplier) {
++        auto manager = std::make_shared<ModelManager>();
++        ModelManager::LoraSpec spec;
++        spec.path = path;
++        spec.required = true;
++        std::vector<ModelManager::LoraSpec> specs{spec};
++        if (!manager->prepare_lora_sources(specs))
++            throw std::runtime_error("Cannot load Aesthetic Gradients LoRA: " + path);
++        const auto file = specs.front().file_id;
++        const std::string prefix = std::string("lora.") + clip_prefix;
++        const auto key = [&](const std::string& name) -> std::string {
++            if (!starts_with(name, prefix)) return {};
++            const auto tensor = name.substr(std::string_view("lora.").size());
++            for (std::string_view suffix : {".weight", ".bias"}) {
++                const auto end = tensor.find(std::string(suffix) + ".");
++                if (end != std::string::npos) return tensor.substr(0, end + suffix.size());
++            }
++            return {};
++        };
++        const auto entries = manager->loader().file_tensors(file, version);
++        std::set<std::string> targets;
++        for (const auto& [name, _] : entries) {
++            const auto target = key(name);
++            if (weights.count(target)) targets.insert(target);
++        }
++        if (targets.empty()) return;
++        LoraModel lora(path, gpu, gpu, manager, file, version);
++        lora.multiplier = multiplier;
++        if (!lora.init_params(4, [&](const std::string& name) { return targets.count(key(name)) != 0; }))
++            throw std::runtime_error("Cannot initialize Aesthetic Gradients LoRA: " + path);
++        lora.preprocess_lora_tensors(targets);
++        std::vector<std::pair<Tensor, Tensor>> updates;
++        const auto make_graph = [&]() {
++            updates.clear();
++            auto context = lora.get_context();
++            auto graph = ggml_new_graph_custom(context.ggml_ctx, graph_capacity, false);
++            for (const auto& name : targets) {
++                auto original = weights.at(name);
++                auto delta = lora.get_weight_diff(name, &context, original);
++                if (!delta) continue;
++                delta = ggml_cont(context.ggml_ctx, ggml_ext_cast_f32(&context, delta));
++                ggml_set_output(delta);
++                ggml_build_forward_expand(graph, delta);
++                updates.emplace_back(original, delta);
++            }
++            if (updates.empty()) throw std::runtime_error("No compatible CLIP-L LoRA tensors");
++            return graph;
++        };
++        const auto read_outputs = [&]() {
++            for (const auto& [original, delta] : updates) {
++                const auto adjustment = sd::make_sd_tensor_from_ggml<float>(delta);
++                if (adjustment.empty()) return false;
++                std::vector<float> values(ggml_nelements(original));
++                ggml_backend_tensor_get(original, values.data(), 0, ggml_nbytes(original));
++                for (size_t i = 0; i < values.size(); ++i)
++                    values[i] += adjustment.data()[i];
++                ggml_backend_tensor_set(original, values.data(), 0, ggml_nbytes(original));
++            }
++            return true;
++        };
++        if (!lora.compute(make_graph, 4, true, true, read_outputs).has_value())
++            throw std::runtime_error("Cannot merge Aesthetic Gradients LoRA: " + path);
++        lora.stat(false, "CLIP-L training");
++    }
+
+     Tensor normalize(ggml_context* ctx, Tensor x, bool centered) {
+         if (centered) {
+@@ -110,6 +179,7 @@
+ using AestheticProgress = bool(*)(int step, float loss, void* user_data);
+
+ extern "C" SD_API bool sdv_aesthetic_supports_slerp() { return true; }
++extern "C" SD_API bool sdv_aesthetic_supports_lora() { return true; }
+
+ extern "C" SD_API int sdv_aesthetic_train(const char* device, const char* input, const char* output,
+                                            int steps, float rate, AestheticProgress progress, void* user_data,
+@@ -211,14 +281,60 @@
+         float fraction = 0;
+         if (data.peek() != std::ifstream::traits_type::eof()) {
+             read(&fraction, sizeof(fraction));
+-            read(style_tokens.data(), sizeof(style_tokens));
+-            read(&style_eos, sizeof(style_eos));
+-            if (!(fraction > 0 && fraction <= 1) || style_eos < 0 || style_eos >= tokens ||
+-                style_tokens[style_eos] != 49407 || data.peek() != std::ifstream::traits_type::eof())
++            if (!(fraction >= 0 && fraction <= 1))
+                 throw std::runtime_error("Invalid aesthetic style conditioning");
+-            for (int id : style_tokens)
+-                if (id < 0 || id >= vocabulary)
+-                    throw std::runtime_error("Invalid aesthetic style token");
++            if (fraction > 0) {
++                read(style_tokens.data(), sizeof(style_tokens));
++                read(&style_eos, sizeof(style_eos));
++                if (style_eos < 0 || style_eos >= tokens || style_tokens[style_eos] != 49407)
++                    throw std::runtime_error("Invalid aesthetic style conditioning");
++                for (int id : style_tokens)
++                    if (id < 0 || id >= vocabulary)
++                        throw std::runtime_error("Invalid aesthetic style token");
++            }
++        }
++        if (data.peek() != std::ifstream::traits_type::eof()) {
++            int32_t sdxl = 0, count = 0;
++            read(&sdxl, sizeof(sdxl));
++            read(&count, sizeof(count));
++            if ((sdxl != 0 && sdxl != 1) || count <= 0 || count > 64)
++                throw std::runtime_error("Invalid aesthetic LoRA header");
++            std::map<std::string, Tensor> weights;
++            const auto put = [&](const std::string& name, Tensor value) { weights.emplace(clip_prefix + name, value); };
++            const auto pair = [&](const std::string& name, Parameters value) {
++                put(name + ".weight", value.weights);
++                put(name + ".bias", value.bias);
++            };
++            put("embeddings.token_embedding.weight", token_embed);
++            put("embeddings.position_embedding.weight", position_embed);
++            const std::array<std::string, 4> attention{"q_proj", "k_proj", "v_proj", "out_proj"};
++            for (int i = 0; i < layers - sdxl; ++i) {
++                const auto& block = blocks[i];
++                const auto prefix = "encoder.layers." + std::to_string(i) + ".";
++                pair(prefix + "layer_norm1", block.norm1);
++                for (size_t j = 0; j < attention.size(); ++j)
++                    pair(prefix + "self_attn." + attention[j], block.attention[j]);
++                pair(prefix + "layer_norm2", block.norm2);
++                pair(prefix + "mlp.fc1", block.fc1);
++                pair(prefix + "mlp.fc2", block.fc2);
++            }
++            if (!sdxl) pair("final_layer_norm", final_norm);
++            for (int i = 0; i < count; ++i) {
++                int32_t length = 0;
++                float weight = 0;
++                read(&weight, sizeof(weight));
++                read(&length, sizeof(length));
++                if (!std::isfinite(weight) || length <= 0 || length > 131072)
++                    throw std::runtime_error("Invalid aesthetic LoRA record");
++                std::string path(length, '\0');
++                read(path.data(), path.size());
++                if (path.find('\0') != std::string::npos)
++                    throw std::runtime_error("Invalid aesthetic LoRA path");
++                if (progress && !progress(0, 0.f, user_data)) return 1;
++                merge_aesthetic_lora(gpu.get(), weights, sdxl ? VERSION_SDXL : VERSION_SD1, path, weight);
++            }
++            if (data.peek() != std::ifstream::traits_type::eof())
++                throw std::runtime_error("Unexpected trailing aesthetic LoRA data");
+         }
+         data.close();
+         std::array<float,tokens*tokens> causal;

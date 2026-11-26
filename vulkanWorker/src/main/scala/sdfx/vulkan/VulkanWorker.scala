@@ -4,6 +4,7 @@ import java.awt.image.BufferedImage
 import java.io.{BufferedReader, InputStreamReader, OutputStream, OutputStreamWriter}
 import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.{Files, Path}
+import java.nio.file.attribute.BasicFileAttributes
 import java.util.UUID
 import java.util.concurrent.{CancellationException, Executors, ThreadLocalRandom}
 import javax.imageio.ImageIO
@@ -607,6 +608,18 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
         prepareConditioning(adapted, job, resources)
       }
       var aestheticHash = Option.empty[String]
+      def adapterStamp(path: Path) =
+        val attributes = Files.readAttributes(path, classOf[BasicFileAttributes])
+        (attributes.fileKey(), attributes.size(), attributes.lastModifiedTime())
+      val aestheticAdapters = if graph.contains(VulkanGraph.aestheticHook) then
+        val used = planned.fold(p.loras)(_.loras) ++
+          req.hiresLoras.filter(_ => p.hires.enabled).toSeq.flatten ++
+          req.img2imgHiresLoras.filter(_ => refinement.nonEmpty).toSeq.flatten
+        used.filter(_.weight.toFloat != 0).flatMap(l => req.loraPaths.get(l.name)).distinct.map { raw =>
+          val path = Path.of(raw)
+          path -> adapterStamp(path)
+        }
+      else Nil
       def recordAesthetic(hash: String): Unit =
         if aestheticHash.exists(_ != hash) then invalid("Aesthetic Gradients embedding changed during the job")
         aestheticHash = Some(hash)
@@ -719,6 +732,9 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
                 backend.generate(prompt, negative, w, ht, refinementParams.steps, refinementParams.cfgScale,
                   seed, method, nativeSchedule, p.clipSkip,
                   new VulkanInference.ImageOptions(resized, null, strength, null), conditioning2, progress(Some("img2img_hires")))
+        }
+        aestheticAdapters.foreach { (path, stamp) =>
+          if adapterStamp(path) != stamp then invalid(s"Aesthetic Gradients LoRA changed during the job: ${path.getFileName}")
         }
         val scaled = p.hooks.get("sonar").filterNot(_.obj.get("enabled").contains(ujson.Bool(false))).fold(initial){ h =>
           new VulkanSonar(h,p,seed).upscale(initial,req.upscalerPaths,modelUpscale)

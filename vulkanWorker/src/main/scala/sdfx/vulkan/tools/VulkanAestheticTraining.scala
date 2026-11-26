@@ -2,12 +2,14 @@ package sdfx.vulkan.tools
 
 import java.io.{BufferedInputStream, BufferedOutputStream, DataOutputStream}
 import java.nio.file.{Files, Path}
+import java.nio.charset.StandardCharsets.UTF_8
 import java.security.MessageDigest
 import java.util.HexFormat
 import scala.collection.mutable.Builder
 import scala.util.Using
 import scala.util.boundary, boundary.break
-import sdfx.vulkan.{VulkanInference, VulkanPromptAttention, VulkanProtocol}
+import sdfx.core.model.LoraRef
+import sdfx.vulkan.{VulkanInference, VulkanPromptAttention, VulkanProtocol, VulkanComposableLora}
 import ujson.Value
 
 private[vulkan] object VulkanAestheticTraining:
@@ -20,9 +22,10 @@ private[vulkan] object VulkanAestheticTraining:
       negative: Boolean, slerp: Boolean, angle: Double, style: String):
     def active: Boolean = weight != 0 && steps != 0 && rate != 0
 
-  final case class Conditioning(settings: Settings, sdxl: Boolean, trainedEncoder: String => String):
+  final case class Conditioning(settings: Settings, sdxl: Boolean, trainedEncoder: (String, Seq[LoraRef]) => String,
+      components: String => (Boolean, Boolean)):
     def encode(label: String, text: String, caption: String, options: String, negative: Boolean,
-        lines: Builder[String, Vector[String]]): String =
+        loras: Seq[LoraRef], lines: Builder[String, Vector[String]]): String =
       val blankNegative = negative && caption.trim.isEmpty
       val quoted = ujson.write(ujson.Str(if blankNegative then "" else caption))
       def encoded(encoder: String): String = s"encode_prompt($encoder, $quoted, $options)"
@@ -32,13 +35,18 @@ private[vulkan] object VulkanAestheticTraining:
         val base = s"${label}_base"
         val trained = s"${label}_trained"
         lines += s"$base = ${encoded(text)}"
-        lines += s"$trained = ${encoded(trainedEncoder(caption))}"
+        lines += s"$trained = ${encoded(trainedEncoder(caption, loras))}"
         if sdxl then
           val left = s"${label}_l"
           lines += s"$left = tensor::lerp(tensor::crop($base.crossattn, axes = [0], start = [0], size = [768]), tensor::crop($trained.crossattn, axes = [0], start = [0], size = [768]), ${settings.weight})"
           lines += s"$label = {crossattn = tensor::replace_slice($base.crossattn, $left, axis = 0, start = 0), vector = $base.vector}"
         else lines += s"$label = {crossattn = tensor::lerp($base.crossattn, $trained.crossattn, ${settings.weight})}"
       label
+
+  def loraComponents(path: String): (Boolean, Boolean) =
+    if path.toLowerCase(java.util.Locale.ROOT).endsWith(".safetensors") then
+      Using.resource(CheckpointIO.open(Path.of(path)))(file => VulkanComposableLora.components(file.tensors.keys))
+    else (true, true)
 
   def settings(value: Value): Settings =
     def number(key: String, default: Double): Double =
@@ -137,10 +145,14 @@ private[vulkan] object VulkanAestheticTraining:
       promptChunks(config.style, firstOnly = true).head)
 
   def train(engine: VulkanInference, device: String, checkpoint: Path, sdxl: Boolean, prompt: String,
-      config: Settings, folder: Path, cancelled: () => Boolean, progress: (Int, Float) => Unit): (Path, String) =
+      config: Settings, folder: Path, loras: Seq[(String, Float)], cancelled: () => Boolean,
+      progress: (Int, Float) => Unit): (Path, String) =
     if !checkpoint.getFileName.toString.toLowerCase(java.util.Locale.ROOT).endsWith(".safetensors") then
       VulkanProtocol.unsupported("Aesthetic Gradients with a checkpoint outside SafeTensors")
     val style = styleChunk(config)
+    if loras.nonEmpty && !engine.supportsAestheticLora() then
+      VulkanProtocol.unsupported("Aesthetic Gradients with LoRA in this Vulkan runtime")
+    if loras.size > 64 then VulkanProtocol.unsupported("Aesthetic Gradients with more than 64 LoRAs")
     if style.nonEmpty && !engine.supportsAestheticSlerp() then
       VulkanProtocol.unsupported("Aesthetic Gradients slerp with this Vulkan runtime")
     val context = new NativeWorkContext(cancelled, () => (), (_, _) => ())
@@ -173,6 +185,16 @@ private[vulkan] object VulkanAestheticTraining:
         tokens.foreach(writeInt)
         writeInt(tokens.indexOf(tokenizer.eosId.toInt))
       }
+      if loras.nonEmpty then
+        if style.isEmpty then writeInt(0)
+        writeInt(if sdxl then 1 else 0)
+        writeInt(loras.size)
+        loras.foreach { (path, weight) =>
+          val bytes = path.getBytes(UTF_8)
+          writeInt(java.lang.Float.floatToRawIntBits(weight))
+          writeInt(bytes.length)
+          stream.write(bytes)
+        }
     }
     engine.trainAesthetic(device, input, trained, config.steps, config.rate, (step, loss) =>
       if step > 0 && !cancelled() then progress(step, loss)

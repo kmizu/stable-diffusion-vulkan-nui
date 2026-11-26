@@ -82,8 +82,6 @@ private[vulkan] object VulkanGraph:
       val sdxl = Set("sdxl", "SDXL Inpaint")(model.kind)
       if !sdxl && !Set("sd15", "SD 1.x Inpaint")(model.kind) then
         unsupported("Aesthetic Gradients requires an SD1.x or SDXL CLIP-L encoder")
-      if loras.nonEmpty || p.hires.enabled && req.hiresLoras.exists(_.nonEmpty) then
-        unsupported("Aesthetic Gradients with LoRA")
       val config = VulkanAestheticTraining.settings(p.hooks(aestheticHook))
       (config, scratch, sdxl)
     }
@@ -229,29 +227,44 @@ private[vulkan] object VulkanGraph:
     val loadText = s"text0 = load_text_encoder(${path(model.path)}, $common)"
     lines += loadText
     textSetup += loadText
+    def loraFile(l: LoraRef): String =
+      VulkanConditioning.file(req.loraPaths.getOrElse(l.name, invalid(s"Unresolved LoRA ${l.name}")), "LoRA")
     val aestheticConditioning = aesthetic.map { (config, scratch, sdxl) =>
-      val trained = scala.collection.mutable.Map.empty[String, String]
+      val trained = scala.collection.mutable.Map.empty[(String, Seq[(String, Float)]), String]
+      val layouts = scala.collection.mutable.Map.empty[String, (Boolean, Boolean)]
+      def components(path: String): (Boolean, Boolean) =
+        layouts.getOrElseUpdate(path, VulkanAestheticTraining.loraComponents(path))
       var fingerprint = config.sha256
-      VulkanAestheticTraining.Conditioning(config, sdxl, caption => trained.getOrElseUpdate(caption, {
-        val name = s"text_aesthetic_${trained.size}"
-        val (tuned, digest) = VulkanAestheticTraining.train(engine, device, Path.of(model.path), sdxl,
-          caption, config.copy(sha256 = fingerprint), scratch, cancelled, aestheticProgress)
-        fingerprint = digest
-        aestheticDigest(digest)
-        lines += s"$name = load_text_encoder(${path(model.path)}, backend = ${quoted(device)}$placement, wtype = \"f32\", family = ${quoted(family)}, clip_l_path = ${path(tuned.toString)})"
-        name
-      }))
+      VulkanAestheticTraining.Conditioning(config, sdxl, (caption, adapters) => {
+        val textAdapters = adapters.filter(_.weight.toFloat != 0).map(l => loraFile(l) -> l.weight.toFloat)
+          .filter((file, _) => components(file)._1)
+        trained.getOrElseUpdate((caption, textAdapters), {
+          val name = s"text_aesthetic_${trained.size}"
+          val (tuned, digest) = VulkanAestheticTraining.train(engine, device, Path.of(model.path), sdxl,
+            caption, config.copy(sha256 = fingerprint), scratch, textAdapters, cancelled, aestheticProgress)
+          fingerprint = digest
+          aestheticDigest(digest)
+          lines += s"$name = load_text_encoder(${path(model.path)}, backend = ${quoted(device)}$placement, wtype = \"f32\", family = ${quoted(family)}, clip_l_path = ${path(tuned.toString)})"
+          name
+        })
+      }, components)
     }
     val scale = if family.startsWith("sdxl") && model.vaePath.isEmpty then ", conv_scale = 0.03125" else ""
     lines += s"vae = load_vae(${path(model.vaePath.getOrElse(model.path))}, $common$scale)"
     val sharedLoras = if composable.nonEmpty then Nil else loras
     for (l,i) <- sharedLoras.zipWithIndex do
       if l.unet.exists(_ != l.weight) || l.lbw.nonEmpty || l.dyn.nonEmpty || l.start.nonEmpty || l.stop.nonEmpty then unsupported("scheduled LoRA in a motion/identity graph")
-      val loadLora = s"lora$i = load_lora(${path(req.loraPaths.getOrElse(l.name, invalid(s"Unresolved LoRA ${l.name}")))})"
+      val file = loraFile(l)
+      val (withText, withUnet) = aestheticConditioning.fold((true, true))(a =>
+        if l.weight.toFloat == 0 then (false, false) else a.components(file))
+      val loadLora = s"lora$i = load_lora(${path(file)})"
       lines += loadLora
       textSetup += loadLora
-      lines += s"unet${i+1} = apply_lora(unet$i, lora$i, weight = ${l.weight})"
-      val applyText = s"text${i+1} = apply_lora(text$i, lora$i, weight = ${l.weight})"
+      val mode = if aestheticConditioning.nonEmpty then ", mode = \"at_runtime\"" else ""
+      val adaptedUnet = if withUnet then s"apply_lora(unet$i, lora$i, weight = ${l.weight}$mode)" else s"unet$i"
+      lines += s"unet${i+1} = $adaptedUnet"
+      val adaptedText = if withText then s"apply_lora(text$i, lora$i, weight = ${l.weight}$mode)" else s"text$i"
+      val applyText = s"text${i+1} = $adaptedText"
       lines += applyText
       textSetup += applyText
     val unet = s"unet${sharedLoras.size}"
@@ -269,7 +282,7 @@ private[vulkan] object VulkanGraph:
     def condition(label: String, caption: String, negative: Boolean): Unit =
       aestheticConditioning match
         case None => lines += s"$label = encode_prompt($text, ${quoted(caption)}, $enc)"
-        case Some(conditioning) => conditioning.encode(label, text, caption, enc, negative, lines)
+        case Some(conditioning) => conditioning.encode(label, text, caption, enc, negative, sharedLoras, lines)
     def onCanvas(image: BufferedImage): BufferedImage =
       if (image.getWidth, image.getHeight) == (width, height) then image
       else VulkanImageInputs.resize(image, width, height, 0)

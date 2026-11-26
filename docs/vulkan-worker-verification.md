@@ -3,6 +3,16 @@
 
 
 
+## Windows v0.64 — Aesthetic Gradients with LoRA
+
+An independent CPU PyTorch check formed a rank-two Q-projection delta and applied the fixture's alpha and adapter weight before three Adam updates. On Radeon 780M, maximum absolute loss differences were 0.000357 for SD1.5 and 0.000456 for SDXL. On RTX 3090 the SDXL difference was 0.000084 at the first step and 0.003500 at the third. The same merged weights feed the Aesthetic style projection before training.
+
+Masked img2img compared no LoRA with a real fixed-weight adapter at 0.65 using the same seed. Radeon 780M used SD1.5 and `20_yui`, and RTX 3090 used SDXL and `alraune_v1_illustrious_b-000007`. Both changed the masked area and preserved every unmasked RGB channel. The worker logged 216 and 198 applied CLIP-L adapter tensors respectively. The input mask had zero blur and left visible seams in the comparison images.
+
+The staged `SDV-NUI.exe` repeated masked LoRA generation through MCP on both adapters with `cuda=false`. The run logs showed LoRA deltas applied before training and a trained CLIP-L overlay loaded for inference. Both PNGs retained every unmasked pixel and recorded the aesthetic embedding fingerprint. The images were inspected.
+
+All 69 Vulkan worker tests and 14 aesthetic plugin tests passed. The ZIP SHA-256 is `2652557ee2c19350e9c81958e64849c08bc4a6ab9cd3a09d4b5977eadf3b72d9`. The archived launcher, desktop JAR, worker JAR and inference DLL matched the tested staging files.
+
 ## Windows v0.63 — Aesthetic Gradients with ControlNet and Hires
 
 Matched-seed masked img2img ran with a balanced Canny unit on Radeon 780M using SD1.5 at 512 × 512 and RTX 3090 using SDXL at 768 × 768. Removing the unit or changing the Aesthetic blend weight from 0.85 to 0.01 changed the generated region on both adapters. All three comparisons on each adapter preserved every unmasked RGB channel.

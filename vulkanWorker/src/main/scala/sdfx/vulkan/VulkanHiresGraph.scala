@@ -51,9 +51,14 @@ private[vulkan] object VulkanHiresGraph:
         if l.unet.exists(_ != l.weight) || l.lbw.nonEmpty || l.dyn.nonEmpty || l.start.nonEmpty || l.stop.nonEmpty then
           unsupported("scheduled or block hires LoRA")
         val path = VulkanConditioning.file(req.loraPaths.getOrElse(l.name,invalid(s"Unresolved hires LoRA: ${l.name}")),"LoRA")
+        val (withText, withUnet) = aesthetic.fold((true, true))(a =>
+          if l.weight.toFloat == 0 then (false, false) else a.components(path))
         lines += s"hr_lora$i = load_lora(${q(path)})"
-        lines += s"hr_unet$i = apply_lora($unet, hr_lora$i, weight = ${l.weight})"
-        lines += s"hr_text$i = apply_lora($text, hr_lora$i, weight = ${l.weight})"
+        val mode = if aesthetic.nonEmpty then ", mode = \"at_runtime\"" else ""
+        val nextUnet = if withUnet then s"apply_lora($unet, hr_lora$i, weight = ${l.weight}$mode)" else unet
+        val nextText = if withText then s"apply_lora($text, hr_lora$i, weight = ${l.weight}$mode)" else text
+        lines += s"hr_unet$i = $nextUnet"
+        lines += s"hr_text$i = $nextText"
         unet = s"hr_unet$i"
         text = s"hr_text$i"
     val encoding = s"width = $width, height = $height, clip_skip = ${p.clipSkip}"
@@ -119,7 +124,7 @@ private[vulkan] object VulkanHiresGraph:
         colorShift = grown, high = true, colorMapped = grown))
       val ref = reference.fold("")(_.args("hr_ref", positive = name == "pos"))
       val encoded = aesthetic.fold(s"encode_prompt($text, ${q(prompt)}, $encoding)")(
-        _.encode(s"hr_${name}_condition", text, prompt, encoding, name == "neg", lines))
+        _.encode(s"hr_${name}_condition", text, prompt, encoding, name == "neg", adapters, lines))
       val blank = if name != "neg" || aesthetic.fold(prompt.nonEmpty)(_ => prompt.trim.nonEmpty) then ""
         else if lllite.nonEmpty then ", lllite_blank_negative = true"
         else if llul.nonEmpty then ", llul_blank_negative = true"

@@ -1,6 +1,7 @@
 package sdfx.vulkan
 
 import sdfx.core.protocol.EngineError
+import sdfx.core.model.LoraRef
 import sdfx.vulkan.tools.VulkanAestheticTraining
 
 class VulkanAestheticTrainingSuite extends munit.FunSuite:
@@ -38,17 +39,18 @@ class VulkanAestheticTrainingSuite extends munit.FunSuite:
 
   test("personalization leaves a blank negative untouched and uses each refinement caption") {
     val config = VulkanAestheticTraining.settings(ujson.Obj("embedding" -> "style", "negative" -> true))
-    val captions = Vector.newBuilder[String]
-    val conditioning = VulkanAestheticTraining.Conditioning(config, sdxl = true, caption => {
-      captions += caption
+    val captions = Vector.newBuilder[(String, Seq[LoraRef])]
+    val conditioning = VulkanAestheticTraining.Conditioning(config, sdxl = true, (caption, loras) => {
+      captions += caption -> loras
       "trained"
-    })
+    }, _ => true -> true)
     val lines = Vector.newBuilder[String]
-    conditioning.encode("neg", "base", "   ", "width = 512", negative = true, lines)
-    conditioning.encode("pos", "base", "red fox", "width = 512", negative = false, lines)
-    conditioning.encode("hr_neg", "base", "blue sky", "width = 576", negative = true, lines)
+    conditioning.encode("neg", "base", "   ", "width = 512", negative = true, Nil, lines)
+    conditioning.encode("pos", "base", "red fox", "width = 512", negative = false, Nil, lines)
+    val adapters = Seq(LoraRef("style", .7))
+    conditioning.encode("hr_neg", "base", "blue sky", "width = 576", negative = true, adapters, lines)
     val program = lines.result()
-    assertEquals(captions.result(), Vector("blue sky"))
+    assertEquals(captions.result(), Vector("blue sky" -> adapters))
     assertEquals(program.head, "neg = encode_prompt(base, \"\", width = 512)")
     assert(program.contains("hr_neg_trained = encode_prompt(trained, \"blue sky\", width = 576)"))
     assert(program.last.contains("vector = hr_neg_base.vector"))
