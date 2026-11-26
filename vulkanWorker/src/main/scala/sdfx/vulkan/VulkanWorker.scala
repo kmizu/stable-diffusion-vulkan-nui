@@ -87,7 +87,7 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
 
   private def hello = Obj("protocol" -> 1, "engine_version" -> "vulkan-sd.cpp-f296cb0", "cuda" -> false,
     "dry_run" -> false, "device" -> display(device), "vulkan_devices" -> Arr.from(adapters.map(display)),
-    "features" -> Arr.from(Vector("txt2img", "aesthetic_embedding", "aesthetic_score", "lora", "embeddings", "external_vae", "controlnet", "img2img", "animatediff", "animatediff_encode", "photomaker", "inpaint", "hires_fix", "img2img_hires_fix", "temporal_lab", "vae_tools", "list_devices", "system_info", "vram_estimator", "prevent_interrupt", VulkanClipIo.id) ++ VulkanTools.features ++
+    "features" -> Arr.from(Vector("txt2img", "aesthetic_embedding", "aesthetic_score", "lora", "embeddings", "external_vae", "controlnet", "img2img", "animatediff", "animatediff_encode", "photomaker", "inpaint", "hires_fix", "img2img_hires_fix", "temporal_lab", "vae_tools", "list_devices", "system_info", "vram_estimator", "prevent_interrupt", VulkanClipIo.id, VulkanFusionPrompt.id) ++ VulkanTools.features ++
       (if backend.supportsUnetHooks() then VulkanUnetHooks.attentionHooks.toVector.sorted else Vector.empty) ++
       (if backend.supportsUnetResize() then VulkanUnetHooks.resizeHooks.toVector.sorted else Vector.empty) ++
       Option.when(backend.supportsDynamicThreshold())("dynamic_thresholding") ++
@@ -484,7 +484,9 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
       val image = sdfx.vulkan.tools.DiffusionImageInput.readRgb(Path.of(path), maxBytes = 200000000L)
       (image, VulkanTools.differenceMask(config, image, () => job.cancelled))
     }
-    val graph = p.hooks.keysIterator.find(k => VulkanGraph.hooks(k) && !p.hooks(k).obj.get("enabled").contains(ujson.Bool(false)))
+    lazy val fusionActive = VulkanFusionPrompt.active(p.prompt) || VulkanFusionPrompt.active(p.negativePrompt)
+    val graph = p.hooks.keysIterator.find(k => VulkanGraph.hooks(k) &&
+      !p.hooks(k).obj.get("enabled").contains(ujson.Bool(false)) && (k != VulkanFusionPrompt.id || fusionActive))
       .orElse(Option.when(tweak.nonEmpty || separateHires && p.hires.upscaler.startsWith("Latent"))(VulkanGraph.latentHires))
     val temperature = p.hooks.get("gpu_temperature_guard").filterNot(_.obj.get("enabled").contains(ujson.Bool(false))).map { h =>
       if graph.nonEmpty then unsupported("GPU temperature guard in custom DGL graphs")
@@ -577,14 +579,20 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
             val clip = graph.filter(_ == VulkanClipIo.id).flatMap { _ =>
               VulkanClipIo.refinementConfig(p.hooks(VulkanClipIo.id), prompt == activePrompt, negative == p.negativePrompt)
             }
-            clip match
-              case Some(config) =>
+            val fusion = p.hooks.get(VulkanFusionPrompt.id)
+              .filterNot(_.obj.get("enabled").contains(ujson.Bool(false)))
+              .filter(_ => VulkanFusionPrompt.active(prompt) || VulkanFusionPrompt.active(negative))
+              .map(VulkanFusionPrompt.id -> _)
+            if clip.nonEmpty && fusion.nonEmpty then unsupported("Clip I/O and Prompt Fusion in the same refinement")
+            val refinementGraph = clip.map(VulkanClipIo.id -> _).orElse(fusion)
+            refinementGraph match
+              case Some((hook, config)) =>
                 val params = refinementParams.copy(prompt = prompt, negativePrompt = negative,
                   samplerName = sampler, scheduler = actualSchedule,
                   img2img = p.img2img.map(_.copy(mask = None, denoisingStrength = strength)),
-                  hooks = Map(VulkanClipIo.id -> config))
+                  hooks = Map(hook -> config))
                 VulkanGraph.render(backend, device.id(), model, loadRequest.get, req.copy(params = params),
-                  VulkanClipIo.id, prompt, params.loras, seed, actualSchedule, () => job.cancelled,
+                  hook, prompt, params.loras, seed, actualSchedule, () => job.cancelled,
                   refinementImage = Some(resized)).head
               case None =>
                 val conditioning2 = prepareConditioning(req.copy(params = refinementParams.copy(prompt = prompt)), job, resources)

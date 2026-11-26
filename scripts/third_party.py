@@ -128,7 +128,7 @@ BASE = [
     ("ljleb/prompt-fusion-extension", "ported", "Prompt Fusion parser, AST and interpolation algorithms: "
      "upstream lib_prompt_fusion/{ast_nodes,geometries,interpolation_functions,interpolation_tensor,prompt_parser,t_scaler}.py "
      "at [1d86996](https://github.com/ljleb/prompt-fusion-extension/tree/1d86996ac4c3d32efaacb8a115600aa6fde6dab6/lib_prompt_fusion) "
-     "adapted into python/sdfx/fusion/; upstream MIT notice also preserved in python/sdfx/fusion/LICENSE"),
+     "adapted into python/sdfx/fusion/ and the JVM Vulkan worker; upstream MIT notice also preserved in python/sdfx/fusion/LICENSE"),
     ("AUTOMATIC1111/stable-diffusion-webui-tokenizer", "reimplemented", "CLIP text/ID token inspection -> `tokenizer`; "
      "clean implementation in python/sdfx/tokenizer_tool.py and native Tokenizer tab from documented behaviour "
      "at [ac6d541](https://github.com/AUTOMATIC1111/stable-diffusion-webui-tokenizer/tree/ac6d541c7032e9f9c69c8ead2ed201302b06a4fe); "

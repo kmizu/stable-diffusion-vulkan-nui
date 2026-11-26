@@ -39,10 +39,10 @@ private[vulkan] object VulkanClipIo:
       if !Files.exists(current) && Files.exists(legacy) then legacy else current
     }
 
-  private case class Matrix(tokens: Int, width: Int, values: Array[Float])
+  private[vulkan] case class Matrix(tokens: Int, width: Int, values: Array[Float])
   private val NpyMagic = Array(0x93.toByte, 'N'.toByte, 'U'.toByte, 'M'.toByte, 'P'.toByte, 'Y'.toByte)
   private val Shape = """'shape'\s*:\s*\(([^)]*)\)""".r
-  private def writeNpy(file: Path, matrix: Matrix): Unit =
+  private[vulkan] def writeNpy(file: Path, matrix: Matrix): Unit =
     val dict = s"{'descr': '<f4', 'fortran_order': False, 'shape': (${matrix.tokens}, ${matrix.width}), }"
     val pad = (64 - (10 + dict.length + 1) % 64) % 64
     val header = (dict + " " * pad + "\n").getBytes(US_ASCII)
@@ -51,7 +51,7 @@ private[vulkan] object VulkanClipIo:
     data.asFloatBuffer().put(matrix.values)
     Files.write(file, data.array())
 
-  private def readNpy(file: Path, width: Int): Matrix =
+  private[vulkan] def readNpy(file: Path, width: Int): Matrix =
     val data = ByteBuffer.wrap(Files.readAllBytes(file)).order(ByteOrder.LITTLE_ENDIAN)
     val magic = new Array[Byte](6)
     data.get(magic)
@@ -216,8 +216,11 @@ private[vulkan] object VulkanClipIo:
     out.result()
 
   def withSession[A](config: Value, width: Int)(body: Session => A): A =
-    val scratch = Files.createTempDirectory("sdv-clip-io-")
-    try body(new Session(config, width, scratch))
+    withScratch("sdv-clip-io-")(scratch => body(new Session(config,width,scratch)))
+
+  private[vulkan] def withScratch[A](prefix: String)(body: Path => A): A =
+    val scratch = Files.createTempDirectory(prefix)
+    try body(scratch)
     finally
       Using.resource(Files.list(scratch))(_.iterator().asScala.foreach(Files.deleteIfExists(_)))
       Files.deleteIfExists(scratch)
