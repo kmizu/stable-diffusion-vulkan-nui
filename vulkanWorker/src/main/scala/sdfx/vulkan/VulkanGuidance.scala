@@ -2,18 +2,26 @@ package sdfx.vulkan
 
 import sdfx.core.model.GenerationParams
 
+private[vulkan] object VulkanGuidance:
+  def cacheSchedule(hooks: Map[String, ujson.Value]): Option[(Double, Int)] =
+    hooks.get("cfg_cache").filterNot(_.obj.get("enabled").contains(ujson.Bool(false))).map { cache =>
+      val start = cache.obj.get("start").fold(0.25)(_.num)
+      val interval = cache.obj.get("interval").fold(3.0)(_.num)
+      if !start.isFinite || start < 0 || start > 1 || !interval.isWhole || interval < 2 || interval > 20 then
+        VulkanProtocol.invalid("Invalid CFG cache schedule")
+      if Seq("adaptive_threshold", "hf_weight").exists(k => cache.obj.get(k).exists(_.num != 0)) then
+        VulkanProtocol.unsupported("adaptive CFG cache or high-frequency boosting")
+      (start, interval.toInt)
+    }
+
 /** Evaluates both standard model branches and applies CFG in native prediction space. */
 private[vulkan] final class VulkanGuidance(p: GenerationParams, steps: Int):
   private type Lines = scala.collection.mutable.Builder[String,Vector[String]]
   private val rescale = p.hooks.get("rescale_cfg").filterNot(_.obj.get("enabled").contains(ujson.Bool(false)))
     .map(_.obj.get("multiplier").fold(0.7)(_.num))
   require(rescale.forall(n => n.isFinite && n >= 0 && n <= 1),"Invalid CFG rescale multiplier")
-  private val cache = p.hooks.get("cfg_cache").filterNot(_.obj.get("enabled").contains(ujson.Bool(false)))
-  private val start = cache.flatMap(_.obj.get("start")).fold(0.25)(_.num)
-  private val interval = cache.flatMap(_.obj.get("interval")).fold(3)(_.num.toInt)
-  require(start.isFinite && start >= 0 && start <= 1 && interval >= 2 && interval <= 20,"Invalid CFG cache schedule")
-  if cache.exists(v => Seq("adaptive_threshold","hf_weight").exists(k => v.obj.get(k).exists(_.num != 0))) then
-    VulkanProtocol.unsupported("adaptive CFG cache or high-frequency boosting")
+  private val cache = VulkanGuidance.cacheSchedule(p.hooks)
+  private val (start, interval) = cache.getOrElse((0.25, 3))
   private val mahiro = p.hooks.get("mahiro").exists(!_.obj.get("enabled").contains(ujson.Bool(false)))
   val enabled = (mahiro || rescale.nonEmpty || cache.nonEmpty) && p.cfgScale > 1
   private var lastFull = -1

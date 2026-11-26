@@ -1,0 +1,196 @@
+--- a/src/dgl/bindings/predictor.cpp
++++ b/src/dgl/bindings/predictor.cpp
+@@ -67,4 +67,11 @@
+         auto& hooks = options.unet_hooks;
+         hooks.tgate_step = int(get_int(args, "tgate_step"));
++        hooks.deepcache_interval = int(get_int(args, "deepcache_interval"));
++        hooks.deepcache_branch = int(get_int(args, "deepcache_branch"));
++        hooks.deepcache_first = int(get_int(args, "deepcache_first"));
++        hooks.deepcache_order = int(get_int(args, "deepcache_order"));
++        hooks.deepcache_contraction = float(get_number(args, "deepcache_contraction"));
++        if (hooks.deepcache_interval == 1 || hooks.deepcache_contraction <= 0.f)
++            throw std::runtime_error("Invalid DeepCache interval or contraction");
+         hooks.cdt_detail = float(get_number(args, "cdt_detail"));
+         hooks.cdt_detail2 = float(get_number(args, "cdt_detail2"));
+--- a/src/dgl/bindings/registration.cpp
++++ b/src/dgl/bindings/registration.cpp
+@@ -601,4 +601,7 @@
+              optional("circular_x", Kind::Boolean, false), optional("circular_y", Kind::Boolean, false),
+              integer("tgate_step", 0, 1000, 0),
++             integer("deepcache_interval", 0, 10, 0), integer("deepcache_branch", 0, 3, 0),
++             integer("deepcache_first", 0, 50, 5), integer("deepcache_order", 0, 2, 0),
++             number("deepcache_contraction", 0, 1, 1),
+              number("cdt_detail", -10000, 10000, 0), number("cdt_detail2", -10000, 10000, 0),
+              number("cdt_contrast", -10000, 10000, 0), number("cdt_stop", -10000, 10000, 0),
+--- a/src/dgl/models/dit.cpp
++++ b/src/dgl/models/dit.cpp
+@@ -487,4 +487,17 @@
+         }
+         const auto& attention = sd::nui::active;
++        if (auto* history = options.unet_hooks.deepcache_history) {
++            if (attention.deepcache_saved) {
++                if (history->last != step.index - 1)
++                    history->previous = history->last;
++                history->last = step.index - 1;
++                history->first_derivative = attention.deepcache_d1;
++                history->second_derivative = attention.deepcache_d2;
++            }
++            if (attention.deepcache_saved || attention.deepcache_reused)
++                LOG_INFO("DeepCache step %d, %s, forecast order %d", step.index,
++                         attention.deepcache_reused ? "reused" : "saved",
++                         history->second_derivative ? 2 : history->first_derivative ? 1 : 0);
++        }
+         if (attention.tgate_step && (step.index == gate || step.index == gate + 1)) {
+             LOG_INFO("T-GATE step %d, cross-attention saved %d, reused %d",
+--- a/src/dgl/ops/predictor.cpp
++++ b/src/dgl/ops/predictor.cpp
+@@ -156,4 +156,5 @@
+     struct PredictionExecution::Resources {
+         int unet_evaluations = 0;
++        std::map<std::tuple<const ModelPredictor*, bool, bool>, sd::nui::DeepCacheHistory> deepcache;
+         struct PreparedModel {
+             models::Model::ExecutionScope scope;
+@@ -460,4 +461,6 @@
+         auto options = leaf.options;
+         options.unet_hooks.sag_capture = sag_mask;
++        if (options.unet_hooks.deepcache_interval >= 2)
++            options.unet_hooks.deepcache_history = &deepcache[{&leaf, false, step.solver_index < 0}];
+         if (options.unet_hooks.tgate_step > 0)
+             options.unet_hooks.tgate_branch = reinterpret_cast<uintptr_t>(&leaf);
+@@ -476,4 +479,6 @@
+         sd::ParallelScope tensor_scope(model.tensor_executor.get());
+         auto options = leaf.options;
++        if (options.unet_hooks.deepcache_interval >= 2)
++            options.unet_hooks.deepcache_history = &deepcache[{&leaf, true, step.solver_index < 0}];
+         if (options.unet_hooks.tgate_step > 0) {
+             options.unet_hooks.tgate_branch = reinterpret_cast<uintptr_t>(&leaf);
+--- a/src/model/common/nui_unet_hooks.hpp
++++ b/src/model/common/nui_unet_hooks.hpp
+@@ -6,4 +6,9 @@
+
+ namespace sd::nui {
++    struct DeepCacheHistory {
++        int last = -1, previous = -1;
++        bool first_derivative = false, second_derivative = false;
++    };
++
+     struct UNetOptions {
+         float backbone[2] = {1.f, 1.f};
+@@ -19,4 +24,7 @@
+         bool shrink_after_skip = true;
+         uint32_t tile_seed = 0;
++        int deepcache_interval = 0, deepcache_branch = 0, deepcache_first = 5, deepcache_order = 0;
++        float deepcache_contraction = 1.f;
++        DeepCacheHistory* deepcache_history = nullptr;
+         int tgate_step = 0;
+         uintptr_t tgate_branch = 0;
+@@ -35,4 +43,6 @@
+         bool tgate_substep = false;
+         int tgate_captures = 0, tgate_reuses = 0;
++        bool deepcache_reused = false, deepcache_saved = false;
++        bool deepcache_d1 = false, deepcache_d2 = false;
+     };
+     inline thread_local UNetPass active;
+--- a/src/model/diffusion/unet.hpp
++++ b/src/model/diffusion/unet.hpp
+@@ -663,9 +663,35 @@
+             return mm->forward(ctx, h_in, num_video_frames);
+         };
++        // The downsampling result at the cut has no shallow decoder consumer.
++        auto& pass = sd::nui::active;
++        const auto* dc = pass.options;
++        const auto* history = dc ? dc->deepcache_history : nullptr;
++        const int step = int(pass.step) - 1;
++        const int branch = history ? dc->deepcache_branch : 0;
++        const auto levels = int(channel_mult.size());
++        std::string cache_key;
++        ggml_tensor* feature = nullptr;
++        if (history) {
++            if (tiny_unet || branch >= levels - 1 || !controls.empty())
++                throw std::runtime_error("DeepCache requires a standard U-Net, a shallower branch and no ControlNet");
++            cache_key = "deepcache." + std::to_string(reinterpret_cast<uintptr_t>(history));
++            const bool full = step < dc->deepcache_first || step < 0 ||
++                              (step - dc->deepcache_first) % dc->deepcache_interval == 0 ||
++                              (pass.tgate_step > 0 && int(pass.step) == pass.tgate_step);
++            if (!full && history->last >= 0 && step > history->last) {
++                feature = ctx->load_cache_tensor(cache_key + ".feature");
++                if (feature && (feature->ne[0] * (1LL << branch) != h->ne[0] ||
++                                feature->ne[1] * (1LL << branch) != h->ne[1] ||
++                                feature->ne[3] != h->ne[3]))
++                    feature = nullptr;
++            }
++        }
++        const bool reuse = feature != nullptr;
++
+         // input block 1-11
+         size_t len_mults    = channel_mult.size();
+         int input_block_idx = 0;
+         int ds              = 1;
+-        for (int i = 0; i < len_mults; i++) {
++        for (int i = 0; i < (reuse ? size_t(branch + 1) : len_mults); i++) {
+             int mult = channel_mult[i];
+             for (int j = 0; j < num_res_blocks; j++) {
+@@ -711,5 +737,24 @@
+
+         // middle_block
+-        if (!tiny_unet) {
++        if (reuse) {
++            auto* graph = ctx->ggml_ctx;
++            h = feature;
++            const float tau = float(step - history->last);
++            if (history->first_derivative) {
++                if (auto* d1 = ctx->load_cache_tensor(cache_key + ".d1"))
++                    h = ggml_add(graph, h, ggml_scale(graph, d1, dc->deepcache_contraction * tau));
++            }
++            if (history->second_derivative) {
++                if (auto* d2 = ctx->load_cache_tensor(cache_key + ".d2")) {
++                    const auto sigma = dc->deepcache_contraction;
++                    const float coefficient = (sigma < 1.f ? 0.5f * sigma * sigma : 1.f) *
++                                              tau * float(step - history->previous);
++                    h = ggml_add(graph, h, ggml_scale(graph, d2, coefficient));
++                }
++            }
++            pass.deepcache_reused = true;
++            hs.resize(size_t(branch + 1) * (num_res_blocks + 1));
++            ds = 1 << branch;
++        } else if (!tiny_unet) {
+             h = resblock_forward("middle_block.0", ctx, h, emb, num_video_frames);  // [N, 4*model_channels, h/8, w/8]
+             if (version != VERSION_SDXL_SSD1B && version != VERSION_SDXL_VEGA) {
+@@ -737,6 +782,27 @@
+
+         // output_blocks
+-        int output_block_idx = 0;
+-        for (int i = (int)len_mults - 1; i >= 0; i--) {
++        int output_block_idx = reuse ? (levels - 1 - branch) * (num_res_blocks + 1) : 0;
++        for (int i = reuse ? branch : levels - 1; i >= 0; i--) {
++            if (history && !reuse && i == branch) {
++                auto* graph = ctx->ggml_ctx;
++                auto* prior = ctx->load_cache_tensor(cache_key + ".feature");
++                if (dc->deepcache_order && prior && history->last >= 0 && step > history->last &&
++                    ggml_are_same_shape(h, prior)) {
++                    auto* delta = ggml_scale(graph, ggml_sub(graph, h, prior), 1.f / float(step - history->last));
++                    if (dc->deepcache_order >= 2 && history->first_derivative &&
++                        history->previous >= 0 && history->last > history->previous) {
++                        if (auto* old_d1 = ctx->load_cache_tensor(cache_key + ".d1")) {
++                            auto* delta2 = ggml_scale(graph, ggml_sub(graph, delta, old_d1),
++                                                      1.f / float(step - history->previous));
++                            ctx->persist_cache_tensor(cache_key + ".d2", delta2);
++                            pass.deepcache_d2 = true;
++                        }
++                    }
++                    ctx->persist_cache_tensor(cache_key + ".d1", delta);
++                    pass.deepcache_d1 = true;
++                }
++                ctx->persist_cache_tensor(cache_key + ".feature", h);
++                pass.deepcache_saved = true;
++            }
+             int up_w = 0, up_h = 0;
+             if (sd::nui::shrink_enabled()) {
+@@ -872,5 +938,6 @@
+         }
+
+-        auto runner_ctx            = get_context(sd::nui::active.tgate_step > 0 ? gf : nullptr);
++        auto runner_ctx            = get_context(sd::nui::active.tgate_step > 0 ||
++                                                        (sd::nui::active.options && sd::nui::active.options->deepcache_history) ? gf : nullptr);
+         runner_ctx.ip_context      = ip_context;
+         runner_ctx.ip_scale        = ip_scale;

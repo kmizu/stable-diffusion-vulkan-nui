@@ -1,0 +1,207 @@
+--- a/src/dgl/ops/predictor.h
++++ b/src/dgl/ops/predictor.h
+@@ -50,6 +50,8 @@
+         float image_scale = 1.f;
+         float pag_adaptive_decay = 0.f;
+         float sag_scale = 0.f;
++        int cfg_cache_interval = 0;
++        float cfg_cache_start = 0.25f;
+         LatentModifierOptions latent_modifier;
+         std::vector<float> scale_schedule;
+
+--- a/src/dgl/bindings/registration.cpp
++++ b/src/dgl/bindings/registration.cpp
+@@ -625,6 +625,7 @@
+         const std::vector<Argument> guidance_branches{
+             required("positive", Kind::Predictor), required("negative", Kind::Predictor), number("scale", 0, 1000),
+             optional("image_only", Kind::Predictor), number("image_scale", 0, 1000, 1), optional_list("schedule", Kind::Number), number("pag_adaptive_decay",0,1,0), number("sag_scale",0,30,0),
++            integer("cfg_cache_interval", 0, 20, 0), number("cfg_cache_start", 0, 1, 0.25),
+             optional("latent_modifier", Kind::Dict)};
+         registry["cfg"] = make_operation(guidance_branches, {Kind::Predictor}, make_cfg);
+         auto apg        = guidance_branches;
+--- a/src/dgl/bindings/predictor.cpp
++++ b/src/dgl/bindings/predictor.cpp
+@@ -252,6 +252,10 @@
+         output.image_scale = float(get_number(args, "image_scale"));
+         output.pag_adaptive_decay = float(get_number(args,"pag_adaptive_decay"));
+         output.sag_scale = float(get_number(args,"sag_scale"));
++        output.cfg_cache_interval = int(get_int(args, "cfg_cache_interval"));
++        output.cfg_cache_start = float(get_number(args, "cfg_cache_start"));
++        if (output.cfg_cache_interval == 1)
++            throw std::runtime_error("CFG cache interval must be zero or at least two");
+         if (args.count("latent_modifier")) {
+             const auto& fields = args.at("latent_modifier").fields;
+             auto& m = output.latent_modifier;
+--- a/src/dgl/ops/predictor.cpp
++++ b/src/dgl/ops/predictor.cpp
+@@ -155,7 +155,12 @@
+
+     struct PredictionExecution::Resources {
+         int unet_evaluations = 0;
+-        std::map<std::tuple<const ModelPredictor*, bool, bool>, sd::nui::DeepCacheHistory> deepcache;
++        std::map<std::pair<const ModelPredictor*, bool>, sd::nui::DeepCacheHistory> deepcache;
++        struct CfgDelta {
++            Tensor<float> value;
++            int step = -1;
++        };
++        std::map<std::pair<const GuidanceBranches*, bool>, CfgDelta> cfg_deltas;
+         struct PreparedModel {
+             models::Model::ExecutionScope scope;
+
+@@ -461,7 +466,7 @@
+         auto options = leaf.options;
+         options.unet_hooks.sag_capture = sag_mask;
+         if (options.unet_hooks.deepcache_interval >= 2)
+-            options.unet_hooks.deepcache_history = &deepcache[{&leaf, false, step.solver_index < 0}];
++            options.unet_hooks.deepcache_history = &deepcache[{&leaf, step.solver_index < 0}];
+         if (options.unet_hooks.tgate_step > 0)
+             options.unet_hooks.tgate_branch = reinterpret_cast<uintptr_t>(&leaf);
+         if (sag_mask) step.cache = nullptr;
+@@ -479,7 +484,7 @@
+         sd::ParallelScope tensor_scope(model.tensor_executor.get());
+         auto options = leaf.options;
+         if (options.unet_hooks.deepcache_interval >= 2)
+-            options.unet_hooks.deepcache_history = &deepcache[{&leaf, true, step.solver_index < 0}];
++            options.unet_hooks.deepcache_history = &deepcache[{&leaf, step.solver_index < 0}];
+         if (options.unet_hooks.tgate_step > 0) {
+             options.unet_hooks.tgate_branch = reinterpret_cast<uintptr_t>(&leaf);
+             options.unet_hooks.tgate_pair = true;
+@@ -633,12 +638,48 @@
+             return value;
+         }
+
++        Result cached_cfg(const GuidanceBranches& branches, float scale) {
++            auto& cached = execution_.resources_->cfg_deltas[{&branches, step_.solver_index < 0}];
++            const auto step = int(step_.index) - 1;
++            const auto warmup = std::max(1, int(std::ceil((step_.schedule_size - 1) * branches.cfg_cache_start)));
++            const auto& hooks = primary_predictor(active_branch(*branches.positive)).options.unet_hooks;
++            const bool deepcache_refresh = hooks.deepcache_interval >= 2 &&
++                (step < hooks.deepcache_first || (step - hooks.deepcache_first) % hooks.deepcache_interval == 0);
++            const bool gate = hooks.tgate_step > 0 && int(step_.index) == hooks.tgate_step;
++            if (!deepcache_refresh && !gate && step >= warmup &&
++                cached.step >= 0 && step > cached.step && step - cached.step < branches.cfg_cache_interval &&
++                cached.value.shape() == x_.shape()) {
++                auto& pos = evaluate(*branches.positive);
++                LOG_INFO("CFG cache step %d, reused", step + 1);
++                return {{}, modify_latent(branches, scale,
++                    denoised(pos) + cached.value * ((scale - 1.f) * pos.prediction.output_scale))};
++            }
++
++            batch_cfg(branches);
++            auto& pos = evaluate(*branches.positive);
++            auto& neg = evaluate(*branches.negative);
++            if (!pos.prediction.output.empty() && !neg.prediction.output.empty() &&
++                pos.prediction.output_scale == neg.prediction.output_scale &&
++                pos.prediction.skip_scale == neg.prediction.skip_scale) {
++                cached.value = pos.prediction.output - neg.prediction.output;
++                cached.step = step;
++                LOG_INFO("CFG cache step %d, saved", step + 1);
++            } else {
++                cached.step = -1;
++            }
++            const auto& unconditional = denoised(neg);
++            return {{}, modify_latent(branches, scale, unconditional + (denoised(pos) - unconditional) * scale)};
++        }
++
+         Result cfg(const GuidanceBranches& branches) {
+             auto scale = branches.scale_at(step_.index);
+             if (branches.pag_adaptive_decay > 0.f) {
+                 const auto& parameterization = primary_predictor(*branches.positive).resolved_parameterization();
+                 scale = std::max(1.f, scale - branches.pag_adaptive_decay * (1000.f - parameterization.timestep(sigma_)));
+             }
++            if (branches.cfg_cache_interval >= 2 && scale > 1.f && !branches.image_only &&
++                branches.sag_scale == 0.f && branches.negative.get() != unconditional_)
++                return cached_cfg(branches, scale);
+             if (scale != 1.f || branches.negative.get() == unconditional_)
+                 batch_cfg(branches);
+             const auto& pos = denoised(*branches.positive);
+--- a/src/model/diffusion/unet.hpp
++++ b/src/model/diffusion/unet.hpp
+@@ -670,6 +670,14 @@
+         const int branch = history ? dc->deepcache_branch : 0;
+         const auto levels = int(channel_mult.size());
+         std::string cache_key;
++        const auto batch = h->ne[3];
++        const auto load = [&](const char* suffix) -> ggml_tensor* {
++            auto* tensor = ctx->load_cache_tensor(cache_key + suffix);
++            if (tensor && batch == 1 && tensor->ne[3] == 2)
++                return ggml_view_4d(ctx->ggml_ctx, tensor, tensor->ne[0], tensor->ne[1], tensor->ne[2],
++                                    1, tensor->nb[1], tensor->nb[2], tensor->nb[3], 0);
++            return tensor && tensor->ne[3] == batch ? tensor : nullptr;
++        };
+         ggml_tensor* feature = nullptr;
+         if (history) {
+             if (tiny_unet || branch >= levels - 1 || !controls.empty())
+@@ -679,7 +687,7 @@
+                               (step - dc->deepcache_first) % dc->deepcache_interval == 0 ||
+                               (pass.tgate_step > 0 && int(pass.step) == pass.tgate_step);
+             if (!full && history->last >= 0 && step > history->last) {
+-                feature = ctx->load_cache_tensor(cache_key + ".feature");
++                feature = load(".feature");
+                 if (feature && (feature->ne[0] * (1LL << branch) != h->ne[0] ||
+                                 feature->ne[1] * (1LL << branch) != h->ne[1] ||
+                                 feature->ne[3] != h->ne[3]))
+@@ -741,11 +749,11 @@
+             h = feature;
+             const float tau = float(step - history->last);
+             if (history->first_derivative) {
+-                if (auto* d1 = ctx->load_cache_tensor(cache_key + ".d1"))
++                if (auto* d1 = load(".d1"))
+                     h = ggml_add(graph, h, ggml_scale(graph, d1, dc->deepcache_contraction * tau));
+             }
+             if (history->second_derivative) {
+-                if (auto* d2 = ctx->load_cache_tensor(cache_key + ".d2")) {
++                if (auto* d2 = load(".d2")) {
+                     const auto sigma = dc->deepcache_contraction;
+                     const float coefficient = (sigma < 1.f ? 0.5f * sigma * sigma : 1.f) *
+                                               tau * float(step - history->previous);
+@@ -785,13 +793,13 @@
+         for (int i = reuse ? branch : levels - 1; i >= 0; i--) {
+             if (history && !reuse && i == branch) {
+                 auto* graph = ctx->ggml_ctx;
+-                auto* prior = ctx->load_cache_tensor(cache_key + ".feature");
++                auto* prior = load(".feature");
+                 if (dc->deepcache_order && prior && history->last >= 0 && step > history->last &&
+                     ggml_are_same_shape(h, prior)) {
+                     auto* delta = ggml_scale(graph, ggml_sub(graph, h, prior), 1.f / float(step - history->last));
+                     if (dc->deepcache_order >= 2 && history->first_derivative &&
+                         history->previous >= 0 && history->last > history->previous) {
+-                        if (auto* old_d1 = ctx->load_cache_tensor(cache_key + ".d1")) {
++                        if (auto* old_d1 = load(".d1")) {
+                             auto* delta2 = ggml_scale(graph, ggml_sub(graph, delta, old_d1),
+                                                       1.f / float(step - history->previous));
+                             ctx->persist_cache_tensor(cache_key + ".d2", delta2);
+--- a/src/model/common/block.hpp
++++ b/src/model/common/block.hpp
+@@ -514,11 +514,16 @@
+         std::string key;
+         const bool pair = tgate && pass.options->tgate_pair && x->ne[2] == 2;
+         if (tgate) {
+-            key = "tgate." + std::to_string(pass.options->tgate_branch) +
+-                  (pair ? ".pair." : ".single.") + (pass.tgate_substep ? "sub." : "main.") +
+-                  std::to_string(reinterpret_cast<uintptr_t>(this));
++            const auto cache_key = [&](bool paired) {
++                return "tgate." + std::to_string(pass.options->tgate_branch) +
++                       (paired ? ".pair." : ".single.") + (pass.tgate_substep ? "sub." : "main.") +
++                       std::to_string(reinterpret_cast<uintptr_t>(this));
++            };
++            key = cache_key(pair);
+             if (int(pass.step) > pass.tgate_step) {
+                 cached = ctx->load_cache_tensor(key);
++                if (!cached && !pair && x->ne[2] == 1)
++                    cached = ctx->load_cache_tensor(cache_key(true));
+                 if (cached && (cached->ne[0] != x->ne[0] || cached->ne[1] != x->ne[1] ||
+                                cached->ne[2] != (pair ? 1 : x->ne[2])))
+                     cached = nullptr;
+--- a/src/dgl/models/dit.cpp
++++ b/src/dgl/models/dit.cpp
+@@ -499,7 +499,8 @@
+                          attention.deepcache_reused ? "reused" : "saved",
+                          history->second_derivative ? 2 : history->first_derivative ? 1 : 0);
+         }
+-        if (attention.tgate_step && (step.index == gate || step.index == gate + 1)) {
++        if (attention.tgate_step && (step.index == gate || step.index == gate + 1 ||
++                                     (attention.deepcache_saved && attention.tgate_reuses > 0))) {
+             LOG_INFO("T-GATE step %d, cross-attention saved %d, reused %d",
+                      step.index, attention.tgate_captures, attention.tgate_reuses);
+         }

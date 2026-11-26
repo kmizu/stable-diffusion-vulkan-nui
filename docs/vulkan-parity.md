@@ -100,9 +100,19 @@ Color Map evaluates the positive and negative branches separately. The worker co
 
 The U-Net saves each cross-attention output at the gate step and reuses it on later steps, skipping its normalization and projections. The Vulkan buffer stays in the sampler session. Compatible batched CFG stores the mean of its two outputs. Separate predictions and intermediate solver evaluations have their own entries. Each Hires or img2img refinement pass starts with an empty cache. The cross-attention gate follows the [T-GATE method](https://arxiv.org/abs/2404.02747).
 
-SD1.5 on Radeon 780M saved and reused 16 outputs. SDXL on RTX 3090 saved and reused 70. The same-seed masked runs changed the edited region and retained every pixel outside it. A subsequent replay stayed exact after switching the seed and prompt. RTX 3090 also ran CFG 1, a combined scheduled CFG and Latent Hires pass, and Heun with distinct entries for the intermediate evaluations. Radeon 780M ran separate img2img Hires Fix. The combined Fast Mode preset still needs its DeepCache and CFG-Cache paths integrated with T-GATE.
+SD1.5 on Radeon 780M saved and reused 16 outputs. SDXL on RTX 3090 saved and reused 70. The same-seed masked runs changed the edited region and retained every pixel outside it. A subsequent replay stayed exact after switching the seed and prompt. RTX 3090 also ran CFG 1, a combined scheduled CFG and Latent Hires pass, and Heun with distinct entries for the intermediate evaluations. Radeon 780M ran separate img2img Hires Fix.
 
-Further Python generation hooks without a corresponding verified implementation in this inventory include `aesthetic_gradients`, `agent_attention`, `characteristic_guidance`, `compile`, `composable_lora`, `controllllite`, `deepcache`, `incantations`, `llul`, `reference`.
+### DeepCache
+
+[DeepCache](https://openaccess.thecvf.com/content/CVPR2024/html/Ma_DeepCache_Accelerating_Diffusion_Models_for_Free_CVPR_2024_paper.html) skips the U-Net's deep downsampling, middle block and matching decoder blocks on reuse steps. The sampler owns the cached feature and the optional first and second divided differences for [TaylorSeer](https://openaccess.thecvf.com/content/ICCV2025/html/Liu_From_Reusing_to_Forecasting_Accelerating_Diffusion_Models_with_TaylorSeers_ICCV_2025_paper.html). The worker accepts cache interval, branch, initial full steps, forecast order and contraction. Relative L1 drift refresh is unavailable, and legacy DeepCache excludes ControlNet.
+
+Radeon 780M ran masked SD1.5 at 512 × 512 and RTX 3090 ran masked SDXL at 768 × 768. Both logs confirmed feature reuse and both forecast orders. Same-seed tests retained every pixel outside the mask. SDXL repeated the cached run pixel for pixel and completed an 832 × 832 latent Hires pass. Constant reuse retained the appearance of the fox in the reviewed outputs. Forecasting produced pronounced color artifacts in the short SDXL run.
+
+### Fast Mode
+
+Fast Mode combines DeepCache, T-GATE, fixed-interval CFG-Cache and scheduled CFG in one sampler. It refreshes both CFG branches at scheduled DeepCache refreshes and at the T-GATE capture step. On conditional-only steps the positive stream can read its own slice of the paired DeepCache feature. The combined masked tests ran on SD1.5 at 512 × 512 on Radeon 780M and SDXL at 768 × 768 on RTX 3090. Both reproduced the same-seed image on replay and kept all unmasked pixels unchanged. RTX 3090 also completed an 832 × 832 latent Hires pass with all four hooks. Adaptive CFG-Cache and high-frequency boosting remain unavailable.
+
+Further Python generation hooks without a corresponding verified implementation in this inventory include `aesthetic_gradients`, `agent_attention`, `characteristic_guidance`, `compile`, `composable_lora`, `controllllite`, `incantations`, `llul`, `reference`.
 
 ### Boundaries of the port
 

@@ -683,6 +683,10 @@ public final class VulkanInference implements AutoCloseable {
         return cString(ptr("sd_dgl_builtin_catalog")).contains("`tgate_step?");
     }
 
+    public boolean supportsDeepCache() {
+        return cString(ptr("sd_dgl_builtin_catalog")).contains("`deepcache_interval?");
+    }
+
     public AutoCloseable temporaryDglModelFiles() {
         if (ctx.equals(NULL)) throw new IllegalStateException("Load a checkpoint before using DGL");
         var dgl = ptr("sd_ctx_get_dgl_ctx", ctx);

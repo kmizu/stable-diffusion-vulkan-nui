@@ -9,7 +9,7 @@ private[vulkan] object VulkanHiresGraph:
   /** The first pass leaves its diffusion latent in `latent`; sample again at the target resolution. */
   def refinement(req: GenerationRequest, firstPrompt: String, firstLoras: Seq[LoraRef], seed: Long,
       baseUnet: String, baseText: String, eta: String, device: String, customNoise: Boolean, tiled: String,
-      cdTuner: Option[VulkanCdTuner.Options] = None, tgate: Option[Int] = None): Vector[String] =
+      cdTuner: Option[VulkanCdTuner.Options] = None, cacheArgs: String = ""): Vector[String] =
     import VulkanProtocol.{invalid,unsupported}
     val p = req.params
     val h = p.hires
@@ -49,8 +49,7 @@ private[vulkan] object VulkanHiresGraph:
       val grown = areaRatio > 1
       val cdt = cdTuner.fold("")(t => t.args(t.weights(areaRatio, baseSteps), "cdt_map", name == "neg",
         colorShift = grown, high = true, colorMapped = grown))
-      val cached = tgate.fold("")(n => s", tgate_step = $n")
-      lines += s"hr_$name = predictor($unet, encode_prompt($text, ${q(prompt)}, $encoding)$cdt$cached)"
+      lines += s"hr_$name = predictor($unet, encode_prompt($text, ${q(prompt)}, $encoding)$cdt$cacheArgs)"
     val aa = h.upscaler.contains("antialiased")
     lines += s"""hr_rng = make_rng("cpu", seed = $seed)"""
     if h.upscaler.startsWith("Latent") then
@@ -75,7 +74,7 @@ private[vulkan] object VulkanHiresGraph:
     require(full <= 10000,"Hires schedule exceeds 10000 steps")
     val count = (full*h.denoisingStrength).toInt.min(full).max(1)
     val cfg = h.cfgScale.getOrElse(p.cfgScale)
-    val cfgTiming = tgate.fold("")(_ => VulkanTGate.cfgArguments(p.hooks, cfg, count))
+    val cfgTiming = if cacheArgs.nonEmpty then VulkanGraph.cacheCfgArguments(p.hooks, cfg, count) else ""
     lines += s"hr_guided = cfg(hr_pos, hr_neg, scale = $cfg$cfgTiming)"
     lines += s"hr_full = make_sigmas(hr_guided, latent = hr_base, scheduler = ${q(scheduler)}, steps = $full)"
     lines += s"hr_sigmas = hr_full[${full-count}:]"

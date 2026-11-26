@@ -3,6 +3,12 @@
 
 
 
+## Windows v0.49 — DeepCache and Fast Mode
+
+The ZIP SHA-256 is `387dced983db138a660837ae738f624ea696d0eb6fb93179bbcedb51b3ee71d9`. The staged `SDV-NUI.exe` ran masked SDXL img2img over MCP on RTX 3090 and masked SD1.5 img2img on Radeon 780M with a system-only PATH and reported `cuda=false`. The sampler logged reuse from all three caches and recorded Fast Mode settings in the PNG. Every unmasked pixel matched the input. The ZIP contains the tested launcher, worker JAR and native inference DLL byte for byte.
+
+Direct worker tests used masked SD1.5 at 512 × 512 on Radeon 780M and SDXL at 768 × 768 on RTX 3090. The logs recorded skipped deep U-Net blocks and first- and second-order forecasts. Radeon 780M ran the shorter interval with contraction 0.65. RTX 3090 also ran branch 1 and an 832 × 832 latent Hires pass. Both GPUs retained every unmasked pixel and reproduced the same-seed output with all four Fast Mode hooks. Inspected SDXL output showed pronounced color artifacts in the short extrapolation run. All 39 worker tests and five Fast Mode plugin tests passed.
+
 ## Windows v0.48 — T-GATE
 
 The ZIP SHA-256 is `08ba3928b5eac5310df4184030f312089b6df2006d719e370f2165801eb99064`. The staged `SDV-NUI.exe` ran masked SDXL img2img through MCP on RTX 3090 with a system-only PATH. It saved and reused 70 cross-attention outputs, recorded the gate step in the PNG, and preserved every unmasked pixel. The ZIP contains the tested worker JAR and native DLL byte for byte.
