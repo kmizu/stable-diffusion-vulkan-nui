@@ -3,6 +3,16 @@
 
 
 
+## Windows v0.56 — Static Composable LoRA
+
+RTX 3090 tested masked SDXL at 768 × 768 with a U-Net-only SafeTensors adapter. Radeon 780M tested masked SD1.5 at 512 × 512 with an adapter covering both text and U-Net. Moving the same LoRA between two AND branches changed the edited region on both GPUs. Returning to the original branch reproduced the same seed pixel for pixel. All unmasked source pixels matched.
+
+RTX 3090 also tested the negative adapter switches and a separate branch assignment for the 832 × 832 Latent Hires pass. A two-adapter job applied standard LoRA to one branch and LoKr to another, logged both sets of matched tensors and kept the unmasked image pixel-exact. The images were inspected, and all 57 Vulkan worker tests and the Composable LoRA plugin test passed.
+
+The staged `SDV-NUI.exe` ran both masked jobs through MCP with the default Model Keyword configuration, a system-only PATH and `cuda=false`. RTX 3090 used DPM++ 2M and Radeon 780M used Euler. Both PNGs preserved the original branch tag and settings, and every unmasked source pixel matched. The native log confirmed application of the selected adapter at runtime.
+
+The ZIP SHA-256 is `be011e3f95811190806710e4250e10dac25936ec68153e3db790ef4ea6cd8848`. The archived launcher, desktop JAR, worker JAR and inference DLL matched the tested staged files byte for byte.
+
 ## Windows v0.55 — Characteristic Guidance
 
 Direct masked SDXL img2img on RTX 3090 at 768 × 768 and SD1.5 on Radeon 780M at 512 × 512 exercised the native characteristic solver. The corrected output differed inside the edit, and both adapters retained every unmasked pixel. The one-iteration fallback matched ordinary img2img pixel for pixel. RTX 3090 also reproduced the corrected seed exactly, matched the disabled job at CFG scale 1, matched the fallback with an empty negative prompt and exercised three quantile bands per latent channel.

@@ -691,6 +691,10 @@ public final class VulkanInference implements AutoCloseable {
         return cString(ptr("sd_dgl_builtin_catalog")).contains("`characteristic?");
     }
 
+    public boolean supportsComposableLora() {
+        return cString(ptr("sd_dgl_builtin_catalog")).contains("`composable?");
+    }
+
     public boolean supportsLLLite() {
         return cString(ptr("sd_dgl_builtin_catalog")).contains("`lllite_path?");
     }

@@ -21,7 +21,8 @@ private[vulkan] object VulkanHiresGraph:
       agent: Option[VulkanAgentAttention.Config] = None, controlWeight: Option[Double] = None,
       inpaint: Boolean = false, lllite: Option[(VulkanLLLite.Config, String)] = None,
       llul: Option[VulkanLlul.Config] = None,
-      characteristic: Option[VulkanCharacteristic.Config] = None): Vector[String] =
+      characteristic: Option[VulkanCharacteristic.Config] = None,
+      composable: Option[ujson.Value] = None): Vector[String] =
     import VulkanProtocol.{invalid,unsupported}
     val p = req.params
     val h = p.hires
@@ -40,7 +41,7 @@ private[vulkan] object VulkanHiresGraph:
     val adapters = req.hiresLoras.getOrElse(firstLoras)
     var unet = baseUnet
     var text = baseText
-    if adapters != firstLoras then
+    if composable.isEmpty && adapters != firstLoras then
       unet = "unet0"
       text = "text0"
       for (l,i) <- adapters.zipWithIndex do
@@ -56,6 +57,10 @@ private[vulkan] object VulkanHiresGraph:
     val encoding = s"width = $width, height = $height, clip_skip = ${p.clipSkip}"
     val resolved = p.hooks.get("hires_fix_tweaks").exists(_.obj.get("prompts_resolved").exists(_.bool))
     def selected(value: String, fallback: String) = if resolved || value.nonEmpty then value else fallback
+    val positivePrompt = selected(h.prompt, firstPrompt)
+    val negativePrompt = selected(h.negativePrompt, p.negativePrompt)
+    val loraPlan = composable.map(VulkanComposableLora.plan(
+      positivePrompt, negativePrompt, req.manualLoras, adapters, _, firstPrompt))
     val areaRatio = targetWidth.toDouble * targetHeight / (p.width.toDouble * p.height)
     val baseSteps = p.img2img.fold(p.steps)(i => ((p.steps * i.denoisingStrength).toInt + 1).min(p.steps))
     reference.foreach(config => lines ++= config.prepare("hr_ref", tiled))
@@ -69,7 +74,7 @@ private[vulkan] object VulkanHiresGraph:
       ", concat = hr_inpaint_condition"
     else ""
     val aa = h.upscaler.contains("antialiased")
-    val randomAlgorithm = if llul.nonEmpty || characteristic.nonEmpty then "cuda" else "cpu"
+    val randomAlgorithm = if llul.nonEmpty || characteristic.nonEmpty || composable.nonEmpty then "cuda" else "cpu"
     lines += s"""hr_rng = make_rng("$randomAlgorithm", seed = $seed)"""
     if h.upscaler.startsWith("Latent") then
       lines += s"hr_base = tensor::interpolate(latent, size = [${width/8},${height/8}], mode = ${q(method)}, antialias = $aa)"
@@ -99,7 +104,9 @@ private[vulkan] object VulkanHiresGraph:
       lines += s"hr_lllite_hint = image::to_f32($hint, channels = 3)"
       config.args(path, "hr_lllite_hint")
     }
-    for (name,prompt) <- Seq("pos" -> selected(h.prompt,firstPrompt), "neg" -> selected(h.negativePrompt,p.negativePrompt)) do
+    loraPlan.foreach(plan => lines ++= VulkanComposableLora.prepare(plan, req, "hr_clora", unet, text, encoding,
+      concat, supportsBlank = true))
+    for (name,prompt) <- Seq("pos" -> positivePrompt, "neg" -> negativePrompt) if loraPlan.isEmpty do
       val grown = areaRatio > 1
       val cdt = cdTuner.fold("")(t => t.args(t.weights(areaRatio, baseSteps), "cdt_map", name == "neg",
         colorShift = grown, high = true, colorMapped = grown))
@@ -122,11 +129,14 @@ private[vulkan] object VulkanHiresGraph:
     val cfg = h.cfgScale.getOrElse(p.cfgScale)
     val cfgTiming = if cacheArgs.nonEmpty then VulkanGraph.cacheCfgArguments(p.hooks, cfg, count) else ""
     val chgArgs = characteristic.fold("")(_.args(p.steps, cfg))
-    lines += s"hr_guided = cfg(hr_pos, hr_neg, scale = $cfg$cfgTiming$chgArgs)"
-    lines += s"hr_full = make_sigmas(hr_guided, latent = hr_base, scheduler = ${q(scheduler)}, steps = $full)"
+    val branchNames = if composable.nonEmpty then "hr_clora_branch0, hr_clora_neg" else "hr_pos, hr_neg"
+    val cloraArgs = loraPlan.fold("")(_.guidance("hr_clora"))
+    lines += s"hr_guided = cfg($branchNames, scale = $cfg$cfgTiming$chgArgs$cloraArgs)"
+    val schedulePredictor = if composable.nonEmpty then "hr_clora_branch0" else "hr_guided"
+    lines += s"hr_full = make_sigmas($schedulePredictor, latent = hr_base, scheduler = ${q(scheduler)}, steps = $full)"
     lines += s"hr_sigmas = hr_full[${full-count}:]"
     val noise = if customNoise then "hr_noise" else "tensor::randn_like(hr_base, rng = hr_rng)"
-    lines += s"hr_start = add_noise(hr_guided, hr_base, $noise, sigma = hr_sigmas[0])"
+    lines += s"hr_start = add_noise($schedulePredictor, hr_base, $noise, sigma = hr_sigmas[0])"
     val mask = if p.img2img.exists(_.mask.nonEmpty) then
       val sourceMask = if inpaint then "denoise_mask" else "latent_mask"
       lines += s"""hr_mask = tensor::interpolate($sourceMask, size = [${width/8},${height/8}], mode = "nearest_max")"""

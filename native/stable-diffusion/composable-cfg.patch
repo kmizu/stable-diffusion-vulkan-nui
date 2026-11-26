@@ -1,0 +1,91 @@
+--- a/src/dgl/ops/predictor.h
++++ b/src/dgl/ops/predictor.h
+@@ -47,6 +47,7 @@
+
+     struct GuidanceBranches {
+         std::shared_ptr<Predictor> positive, negative, image_only;
++        std::vector<std::pair<std::shared_ptr<Predictor>, float>> composable;
+         float scale       = 1.f;
+         float image_scale = 1.f;
+         float pag_adaptive_decay = 0.f;
+--- a/src/dgl/bindings/registration.cpp
++++ b/src/dgl/bindings/registration.cpp
+@@ -650,6 +650,7 @@
+             optional("latent_modifier", Kind::Dict)};
+         auto cfg = guidance_branches;
+         cfg.push_back(optional("characteristic", Kind::Dict));
++        cfg.push_back(optional_list("composable", Kind::Dict));
+         registry["cfg"] = make_operation(std::move(cfg), {Kind::Predictor}, make_cfg);
+         auto apg        = guidance_branches;
+         apg.insert(apg.end(),
+--- a/src/dgl/bindings/predictor.cpp
++++ b/src/dgl/bindings/predictor.cpp
+@@ -411,6 +411,20 @@
+             branches.characteristic_start = int(start);
+             branches.characteristic_stop = int(stop);
+         }
++        if (args.count("composable")) {
++            if (branches.characteristic || branches.image_only || branches.sag_scale ||
++                branches.pag_adaptive_decay || branches.cfg_cache_interval)
++                throw std::runtime_error("Composable CFG needs ordinary guidance");
++            const auto& entries = args.at("composable").items;
++            if (entries.empty() || entries.size() > 64)
++                throw std::runtime_error("Composable CFG needs one to 64 branches");
++            for (const auto& entry : entries) {
++                const auto weight = float(get_number(entry.fields, "weight"));
++                if (!std::isfinite(weight))
++                    throw std::runtime_error("Composable CFG requires finite branch weights");
++                branches.composable.emplace_back(object<Predictor>(entry.fields, "predict"), weight);
++            }
++        }
+         return predictor_value(CfgPredictor{std::move(branches)});
+     }
+
+--- a/src/dgl/ops/predictor.cpp
++++ b/src/dgl/ops/predictor.cpp
+@@ -89,7 +89,10 @@
+                 const auto scale = guidance->scale_at(step.index);
+                 active.guidance.emplace_back(&predictor, scale);
+                 self(self, *guidance->positive);
+-                if (scale != 1.f || guidance->image_only)
++                for (const auto& branch : guidance->composable)
++                    if (branch.second != 0.f && scale != 0.f)
++                        self(self, *branch.first);
++                if (scale != 1.f || guidance->image_only || !guidance->composable.empty())
+                     self(self, *guidance->negative);
+                 if (guidance->image_only)
+                     self(self, *guidance->image_only);
+@@ -245,6 +248,8 @@
+             } else if (const auto* branches = guidance_branches(predictor)) {
+                 self(self, *branches->positive);
+                 self(self, *branches->negative);
++                for (const auto& branch : branches->composable)
++                    self(self, *branch.first);
+                 if (branches->image_only)
+                     self(self, *branches->image_only);
+             } else if (const auto* slg = std::get_if<SkipLayerPredictor>(&predictor.node)) {
+@@ -361,6 +366,8 @@
+             } else if (const auto* branches = guidance_branches(current)) {
+                 self(self, *branches->positive);
+                 self(self, *branches->negative);
++                for (const auto& branch : branches->composable)
++                    self(self, *branch.first);
+                 if (branches->image_only)
+                     self(self, *branches->image_only);
+             } else if (const auto* slg = std::get_if<SkipLayerPredictor>(&current.node)) {
+@@ -767,6 +774,15 @@
+                 const auto& parameterization = primary_predictor(*branches.positive).resolved_parameterization();
+                 scale = std::max(1.f, scale - branches.pag_adaptive_decay * (1000.f - parameterization.timestep(sigma_)));
+             }
++            if (!branches.composable.empty()) {
++                const auto& neg = denoised(*branches.negative);
++                auto result = neg;
++                if (scale != 0.f)
++                    for (const auto& branch : branches.composable)
++                        if (branch.second != 0.f)
++                            result += (denoised(*branch.first) - neg) * (branch.second * scale);
++                return {{}, modify_latent(branches, scale, std::move(result))};
++            }
+             if (auto corrected = characteristic(branches, scale))
+                 return std::move(*corrected);
+             if (branches.cfg_cache_interval >= 2 && scale > 1.f && !branches.image_only &&

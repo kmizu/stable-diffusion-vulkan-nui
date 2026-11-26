@@ -101,6 +101,7 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
       Option.when(backend.supportsLLLite())(VulkanLLLite.id).toVector ++
       Option.when(backend.supportsLlul())(VulkanLlul.id).toVector ++
       Option.when(backend.supportsCharacteristic())(VulkanCharacteristic.id).toVector ++
+      Option.when(backend.supportsComposableLora())(VulkanComposableLora.id).toVector ++
       Option.when(backend.supportsAgentAttention())(VulkanAgentAttention.id).toVector ++
       Option.when(backend.supportsDynamicThreshold())("dynamic_thresholding") ++
       (if backend.supportsSvd() then Vector("img2vid","novel_view") else Vector.empty) ++ Option.when(sdfx.vulkan.tools.VulkanCharaImport.available)("chara_searcher") ++ Option.when(sdfx.vulkan.tools.VulkanBlip.available && !sdfx.vulkan.tools.VulkanWdTagger.available)("caption") ++ Option.when(sdfx.vulkan.tools.VulkanCustomCode.enabled)("custom_code") ++ sdfx.vulkan.tools.VulkanWdTagger.features ++ Option.when(sdfx.vulkan.tools.VulkanFaceRestore.available)("face_restore") ++ Vector("vulkan_nsfw") ++ Option.when(sdfx.vulkan.tools.VulkanSafety.available)("nsfw_checker")))
@@ -505,9 +506,11 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
         val hires = requested.hires.enabled && config.applicable(requested.steps, requested.hires.cfgScale.getOrElse(requested.cfgScale))
         !base && !hires
       }
+    val skipComposable = requested.hooks.get(VulkanComposableLora.id)
+      .exists(config => !config.obj.get("enabled").contains(ujson.Bool(false)) && !VulkanComposableLora.needsGraph(gen.request))
     val effectiveHooks = requested.hooks -- Option.when(skipSag)("sag") -- Option.when(skipAgent)(VulkanAgentAttention.id) --
       Option.when(skipLLLite)(VulkanLLLite.id) -- Option.when(skipLlul)(VulkanLlul.id) --
-      Option.when(skipCharacteristic)(VulkanCharacteristic.id)
+      Option.when(skipCharacteristic)(VulkanCharacteristic.id) -- Option.when(skipComposable)(VulkanComposableLora.id)
     val req = if effectiveHooks.size == requested.hooks.size then gen.request
       else gen.request.copy(params = requested.copy(hooks = effectiveHooks))
     val p = req.params
@@ -526,7 +529,10 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
     val keyword = sdfx.vulkan.tools.VulkanKeyword.plan(req, model, toolSession, firstSeed, () => job.cancelled)
     keyword.foreach(plan => job.commit = plan.commit)
     val resources = Option.when(p.hooks.get("pnginfo_injection").exists(!_.obj.get("enabled").contains(ujson.Bool(false))))(new VulkanHashes.Run)
-    val conditioning = Option.when(keyword.isEmpty)(prepareConditioning(req, job, resources))
+    val composable = p.hooks.get(VulkanComposableLora.id)
+      .exists(config => !config.obj.get("enabled").contains(ujson.Bool(false)))
+    val conditioningRequest = if composable then req.copy(params = p.copy(loras = Nil)) else req
+    val conditioning = Option.when(keyword.isEmpty)(prepareConditioning(conditioningRequest, job, resources))
     val difference = p.hooks.get("inpaint_difference").filterNot(_.obj.get("enabled").contains(ujson.Bool(false))).map { config =>
       val path = p.img2img.getOrElse(invalid("Inpaint Difference requires an img2img input")).initImage
       val image = sdfx.vulkan.tools.DiffusionImageInput.readRgb(Path.of(path), maxBytes = 200000000L)
@@ -587,9 +593,9 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
         else emit(Obj("id" -> job.id, "type" -> "event", "event" -> "progress", "step" -> step, "total" -> total,
           "pass" -> pass.getOrElse(stage), "image" -> index, "images" -> order.size, "batch_size" -> 1))
       val planned = keyword.map(_.images(i))
-      val activePrompt = planned.fold(p.prompt)(_.prompt)
+      val activePrompt = planned.fold(p.prompt)(image => if composable then image.source else image.prompt)
       val activeConditioning = conditioning.getOrElse {
-        val adapted = req.copy(params = p.copy(prompt = activePrompt, loras = planned.get.loras))
+        val adapted = req.copy(params = p.copy(prompt = activePrompt, loras = if composable then Nil else planned.get.loras))
         prepareConditioning(adapted, job, resources)
       }
       val rendered = graph match
@@ -743,7 +749,8 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
         val hardware = Option.when(req.hardwareInfo.enabled)(HardwareInfo.Record(display(device),
           f"${(System.nanoTime() - start) / 1e9}%.2fs", Option(req.hardwareInfo.remark).filter(_.nonEmpty)))
         GeneratedImage(file.toString, seed, subseed = pass.fold(-1L)(_.baseSubseed), width = image.getWidth, height = image.getHeight, hardwareInfo = hardware,
-          effectivePrompt = planned.map(_.replay), modelKeywordSourcePrompt = planned.map(_.source),
+          effectivePrompt = planned.map(image => if composable then image.source else image.replay),
+          modelKeywordSourcePrompt = planned.map(_.source),
           hiresSeed = pass.map(_.seed), hiresSubseed = pass.map(_.subseed), hiresRepeat = pass.map(_.repeat),
           hiresSubseedStrength = pass.map(_.strength), hiresSeedResizeFromW = pass.map(_.width), hiresSeedResizeFromH = pass.map(_.height),
           infotextFields = Seq("Vulkan device" -> display(device)) ++ score.toSeq.flatMap(_.fields), pngChunks = score.toSeq.flatMap(_.chunks))

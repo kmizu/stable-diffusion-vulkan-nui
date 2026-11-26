@@ -140,7 +140,13 @@ The packaged executable ran masked SD1.5 and SDXL img2img through MCP on Radeon 
 
 The sampler computes a latent correction by re-evaluating the conditional and unconditional U-Net branches on Vulkan. The solver uses a global direction or per-channel quantile bands for ridge projection, Anderson acceleration and the previous step's converged correction as a warm start. Each Hires pass has its own solver. An evaluation that fails to converge uses ordinary CFG. The worker supports four-channel SD1.x, SD2.x and SDXL U-Nets with epsilon or v-prediction. IP-Adapter and ControlNet combinations are currently unsupported. [Characteristic Guidance paper](https://proceedings.mlr.press/v235/zheng24f.html).
 
-Further Python generation hooks without a corresponding verified implementation in this inventory include `aesthetic_gradients`, `compile`, `composable_lora` and `incantations`.
+### Composable LoRA
+
+Static `AND` branches use independent LoRA bindings for text encoding and U-Net prediction. The sampler combines the difference from the unconditional prediction for each weighted branch. Manual adapters are shared across positive branches. The two negative-adapter switches route the text encoder and U-Net independently, including the legacy default for a single branch. Ordinary Hires rebuilds the branch plan from the Hires prompt. Runtime adapter application keeps the branches on the same Vulkan checkpoint without merging separate copies of its weights. [Original Composable LoRA extension](https://github.com/opparco/stable-diffusion-webui-composable-lora).
+
+Step controllers, weight plots, dynamic ranks, extended Neutral Prompt operators and their combinations remain open. One-component detection currently reads SafeTensors keys. Other weight formats and detector-driven refinement combinations have separate coverage gaps.
+
+Further Python generation hooks without a corresponding verified implementation in this inventory include `aesthetic_gradients`, `compile` and `incantations`.
 
 ### Boundaries of the port
 
