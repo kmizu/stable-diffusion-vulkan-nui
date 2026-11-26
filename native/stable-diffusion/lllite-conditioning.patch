@@ -1,0 +1,44 @@
+--- a/src/dgl/bindings/predictor.cpp
++++ b/src/dgl/bindings/predictor.cpp
+@@ -1,5 +1,6 @@
+ #include "dgl/bindings/predictor.h"
+
++#include <algorithm>
+ #include <cmath>
+
+ #include "dgl/bindings/arguments.h"
+@@ -251,8 +252,6 @@
+             binding->strength = float(get_number(args, "lllite_strength"));
+             binding->first_t = 999.f * (1.f - float(get_number(args, "lllite_start")));
+             binding->last_t = 999.f * (1.f - float(get_number(args, "lllite_end")));
+-            if (binding->last_t > binding->first_t)
+-                throw std::runtime_error("ControlNet-LLLite start must precede end");
+             output.options.lllite = std::move(binding);
+         }
+         const auto& condition = args.at("condition").fields;
+@@ -275,6 +274,15 @@
+         }
+         output.condition = read_condition(condition, args);
+         auto& c          = output.condition;
++        if (output.options.lllite && get_bool(args, "lllite_blank_negative") &&
++            output.resolved_parameterization().prediction() != EDM_V_PRED) {
++            if (c.c_vector.empty() || c.c_vector.shape()[0] < 1280)
++                throw std::runtime_error("SDXL negative conditioning is missing its pooled embedding");
++            std::fill(c.c_crossattn.values().begin(), c.c_crossattn.values().end(), 0.f);
++            const auto stride = c.c_vector.shape()[0];
++            for (int64_t i = 0; i < c.c_vector.numel(); i += stride)
++                std::fill_n(c.c_vector.data() + i, 1280, 0.f);
++        }
+         if (args.count("ref_latents")) {
+             output.references = float_tensor_list(args.at("ref_latents"));
+         }
+--- a/src/dgl/bindings/registration.cpp
++++ b/src/dgl/bindings/registration.cpp
+@@ -602,6 +602,7 @@
+              integer("tgate_step", 0, 1000, 0),
+              optional("reference_latent", Kind::Tensor), optional("reference_noise", Kind::Tensor),
+              optional("lllite_path", Kind::String), optional("lllite_hint", Kind::Tensor),
++             optional("lllite_blank_negative", Kind::Boolean, false),
+              number("lllite_strength", 0, 10, 1), number("lllite_start", 0, 1, 0), number("lllite_end", 0, 1, 1),
+              number("reference_weight", 0, 2, 0), number("reference_style", 0, 1, 0.5),
+              optional("reference_positive", Kind::Boolean, false),

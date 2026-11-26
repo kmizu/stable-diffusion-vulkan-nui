@@ -3,6 +3,14 @@
 
 
 
+## Windows v0.52 — ControlNet-LLLite
+
+The ZIP SHA-256 is `5656197d6b5f02fe6df292bc5dd1d7ea40a03f9c6ec017d76038c578d039500b`. Using a system-only PATH, the staged `SDV-NUI.exe` found the named Canny adapter through the model catalog and accepted its hint through MCP. The worker reported Vulkan with `cuda=false` on both adapters. Both PNGs recorded the adapter and kept every unmasked pixel. The ZIP contains the tested launcher, worker JAR and native inference DLL byte for byte.
+
+RTX 3090 tested SDXL masked img2img at 768 × 768 and Radeon 780M at 512 × 512 with the published Canny adapter. Both logged 136 applied projections per evaluation and kept all unmasked RGB values. On RTX 3090, changing the hint or narrowing the timestep window changed the edited region. The original hint reproduced its image exactly after intervening changes. The published Depth adapter also ran using an RGB test input, which checked the model path and its effect on the output. The four-step 780M comparison showed pronounced saturation inside the edit with and without the adapter. The images were inspected.
+
+RTX 3090 also tested Reference-only together with LLLite, a separate zero-strength baseline with an empty negative prompt, a reversed interval, fallback to the init image and both hint sources in ordinary Hires. Zero strength reproduced normal Hires pixel for pixel. The nine-channel SDXL Inpaint checkpoint ran a separate 832 × 832 Latent Hires test. Another 832 × 832 test ran LLLite and ordinary Canny through the separate Img2Img Hires Fix. All 45 worker tests passed. The test weights were supplied externally. [Canny adapter](https://huggingface.co/kohya-ss/controlnet-lllite/blob/d14d1353be5a2326229d83e14f9b3c11f3a671bd/controllllite_v01032064e_sdxl_canny.safetensors) · [Depth adapter](https://huggingface.co/kohya-ss/controlnet-lllite/blob/2de0a69f3f27645acc62ba8167203f9d09635f8d/controllllite_v01008016e_sdxl_depth_anime.safetensors).
+
 ## Windows v0.51 — Agent Attention
 
 The ZIP SHA-256 is `6d871d8f9ea4578da96791f98efb62607021ebf37931246e481f3696f65e2a64`. The staged `SDV-NUI.exe` ran masked img2img over MCP with SD1.5 on Radeon 780M and SDXL on RTX 3090 using a system-only PATH. It reported Vulkan with `cuda=false`, logged agent-token use, recorded Agent Attention settings in the PNG and preserved every unmasked pixel on both adapters. The archive contains the tested launcher, worker JAR and inference DLL byte for byte.

@@ -1,0 +1,17 @@
+--- a/src/dgl/ops/predictor.cpp
++++ b/src/dgl/ops/predictor.cpp
+@@ -542,6 +542,14 @@
+                 !pos->condition.c_ref_images.empty() || !neg->condition.c_ref_images.empty())
+                 return;
+
++            const auto& pos_lite = pos->options.lllite;
++            const auto& neg_lite = neg->options.lllite;
++            if (bool(pos_lite) != bool(neg_lite) || (pos_lite &&
++                (pos_lite->weights != neg_lite->weights || pos_lite->hint != neg_lite->hint ||
++                 pos_lite->strength != neg_lite->strength || pos_lite->first_t != neg_lite->first_t ||
++                 pos_lite->last_t != neg_lite->last_t)))
++                return;
++
+             if (pos && neg) {
+                 resources.prepare_predictor(*pos);
+                 resources.prepare_predictor(*neg);

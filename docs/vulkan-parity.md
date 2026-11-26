@@ -124,7 +124,13 @@ SDXL masked img2img on RTX 3090 exercised 70 self-attention layers per CFG branc
 
 The masked SDXL test on RTX 3090 exercised ten layers with agents and ten with merge-only attention. It covered the FP32 path, switching or stopping mid-pass, exact same-seed replay and Hires-only application at 832 × 832. All unmasked pixels matched on the base-resolution cases. Radeon 780M exercised five layers with agents at 512 × 512 on SD1.5. Agent Attention with Canny completed masked SD1.5 and ordinary Hires on RTX 3090. The ordinary Hires graph also preserved the nine-channel SDXL Inpaint conditioning. Ineffective configurations keep ordinary generation pixel-exact, and the separate Img2Img Hires Fix stays outside Hires-only. Cross-attention remains unchanged.
 
-Further Python generation hooks without a corresponding verified implementation in this inventory include `aesthetic_gradients`, `characteristic_guidance`, `compile`, `composable_lora`, `controllllite`, `incantations` and `llul`.
+### ControlNet-LLLite
+
+The native worker reads the SDXL attention-projection adapters from the selected model file. Each adapter encodes the RGB hint, combines it with the projection input and adds the learned residual before Q, K or V. Conditioning stays in the Vulkan runner for the current sampling pass. The worker honors the strength and timestep interval and uses the prepared img2img input when the hint is omitted. A zero strength or reversed interval uses the normal generation path. Reference-only can use the same hint for each of its two spatial token grids. [Official model repository](https://huggingface.co/kohya-ss/controlnet-lllite).
+
+The official Canny model applied 136 projections per evaluation in the standalone SDXL Vulkan tests. RTX 3090 exercised reference attention, a second published adapter, a partial timestep window and the nine-channel Inpaint checkpoint at 832 × 832 in Hires. Radeon 780M ran SDXL masked img2img at 512 × 512. The masked comparisons preserved all source pixels outside the edit, and a later same-seed Canny replay matched pixel for pixel. LLLite also ran with ordinary Canny in the separate Img2Img Hires Fix.
+
+Further Python generation hooks without a corresponding verified implementation in this inventory include `aesthetic_gradients`, `characteristic_guidance`, `compile`, `composable_lora`, `incantations` and `llul`.
 
 ### Boundaries of the port
 

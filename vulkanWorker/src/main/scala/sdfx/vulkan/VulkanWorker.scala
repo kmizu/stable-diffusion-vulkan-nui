@@ -98,6 +98,7 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
       Option.when(backend.supportsTGate())(VulkanTGate.id).toVector ++
       Option.when(backend.supportsDeepCache())(VulkanDeepCache.id).toVector ++
       Option.when(backend.supportsReferenceOnly())(VulkanReference.id).toVector ++
+      Option.when(backend.supportsLLLite())(VulkanLLLite.id).toVector ++
       Option.when(backend.supportsAgentAttention())(VulkanAgentAttention.id).toVector ++
       Option.when(backend.supportsDynamicThreshold())("dynamic_thresholding") ++
       (if backend.supportsSvd() then Vector("img2vid","novel_view") else Vector.empty) ++ Option.when(sdfx.vulkan.tools.VulkanCharaImport.available)("chara_searcher") ++ Option.when(sdfx.vulkan.tools.VulkanBlip.available && !sdfx.vulkan.tools.VulkanWdTagger.available)("caption") ++ Option.when(sdfx.vulkan.tools.VulkanCustomCode.enabled)("custom_code") ++ sdfx.vulkan.tools.VulkanWdTagger.features ++ Option.when(sdfx.vulkan.tools.VulkanFaceRestore.available)("face_restore") ++ Vector("vulkan_nsfw") ++ Option.when(sdfx.vulkan.tools.VulkanSafety.available)("nsfw_checker")))
@@ -484,8 +485,12 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
     val skipAgent = requested.hooks.get(VulkanAgentAttention.id)
       .filterNot(_.obj.get("enabled").contains(ujson.Bool(false)))
       .exists(config => !VulkanAgentAttention.parse(config).applicable(model.kind, requested.hires.enabled))
-    val effectiveHooks = requested.hooks -- Option.when(skipSag)("sag") -- Option.when(skipAgent)(VulkanAgentAttention.id)
-    val req = if skipSag || skipAgent then gen.request.copy(params = requested.copy(hooks = effectiveHooks)) else gen.request
+    val skipLLLite = requested.hooks.get(VulkanLLLite.id)
+      .filterNot(_.obj.get("enabled").contains(ujson.Bool(false)))
+      .exists(config => !VulkanLLLite.parse(config).active)
+    val effectiveHooks = requested.hooks -- Option.when(skipSag)("sag") -- Option.when(skipAgent)(VulkanAgentAttention.id) --
+      Option.when(skipLLLite)(VulkanLLLite.id)
+    val req = if skipSag || skipAgent || skipLLLite then gen.request.copy(params = requested.copy(hooks = effectiveHooks)) else gen.request
     val p = req.params
     if isGeneration(job.kind) && ((job.kind == "img2img") != p.isImg2Img) then invalid("img2img requests require an init image and the img2img operation")
     val hires = VulkanImageInputs.hires(req)
@@ -526,7 +531,9 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
         cdTuner.flatMap(_.followup(width.toDouble * height / (p.width.toDouble * p.height), baseSteps))
       }
     val graphRequest = if graph.nonEmpty || refinement.nonEmpty then
-      val attachmentPaths = if graph.contains(VulkanFooocusInpaint.id) then req.controlnetPaths else Map.empty[String,String]
+      val attachmentPaths = if graph.contains(VulkanFooocusInpaint.id) then req.controlnetPaths else
+        p.hooks.get(VulkanLLLite.id).flatMap(_.obj.get("model")).flatMap(_.strOpt)
+          .flatMap(name => req.controlnetPaths.get(name).map(name -> _)).toMap
       req.copy(controlnetPaths = attachmentPaths ++ resolveControls(req,job))
     else req
     val fooocusAssets = Option.when(graph.contains(VulkanFooocusInpaint.id)) {
@@ -644,7 +651,8 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
               .orElse(unetHooks.keysIterator.nextOption().map(_ -> unetHooks))
               .orElse(modifier.map(entry => VulkanLatentModifier.id -> Map(entry)))
               .orElse(cdRefinement.map(_ => VulkanCdTuner.id -> Map(VulkanCdTuner.id -> p.hooks(VulkanCdTuner.id))))
-              .orElse(graph.filter(_ == VulkanReference.id).map(key => key -> Map(key -> p.hooks(key))))
+              .orElse(graph.filter(VulkanGraph.imageAttentionHooks).map(key =>
+                key -> p.hooks.filter((k, _) => VulkanGraph.imageAttentionHooks(k))))
               .orElse(graph.filter(VulkanGraph.cacheHooks).map(key =>
                 key -> p.hooks.filter((k, _) => VulkanGraph.cacheHooks(k) || VulkanGraph.cacheGuidanceHooks(k))))
               .map((key,hooks) => key -> (hooks ++ modifier))

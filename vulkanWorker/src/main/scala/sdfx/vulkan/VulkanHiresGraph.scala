@@ -12,7 +12,7 @@ private[vulkan] object VulkanHiresGraph:
       cdTuner: Option[VulkanCdTuner.Options] = None, cacheArgs: String = "",
       reference: Option[VulkanReference.Config] = None,
       agent: Option[VulkanAgentAttention.Config] = None, controlWeight: Option[Double] = None,
-      inpaint: Boolean = false): Vector[String] =
+      inpaint: Boolean = false, lllite: Option[(VulkanLLLite.Config, String)] = None): Vector[String] =
     import VulkanProtocol.{invalid,unsupported}
     val p = req.params
     val h = p.hires
@@ -55,15 +55,6 @@ private[vulkan] object VulkanHiresGraph:
       lines += s"hr_inpaint_condition = tensor::interpolate(inpaint_condition, size = [${width/8},${height/8}])"
       ", concat = hr_inpaint_condition"
     else ""
-    for (name,prompt) <- Seq("pos" -> selected(h.prompt,firstPrompt), "neg" -> selected(h.negativePrompt,p.negativePrompt)) do
-      val grown = areaRatio > 1
-      val cdt = cdTuner.fold("")(t => t.args(t.weights(areaRatio, baseSteps), "cdt_map", name == "neg",
-        colorShift = grown, high = true, colorMapped = grown))
-      val ref = reference.fold("")(_.args("hr_ref", positive = name == "pos"))
-      val encoded = s"encode_prompt($text, ${q(prompt)}, $encoding)"
-      val condition = controlWeight.fold(encoded)(weight =>
-        s"controlnet::apply($encoded, control_model, hr_control_hint, strength = $weight)")
-      lines += s"hr_$name = predictor($unet, $condition$concat$cdt$cacheArgs$ref$agentArgs)"
     val aa = h.upscaler.contains("antialiased")
     lines += s"""hr_rng = make_rng("cpu", seed = $seed)"""
     if h.upscaler.startsWith("Latent") then
@@ -78,6 +69,25 @@ private[vulkan] object VulkanHiresGraph:
       }
       lines += s"hr_resized = tensor::interpolate($input, size = [$width,$height], axes = [1,2], mode = ${q(method)})"
       lines += s"hr_base = vae_to_unet_latents(vae, vae_encode(vae, image::to_f32(hr_resized), rng = hr_rng$tiled))"
+    val llliteArgs = lllite.fold("") { (config, path) =>
+      val hint = if config.image.nonEmpty then "hr_lllite_image"
+        else if h.upscaler.startsWith("Latent") then
+          lines += s"hr_lllite_decoded = vae_decode(vae, unet_to_vae_latents(vae, hr_base)$tiled)"
+          "hr_lllite_decoded"
+        else "hr_resized"
+      lines += s"hr_lllite_hint = image::to_f32($hint, channels = 3)"
+      config.args(path, "hr_lllite_hint")
+    }
+    for (name,prompt) <- Seq("pos" -> selected(h.prompt,firstPrompt), "neg" -> selected(h.negativePrompt,p.negativePrompt)) do
+      val grown = areaRatio > 1
+      val cdt = cdTuner.fold("")(t => t.args(t.weights(areaRatio, baseSteps), "cdt_map", name == "neg",
+        colorShift = grown, high = true, colorMapped = grown))
+      val ref = reference.fold("")(_.args("hr_ref", positive = name == "pos"))
+      val encoded = s"encode_prompt($text, ${q(prompt)}, $encoding)"
+      val blank = if lllite.nonEmpty && name == "neg" && prompt.isEmpty then ", lllite_blank_negative = true" else ""
+      val condition = controlWeight.fold(encoded)(weight =>
+        s"controlnet::apply($encoded, control_model, hr_control_hint, strength = $weight)")
+      lines += s"hr_$name = predictor($unet, $condition$concat$cdt$cacheArgs$ref$agentArgs$llliteArgs$blank)"
     val sampler = h.samplerName.getOrElse(p.samplerName)
     val nativeMethod = VulkanProtocol.samplers.getOrElse(sampler,unsupported(s"hires sampler $sampler"))
     val schedule = h.scheduler.getOrElse(p.scheduler)

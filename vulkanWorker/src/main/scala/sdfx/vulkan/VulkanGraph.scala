@@ -9,6 +9,7 @@ import ujson.Value
 
 /** Builds the motion/identity model graphs using the pinned library's DGL operations. */
 private[vulkan] object VulkanGraph:
+  val imageAttentionHooks = Set(VulkanReference.id, VulkanLLLite.id)
   val cacheHooks = Set(VulkanTGate.id, VulkanDeepCache.id)
   val cacheGuidanceHooks = Set("cfg_cache", "cfg_schedule")
 
@@ -19,7 +20,7 @@ private[vulkan] object VulkanGraph:
       s", cfg_cache_start = $start, cfg_cache_interval = $interval"
     }
 
-  val hooks = Set("animatediff", "photomaker", "ip_adapter", "revision","sonar","semantic_guidance","neutral_prompt","latent_upscale","soft_inpainting","img2imgalt","postdiff",VulkanClipIo.id,VulkanLatentModifier.id,VulkanNegPip.id,VulkanFooocusInpaint.id,VulkanCdTuner.id,VulkanReference.id,VulkanAgentAttention.id) ++ cacheHooks ++ VulkanFusionPrompt.textHooks ++ VulkanLatentGraph.hooks ++ VulkanUnetHooks.hooks
+  val hooks = Set("animatediff", "photomaker", "ip_adapter", "revision","sonar","semantic_guidance","neutral_prompt","latent_upscale","soft_inpainting","img2imgalt","postdiff",VulkanClipIo.id,VulkanLatentModifier.id,VulkanNegPip.id,VulkanFooocusInpaint.id,VulkanCdTuner.id,VulkanAgentAttention.id) ++ imageAttentionHooks ++ cacheHooks ++ VulkanFusionPrompt.textHooks ++ VulkanLatentGraph.hooks ++ VulkanUnetHooks.hooks
   val latentHires = "latent hires refinement"
   private val unetFamilies = Set("sd15", "sdxl", "SD 2.x", "SD 1.x Inpaint", "SD 2.x Inpaint", "SDXL Inpaint")
   private def quoted(s: String): String = ujson.write(ujson.Str(s))
@@ -78,10 +79,18 @@ private[vulkan] object VulkanGraph:
       if !unetFamilies(model.kind) then unsupported("CD Tuner requires an SD1.x, SD2.x or SDXL U-Net")
       cdRefinement.orElse(VulkanCdTuner.config(p.hooks, Set("sdxl", "SDXL Inpaint")(model.kind)))
     }.flatten
-    val reference = Option.when(hook == VulkanReference.id) {
+    def attentionConfig(id: String): Option[Value] =
+      p.hooks.get(id).filter(config => imageAttentionHooks(hook) && !config.obj.get("enabled").contains(ujson.Bool(false)))
+    val reference = attentionConfig(VulkanReference.id).map { config =>
       if !engine.supportsReferenceOnly() then unsupported("This Vulkan runtime lacks Reference only")
       if !unetFamilies(model.kind) then unsupported("Reference only requires an SD1.x, SD2.x or SDXL U-Net")
-      VulkanReference.parse(p.hooks(hook))
+      VulkanReference.parse(config)
+    }
+    val lllite = attentionConfig(VulkanLLLite.id).map { raw =>
+      if !engine.supportsLLLite() then unsupported("This Vulkan runtime lacks ControlNet-LLLite")
+      if !Set("sdxl", "SDXL Inpaint")(model.kind) then unsupported("ControlNet-LLLite requires an SDXL U-Net")
+      val config = VulkanLLLite.parse(raw)
+      config -> VulkanConditioning.file(req.controlnetPaths.getOrElse(config.model, config.model), "ControlNet-LLLite model")
     }
     val agent = Option.when(hook == VulkanAgentAttention.id) {
       if !engine.supportsAgentAttention() then unsupported("This Vulkan runtime lacks Agent Attention")
@@ -98,9 +107,10 @@ private[vulkan] object VulkanGraph:
     val modifier = Option.when(customText || unetGraph || hook == VulkanLatentModifier.id)(
       VulkanLatentModifier.config(p)).flatten
     if modifier.nonEmpty && !engine.supportsLatentModifier() then unsupported("This Vulkan runtime lacks Latent Modifier")
-    val patchedInputs = customText || unetGraph || modifier.nonEmpty || fooocus.nonEmpty || cdTuner.nonEmpty || cacheGraph || reference.nonEmpty || agent.nonEmpty
-    val supportsControl = unetGraph || cdTuner.nonEmpty || tgate.nonEmpty || reference.nonEmpty || agent.nonEmpty || modifier.nonEmpty && !customText
-    val hiresPass = hook == latentHires || (cdTuner.nonEmpty || cacheGraph || reference.nonEmpty || agent.nonEmpty) && p.hires.enabled
+    val patchedAttention = reference.nonEmpty || lllite.nonEmpty || agent.nonEmpty
+    val patchedInputs = customText || unetGraph || modifier.nonEmpty || fooocus.nonEmpty || cdTuner.nonEmpty || cacheGraph || patchedAttention
+    val supportsControl = unetGraph || cdTuner.nonEmpty || tgate.nonEmpty || patchedAttention || modifier.nonEmpty && !customText
+    val hiresPass = hook == latentHires || (cdTuner.nonEmpty || cacheGraph || patchedAttention) && p.hires.enabled
     val h = if hiresPass then ujson.Obj() else p.hooks(hook)
     val latentHook = VulkanLatentGraph.hooks(hook)
     if p.hooks.get("dynamic_thresholding").exists(!_.obj.get("enabled").contains(ujson.Bool(false))) &&
@@ -126,7 +136,8 @@ private[vulkan] object VulkanGraph:
     val textHooks = if fusionScratch.nonEmpty then VulkanFusionPrompt.textHooks
       else if signedText then Set(VulkanWeightGradient.id)
       else Set.empty[String]
-    val permitted = Set(hook,"nsfw_checker","aesthetic_score","model_keyword","pnginfo_injection","adetailer","batch_face_swap") ++ imageHooks ++ textHooks ++ Option.when(hiresPass)("hires_fix_tweaks") ++ (if cacheGraph then cacheHooks ++ cacheGuidanceHooks else Set.empty[String]) ++ Option.when(modifier.nonEmpty)(VulkanLatentModifier.id) ++ (if latentHook then VulkanLatentGraph.hooks else Set.empty[String]) ++ (if unetHooks.nonEmpty then VulkanUnetHooks.hooks else Set.empty[String])
+    val permitted = Set(hook,"nsfw_checker","aesthetic_score","model_keyword","pnginfo_injection","adetailer","batch_face_swap") ++ imageHooks ++ textHooks ++
+      Option.when(reference.nonEmpty)(VulkanReference.id) ++ Option.when(lllite.nonEmpty)(VulkanLLLite.id) ++ Option.when(hiresPass)("hires_fix_tweaks") ++ (if cacheGraph then cacheHooks ++ cacheGuidanceHooks else Set.empty[String]) ++ Option.when(modifier.nonEmpty)(VulkanLatentModifier.id) ++ (if latentHook then VulkanLatentGraph.hooks else Set.empty[String]) ++ (if unetHooks.nonEmpty then VulkanUnetHooks.hooks else Set.empty[String])
     val other = p.hooks.filterNot { (key, value) =>
       value.obj.get("enabled").contains(ujson.Bool(false)) || !VulkanFusionPrompt.applies(key,p.prompt,p.negativePrompt) ||
         key == VulkanUnetHooks.tiledDiffusion && !needsTiles ||
@@ -210,7 +221,7 @@ private[vulkan] object VulkanGraph:
     else if textSchedule.nonEmpty then
       lines += s"unet = $unet"
       1
-    else if unetHooks.nonEmpty || modifier.nonEmpty || fooocus.nonEmpty || cdTuner.nonEmpty || cacheGraph || reference.nonEmpty || agent.nonEmpty || Set("sonar","semantic_guidance","neutral_prompt")(hook) || latentHook || up.nonEmpty || hiresPass || soft.nonEmpty || inverse || postDiff.nonEmpty then
+    else if unetHooks.nonEmpty || modifier.nonEmpty || fooocus.nonEmpty || cdTuner.nonEmpty || cacheGraph || patchedAttention || Set("sonar","semantic_guidance","neutral_prompt")(hook) || latentHook || up.nonEmpty || hiresPass || soft.nonEmpty || inverse || postDiff.nonEmpty then
       lines += s"unet = $unet"
       lines += s"latent_pos = encode_prompt($text, ${quoted(prompt)}, $enc)"
       if !patchedInputs then lines += s"pos = predictor(unet, latent_pos$unetArgs)"
@@ -289,7 +300,7 @@ private[vulkan] object VulkanGraph:
     val maskGraph = patchedInputs && (inpaint || difference.nonEmpty || p.img2img.exists(_.mask.nonEmpty) ||
       preparedInput.exists(_.mask.nonEmpty))
     // The native image pipeline defaults to the CPU implementation of the CUDA-compatible RNG.
-    val randomAlgorithm = if maskGraph || agent.nonEmpty then "cuda" else "cpu"
+    val randomAlgorithm = if maskGraph || agent.nonEmpty || lllite.nonEmpty then "cuda" else "cpu"
     lines += s"rng = make_rng(\"$randomAlgorithm\", seed = $seed)"
     val encodeRng = if maskGraph then
       lines += s"encode_rng = make_rng(\"$randomAlgorithm\", seed = $seed)"
@@ -354,6 +365,16 @@ private[vulkan] object VulkanGraph:
             inputs("hr_ref_image") = VulkanImageInputs.resize(image, width, height, 1)
           lines ++= config.prepare("ref", tiled)
       }
+      lllite.foreach { (config, _) =>
+        val source = config.image.map(VulkanImageInputs.read)
+          .orElse(inputs.get("init"))
+          .getOrElse(VulkanImageInputs.read(config.source(p.img2img.map(_.initImage))))
+        inputs("lllite_image") = VulkanImageInputs.resize(source, p.width, p.height, 1)
+        if hiresPass && config.image.nonEmpty then
+          val (width, height) = p.hires.targetSize(p.width, p.height)
+          inputs("hr_lllite_image") = VulkanImageInputs.resize(source, width, height, 1)
+        lines += "lllite_hint = image::to_f32(lllite_image, channels = 3)"
+      }
       cdTuner.foreach(tuner => lines ++= tuner.prepareMap("cdt_map"))
       fooocus.foreach { assets =>
         if overlay.isEmpty then invalid("Fooocus Inpaint did not produce a prepared mask")
@@ -374,8 +395,10 @@ private[vulkan] object VulkanGraph:
             cdTuner.fold("")(t => t.args(t.base, "cdt_map", negative, colorShift = !hiresPass, high = false))
           val posRef = reference.fold("")(_.args("ref", positive = true))
           val negRef = reference.fold("")(_.args("ref", positive = false))
-          lines += s"pos = predictor(unet, $positiveInput$concat$unetArgs$fooocusArgs${cdArgs(false)}$posRef)"
-          lines += s"neg = predictor(unet, $negativeInput$concat$unetArgs$fooocusArgs${cdArgs(true)}$negRef)"
+          val llliteArgs = lllite.fold("")((config, path) => config.args(path, "lllite_hint"))
+          lines += s"pos = predictor(unet, $positiveInput$concat$unetArgs$fooocusArgs${cdArgs(false)}$posRef$llliteArgs)"
+          val blank = if lllite.nonEmpty && p.negativePrompt.isEmpty then ", lllite_blank_negative = true" else ""
+          lines += s"neg = predictor(unet, $negativeInput$concat$unetArgs$fooocusArgs${cdArgs(true)}$negRef$llliteArgs$blank)"
       lines += guidance
     val fullSteps = up.fold(p.steps)(_.fullSteps)
     val scheduleName = up.fold(schedule)(_.scheduler)
@@ -413,7 +436,7 @@ private[vulkan] object VulkanGraph:
         }
       }
       lines ++= VulkanHiresGraph.refinement(req,prompt,loras,tweak.fold(seed)(_.seed),unet,text,eta,device,
-        noise.nonEmpty,tiled,cdTuner,cacheArgs,reference,agent,controlWeight,inpaint)
+        noise.nonEmpty,tiled,cdTuner,cacheArgs,reference,agent,controlWeight,inpaint,lllite)
     val resultLatent = if hiresPass then "hr_latent" else "latent"
     val saturation = cdTuner.filter(_ => refinementImage.isEmpty).fold("")(_.decoderArgs)
     lines += s"return {output = vae_decode(vae, unet_to_vae_latents(vae, $resultLatent)$tiled$saturation)}"
