@@ -121,6 +121,7 @@ private[vulkan] object VulkanGraph:
       then unsupported("Composable LoRA in detector-driven refinement passes")
       p.hooks(hook)
     }
+    val runtimeLoraWeights = composable.nonEmpty && engine.supportsRuntimeLoraWeights()
     val passSteps = p.img2img.fold(p.steps)(i => math.min(p.steps, (p.steps * i.denoisingStrength).toInt + 1))
     val loraPlan = composable.map { config =>
       val (offset, total) = VulkanComposableLora.clock(p, config, passSteps, hires = false)
@@ -436,7 +437,8 @@ private[vulkan] object VulkanGraph:
         case Some(schedule) => schedule.predictors(concat,lines)
         case None if loraPlan.nonEmpty =>
           lines ++= VulkanComposableLora.prepare(loraPlan.get, req, "clora", unet, text, enc, concat, supportsBlank = true,
-            tracePass = composable.filter(VulkanComposableLora.plotRequested).map(_ => "base"))
+            tracePass = composable.filter(VulkanComposableLora.plotRequested).map(_ => "base"),
+            runtimeWeights = runtimeLoraWeights)
         case None =>
           val fooocusArgs = fooocus.fold("")(_.predictorArgs)
           def cdArgs(negative: Boolean): String =
@@ -486,7 +488,8 @@ private[vulkan] object VulkanGraph:
         }
       }
       lines ++= VulkanHiresGraph.refinement(req,prompt,loras,tweak.fold(seed)(_.seed),unet,text,eta,device,
-        noise.nonEmpty,tiled,cdTuner,cacheArgs,reference,agent,controlWeight,inpaint,lllite,llul,characteristic,composable)
+        noise.nonEmpty,tiled,cdTuner,cacheArgs,reference,agent,controlWeight,inpaint,lllite,llul,characteristic,composable,
+        runtimeLoraWeights = runtimeLoraWeights)
     val resultLatent = if hiresPass then "hr_latent" else "latent"
     val saturation = cdTuner.filter(_ => refinementImage.isEmpty).fold("")(_.decoderArgs)
     lines += s"return {output = vae_decode(vae, unet_to_vae_latents(vae, $resultLatent)$tiled$saturation)}"

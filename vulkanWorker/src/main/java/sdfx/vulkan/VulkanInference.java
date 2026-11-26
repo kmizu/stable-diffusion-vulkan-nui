@@ -718,6 +718,10 @@ public final class VulkanInference implements AutoCloseable {
         return cString(ptr("sd_dgl_builtin_catalog")).contains("`lora_trace?");
     }
 
+    public boolean supportsRuntimeLoraWeights() {
+        return cString(ptr("sd_dgl_builtin_catalog")).contains("`runtime_lora_weights?");
+    }
+
     public boolean supportsLLLite() {
         return cString(ptr("sd_dgl_builtin_catalog")).contains("`lllite_path?");
     }

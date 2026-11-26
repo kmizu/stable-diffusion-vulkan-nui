@@ -22,7 +22,7 @@ private[vulkan] object VulkanHiresGraph:
       inpaint: Boolean = false, lllite: Option[(VulkanLLLite.Config, String)] = None,
       llul: Option[VulkanLlul.Config] = None,
       characteristic: Option[VulkanCharacteristic.Config] = None,
-      composable: Option[ujson.Value] = None): Vector[String] =
+      composable: Option[ujson.Value] = None, runtimeLoraWeights: Boolean = false): Vector[String] =
     import VulkanProtocol.{invalid,unsupported}
     val p = req.params
     val h = p.hires
@@ -109,7 +109,8 @@ private[vulkan] object VulkanHiresGraph:
       config.args(path, "hr_lllite_hint")
     }
     loraPlan.foreach(plan => lines ++= VulkanComposableLora.prepare(plan, req, "hr_clora", unet, text, encoding,
-      concat, supportsBlank = true, tracePass = composable.filter(VulkanComposableLora.plotRequested).map(_ => "hires")))
+      concat, supportsBlank = true, tracePass = composable.filter(VulkanComposableLora.plotRequested).map(_ => "hires"),
+      runtimeWeights = runtimeLoraWeights))
     for (name,prompt) <- Seq("pos" -> positivePrompt, "neg" -> negativePrompt) if loraPlan.isEmpty do
       val grown = areaRatio > 1
       val cdt = cdTuner.fold("")(t => t.args(t.weights(areaRatio, baseSteps), "cdt_map", name == "neg",

@@ -3,6 +3,16 @@
 
 
 
+## Windows v0.59 — Numeric Composable LoRA commands
+
+The staged `SDV-NUI.exe` ran masked img2img over MCP at 768 × 768 with SDXL on RTX 3090 and at 512 × 512 with SD1.5 on Radeon 780M. Both reported `cuda=false`. A numeric `#cmd` selected weight 0.45 for the first two steps and 0.225 for the last three. Both traces reported zero for the other branches. The native log showed one runtime U-Net adapter initialization per run. Every pixel outside each mask matched the source.
+
+The shared and separate U-Net paths produced identical pixels in a fixed-seed 512 × 512 SDXL comparison on RTX 3090. A separate 768 × 768 run used nine distinct nonzero weights with one runtime U-Net adapter initialization. At 576 × 576, a Latent Hires test checked fresh command clocks and weights for both the positive and the negative branches. The images and plots were inspected.
+
+All 65 Vulkan worker tests and the Composable LoRA plugin test passed. The Clip I/O real SD1.5 regression produced the same pixels as its independent Torch conditioning fixture.
+
+The ZIP SHA-256 is `ed199229417e43278ed156dc35f80cf061a1607be917aee3d7d8c2d5361772a6`. The archived launcher, desktop JAR, worker JAR and inference DLL matched the tested staging files.
+
 ## Windows v0.58 — Composable LoRA weight plots
 
 The staged `SDV-NUI.exe` returned the generated image and a 1200 × 680 plot PNG through MCP for masked SDXL img2img at 768 × 768 on RTX 3090 and SD1.5 img2img at 512 × 512 on Radeon 780M. Both reported `cuda=false` and preserved every source pixel outside the mask. Each trace recorded a U-Net adapter weight of 0.45 in the selected branch at steps 1 and 2, zero thereafter, and zero in the other evaluated branches. The short runs showed distortions inside the masked area.

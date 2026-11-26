@@ -1,0 +1,158 @@
+--- a/src/dgl/models/lora.h
++++ b/src/dgl/models/lora.h
+@@ -38,6 +38,12 @@
+         bool ready_ = false;
+
+     public:
++        struct RuntimeWeights {
++            std::shared_ptr<WeightAdapter> adapter;
++            std::vector<float> previous;
++        };
++        RuntimeWeights override_weights(const std::vector<float>& weights);
++        void restore_weights(const std::vector<float>& previous);
+         void end();
+         void reset();
+         bool prepare(const LoraConfig& config, const std::shared_ptr<ModelManager::ResourceHandle>& weights, SDVersion version, SDBackendManager& backends, SDBackendModule module, int n_threads, bool immediately);
+--- a/src/dgl/models/lora.cpp
++++ b/src/dgl/models/lora.cpp
+@@ -34,6 +34,30 @@
+             suffix.remove_prefix(index + 1);
+         return suffix == "diff" || suffix == "lora_up" || suffix == "lora_down" ||
+                suffix.substr(0, 6) == "hada_w" || suffix.substr(0, 6) == "lokr_w";
++    }
++
++    LoraExecution::RuntimeWeights LoraExecution::override_weights(const std::vector<float>& weights) {
++        if (!adapter_ || weights.size() != models_.size())
++            throw std::runtime_error("predictor LoRA weights must match its runtime adapter bindings");
++        RuntimeWeights result;
++        std::vector<std::shared_ptr<LoraModel>> active;
++        result.previous.reserve(weights.size());
++        active.reserve(weights.size());
++        for (size_t i = 0; i < weights.size(); ++i) {
++            result.previous.push_back(models_[i]->multiplier);
++            if (weights[i] != 0.f)
++                active.push_back(models_[i]);
++        }
++        if (!active.empty())
++            result.adapter = std::make_shared<MultiLoraAdapter>(active);
++        for (size_t i = 0; i < weights.size(); ++i)
++            models_[i]->multiplier = weights[i];
++        return result;
++    }
++
++    void LoraExecution::restore_weights(const std::vector<float>& previous) {
++        for (size_t i = 0; i < previous.size(); ++i)
++            models_[i]->multiplier = previous[i];
+     }
+
+     void LoraExecution::end() {
+--- a/src/dgl/models/model_base.h
++++ b/src/dgl/models/model_base.h
+@@ -91,6 +91,18 @@
+             void require_ready() const;
+         };
+
++        // The predictor already holds an ExecutionScope for this model.
++        class LoraWeightsScope {
++            Model& model_;
++            std::vector<float> previous_;
++
++        public:
++            LoraWeightsScope(Model& model, const std::vector<float>& weights);
++            ~LoraWeightsScope();
++            LoraWeightsScope(const LoraWeightsScope&) = delete;
++            LoraWeightsScope& operator=(const LoraWeightsScope&) = delete;
++        };
++
+         Model(const Model&)            = delete;
+         Model& operator=(const Model&) = delete;
+         virtual ~Model();
+--- a/src/dgl/models/model_base.cpp
++++ b/src/dgl/models/model_base.cpp
+@@ -135,6 +135,21 @@
+         return true;
+     }
+
++    Model::LoraWeightsScope::LoraWeightsScope(Model& model, const std::vector<float>& weights) : model_(model) {
++        if (weights.empty())
++            return;
++        auto current = model_.lora_execution_.override_weights(weights);
++        previous_ = std::move(current.previous);
++        model_.set_weight_adapter(current.adapter);
++    }
++
++    Model::LoraWeightsScope::~LoraWeightsScope() {
++        if (previous_.empty())
++            return;
++        model_.lora_execution_.restore_weights(previous_);
++        model_.set_weight_adapter(model_.lora_execution_.adapter());
++    }
++
+     void Model::end_runners() {
+         for (const auto& runner : runners_)
+             runner.end();
+--- a/src/dgl/ops/predictor.h
++++ b/src/dgl/ops/predictor.h
+@@ -39,6 +39,7 @@
+         models::DiffusionPredictionOptions options;
+         std::vector<sd::Tensor<float>> references;
+         std::string lora_trace;
++        std::vector<float> runtime_lora_weights;
+         bool circular_x = false;
+         bool circular_y = false;
+
+--- a/src/dgl/bindings/registration.cpp
++++ b/src/dgl/bindings/registration.cpp
+@@ -599,7 +599,8 @@
+              integer("audio_length", 0, INT_MAX, 0),
+              number("fps", 0.01, 100000, 24), number("video_sigma_shift", 0.001, 1000, 12), number("audio_sigma_shift", 0.001, 1000, 3),
+              optional("circular_x", Kind::Boolean, false), optional("circular_y", Kind::Boolean, false),
+-             optional("lora_trace", Kind::String), integer("tgate_step", 0, 1000, 0),
++             optional("lora_trace", Kind::String), optional_list("runtime_lora_weights", Kind::Number),
++             integer("tgate_step", 0, 1000, 0),
+              optional("reference_latent", Kind::Tensor), optional("reference_noise", Kind::Tensor),
+              optional("lllite_path", Kind::String), optional("lllite_hint", Kind::Tensor),
+              optional("lllite_blank_negative", Kind::Boolean, false),
+--- a/src/dgl/bindings/predictor.cpp
++++ b/src/dgl/bindings/predictor.cpp
+@@ -238,6 +238,14 @@
+         bind_predictor_options(output, args);
+         if (args.count("lora_trace"))
+             output.lora_trace = get_string(args, "lora_trace");
++        if (const auto found = args.find("runtime_lora_weights"); found != args.end()) {
++            for (const auto& value : found->second.items) {
++                const float weight = float(value.scalar.get<double>());
++                if (!std::isfinite(weight))
++                    throw std::runtime_error("runtime LoRA weight must be finite");
++                output.runtime_lora_weights.push_back(weight);
++            }
++        }
+         if (args.count("lllite_path") || args.count("lllite_hint")) {
+             if (!args.count("lllite_path") || !args.count("lllite_hint") || !sd_version_is_sdxl(engine.version()))
+                 throw std::runtime_error("ControlNet-LLLite requires an SDXL denoiser, model path and RGB hint");
+--- a/src/dgl/ops/predictor.cpp
++++ b/src/dgl/ops/predictor.cpp
+@@ -487,6 +487,7 @@
+         if (options.unet_hooks.tgate_step > 0)
+             options.unet_hooks.tgate_branch = reinterpret_cast<uintptr_t>(&leaf);
+         if (sag_mask) step.cache = nullptr;
++        models::Model::LoraWeightsScope lora_weights(engine, leaf.runtime_lora_weights);
+         auto prediction = engine.predict_diffusion(x, leaf.resolved_parameterization(), sigma, leaf.condition, leaf.references,
+                                                    options, step);
+         if (prediction.output.empty())
+@@ -498,6 +499,7 @@
+     models::DiffusionPrediction PredictionExecution::Resources::predict_batch(const ModelPredictor& leaf, const SDCondition& condition, const Tensor<float>& x, float sigma, const models::DiffusionPredictionStep& step) {
+         auto& model = leaf.dit();
+         prepare_predictor(leaf);
++        models::Model::LoraWeightsScope lora_weights(model, leaf.runtime_lora_weights);
+         models::CircularAxesScope circular_axes(model, leaf.circular_x, leaf.circular_y);
+         sd::ParallelScope tensor_scope(model.tensor_executor.get());
+         auto options = leaf.options;
+@@ -545,6 +547,7 @@
+             const auto* pos = std::get_if<ModelPredictor>(&positive.node);
+             const auto* neg = std::get_if<ModelPredictor>(&negative.node);
+             if (!pos || !neg || &pos->dit() != &neg->dit() || !sd_version_is_unet(pos->dit().version()) ||
++                pos->runtime_lora_weights != neg->runtime_lora_weights ||
+                 !pos->resolved_parameterization().compatible_forward(neg->resolved_parameterization()) ||
+                 pos->circular_x != neg->circular_x || pos->circular_y != neg->circular_y ||
+                 pos->model->motion || neg->model->motion || pos->controls || neg->controls ||

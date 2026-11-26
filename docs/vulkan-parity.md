@@ -146,9 +146,11 @@ Static `AND` branches use independent LoRA bindings for text encoding and U-Net 
 
 With step control enabled, LoRA-only bracket expressions can set inclusive start and end steps, alternate adapters, or scale a window with `#increment` and `#decrease`. Text encoding and U-Net weighting use their respective clocks. Fractions in base img2img use the legacy denoising step count. An ordinary Hires pass can restart its clock or use the existing global-step option.
 
+Numeric `#cmd` expressions use the JVM evaluator and the legacy lifecycle helpers. For example, `[<lora:style:0:0.8> #cmd(warmup(0.5))::10]` ramps the U-Net adapter during the first half of its ten-step window. The evaluator supports both plain and escaped parentheses. It supplies the component weight, lifecycle progress, step, total steps, branch polarity and adapter counts. The Vulkan runner shares a U-Net and adapter set across scheduled weights, then scopes the selected weights to a single prediction.
+
 **Plot weights** adds a PNG and writes the corresponding JSON under `intermediates/composable-lora`. The worker records each U-Net predictor that actually ran, with separate image, pass, and branch labels. Rows show the effective weight and the observed model-evaluation count. The original layer-evaluation count is unavailable in this Vulkan trace.
 
-`#cmd` controllers, dynamic ranks, extended Neutral Prompt operators and their combinations remain open. One-component detection currently reads SafeTensors keys. Other weight formats and detector-driven refinement combinations have separate coverage gaps.
+Advanced `#cmd` scripts, layer-level context, dynamic ranks, extended Neutral Prompt operators and their combinations remain open. `random()` draws when planning each branch and step and is independent of the image seed. One-component detection currently reads SafeTensors keys. Other weight formats and detector-driven refinement combinations have separate coverage gaps.
 
 Further Python generation hooks without a corresponding verified implementation in this inventory include `aesthetic_gradients`, `compile` and `incantations`.
 

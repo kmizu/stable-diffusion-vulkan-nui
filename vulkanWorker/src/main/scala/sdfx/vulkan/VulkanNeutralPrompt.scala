@@ -15,10 +15,12 @@ private[vulkan] object VulkanNeutralPrompt:
   final case class Leaf(text: String, weight: Double = 1.0, kind: String = "AND") extends Node
   final case class Group(children: Vector[Node], weight: Double = 1.0, kind: String = "AND") extends Node
 
-  def parse(prompt: String): Group =
-    val parts = splitTopKeywords(prompt)
+  def parse(prompt: String): Group = parse(prompt, identity)
+
+  def parse(prompt: String, maskSyntax: String => String): Group =
+    val parts = splitTopKeywords(prompt, maskSyntax)
     val children = parts.map { case (kind, rawSegment) =>
-      parseSegment(rawSegment, kind)
+      parseSegment(rawSegment, kind, maskSyntax)
     }
     Group(children, 1.0, "AND")
 
@@ -35,9 +37,10 @@ private[vulkan] object VulkanNeutralPrompt:
     val lvs = leaves(tree)
     cfgRescale != 0.0 || lvs.size != 1 || lvs.exists(n => n.weight != 1.0 || n.kind != "AND") || lvs.head.text != prompt
 
-  private def splitTopKeywords(text: String): Vector[(String, String)] =
-    val matches = KeywordRegex.findAllMatchIn(text).filter { m =>
-      isTopLevel(text, m.start)
+  private def splitTopKeywords(text: String, maskSyntax: String => String): Vector[(String, String)] =
+    val masked = maskSyntax(text)
+    val matches = KeywordRegex.findAllMatchIn(masked).filter { m =>
+      isTopLevel(masked, m.start)
     }.toVector
     if matches.isEmpty then Vector(("AND", text))
     else
@@ -62,15 +65,15 @@ private[vulkan] object VulkanNeutralPrompt:
       i += 1
     depth == 0
 
-  private def parseSegment(raw: String, kind: String): Node =
+  private def parseSegment(raw: String, kind: String, maskSyntax: String => String): Node =
     val trimmed = raw.trim
-    val (body, weight) = splitTrailingWeight(trimmed)
+    val (body, weight) = splitTrailingWeight(trimmed, maskSyntax)
     val bTrim = body.trim
-    if bTrim.startsWith("[") && bTrim.endsWith("]") && isMatchingOuterBracket(bTrim) then
+    if bTrim.startsWith("[") && bTrim.endsWith("]") && isMatchingOuterBracket(maskSyntax(bTrim)) then
       val inner = bTrim.substring(1, bTrim.length - 1)
-      val subParts = splitTopKeywords(inner)
-      if subParts.size > 1 || splitTrailingWeight(inner.trim)._2 != 1.0 then
-        val children = subParts.map { case (k, seg) => parseSegment(seg, k) }
+      val subParts = splitTopKeywords(inner, maskSyntax)
+      if subParts.size > 1 || splitTrailingWeight(inner.trim, maskSyntax)._2 != 1.0 then
+        val children = subParts.map { case (k, seg) => parseSegment(seg, k, maskSyntax) }
         return Group(children, weight, kind)
     Leaf(if weight != 1.0 then body.trim else raw.trim, weight, kind)
 
@@ -87,12 +90,13 @@ private[vulkan] object VulkanNeutralPrompt:
       i += 1
     depth == 0
 
-  private def splitTrailingWeight(s: String): (String, Double) =
+  private def splitTrailingWeight(s: String, maskSyntax: String => String): (String, Double) =
+    val masked = maskSyntax(s)
     var depth = 0
     var lastColon = -1
     var i = 0
     while i < s.length do
-      val c = s.charAt(i)
+      val c = masked.charAt(i)
       if c == '\\' then i += 1
       else if c == '[' || c == '(' || c == '<' then depth += 1
       else if (c == ']' || c == ')' || c == '>') && depth > 0 then depth -= 1

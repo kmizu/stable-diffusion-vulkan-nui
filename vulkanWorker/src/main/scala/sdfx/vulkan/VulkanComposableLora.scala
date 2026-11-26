@@ -74,12 +74,14 @@ private[vulkan] object VulkanComposableLora:
       node match
         case Leaf(text, _, _) => leaves += text -> weight
         case Group(children, _, _) => children.foreach(visit(_, weight))
-    visit(VulkanNeutralPrompt.parse(prompt), 1)
+    val maskSyntax: String => String = if useSteps then VulkanLoraSteps.maskCommands else identity
+    visit(VulkanNeutralPrompt.parse(prompt, maskSyntax), 1)
     val positive = leaves.result()
     if positive.size > 64 then invalid("Composable LoRA supports up to 64 branches")
-    val promptTags = tags(prompt)
-    val attached = (promptTags ++ tags(alternatePrompt)).map(_.name).toSet
+    val promptTags = tags(maskSyntax(prompt))
+    val attached = (promptTags ++ tags(maskSyntax(alternatePrompt))).map(_.name).toSet
     val shared = manual.getOrElse(discovered.filterNot(lora => attached(lora.name)))
+    val loraCount = (attached ++ shared.map(_.name)).size
     val legacy = Option.when(manual.isEmpty)(discovered.map(ref => ref.name -> ref).toMap).getOrElse(Map.empty)
     def check(ref: LoraRef): Unit =
       if ref.lbw.nonEmpty || ref.start.nonEmpty || ref.stop.nonEmpty || ref.dyn.nonEmpty then
@@ -113,27 +115,32 @@ private[vulkan] object VulkanComposableLora:
         Option.when(weight != 0)(name -> weight)
       }
     val singleDefault = positive.size == 1 && !flag(config, "single_no_uc")
-    def schedule(program: Option[VulkanLoraSteps.Program]): Vector[Vector[(String, Double)]] =
+    def expressionWeight(ref: LoraRef): Double = if manual.isDefined then ref.unet.getOrElse(ref.weight) else ref.weight
+    def schedule(program: Option[VulkanLoraSteps.Program], negativeBranch: Boolean = false): Vector[Vector[(String, Double)]] =
       program.fold(Vector.empty[Vector[(String, Double)]]) { stepsProgram =>
-        Vector.tabulate(steps)(i => weights(Nil, true, Some(stepsProgram.weights(i + 1 + clockOffset, total))))
+        Vector.tabulate(steps)(i =>
+          weights(Nil, true, Some(stepsProgram.weights(i + 1 + clockOffset, total, negativeBranch, Some(loraCount),
+            expressionWeight))))
       }
     val negativeUnet = singleDefault || flag(config, "uc_diffusion_model")
-    val negativeSchedule = schedule(Option.when(useSteps && negativeUnet && positive.size == 1)(VulkanLoraSteps.parse(prompt)))
+    val negativeSchedule = schedule(Option.when(useSteps && negativeUnet && positive.size == 1)(VulkanLoraSteps.parse(prompt)),
+      negativeBranch = true)
     val uncond = Branch(cleanPrompt(negative), 1,
       if singleDefault || flag(config, "uc_text_model_encoder") then weights(promptTags, false) else Vector.empty,
       negativeSchedule.headOption.getOrElse(if negativeUnet then weights(promptTags, true) else Vector.empty),
       negativeSchedule)
     Plan(uncond, positive.map { (text, coefficient) =>
-      val local = tags(text)
+      val local = tags(maskSyntax(text))
       val program = Option.when(useSteps)(VulkanLoraSteps.parse(text))
       val timeline = schedule(program)
       Branch(cleanPrompt(program.fold(text)(_.prompt)), coefficient,
-        weights(local, false, program.map(_.weights(-1, total))),
+        weights(local, false, program.map(_.weights(-1, total, loraCount = Some(loraCount)))),
         timeline.headOption.getOrElse(weights(local, true)), timeline)
     }, (promptTags ++ shared).map(_.name).distinct.toVector)
 
   def prepare(plan: Plan, req: GenerationRequest, prefix: String, unet: String, text: String, enc: String,
-      concat: String, supportsBlank: Boolean, tracePass: Option[String] = None): Vector[String] =
+      concat: String, supportsBlank: Boolean, tracePass: Option[String] = None,
+      runtimeWeights: Boolean = false): Vector[String] =
     def quoted(value: String): String = ujson.write(ujson.Str(value))
     val lines = Vector.newBuilder[String]
     val branches = (s"${prefix}_neg" -> plan.negative) +:
@@ -170,24 +177,34 @@ private[vulkan] object VulkanComposableLora:
         lines += s"""$key = apply_lora($base, $adapter, weight = $weight, mode = "at_runtime")"""
         key
       })
+    def unetWeights(weights: Vector[(String, Double)]): Vector[(String, Double)] =
+      weights.filter(entry => adapters(entry._1)._3)
+    val scheduledNames =
+      if runtimeWeights && branches.exists(_._2.unetSchedule.distinct.size > 1) then
+        branches.flatMap { (_, branch) =>
+          unetWeights(branch.unetAdapters ++ branch.unetSchedule.flatten).map(_._1)
+        }.distinct.sorted
+      else Vector.empty
+    val sharedDenoiser = Option.when(scheduledNames.nonEmpty)(applyAdapters(unet, scheduledNames.map(_ -> 1.0)))
     for (name, branch) <- branches do
       val encoder = applyAdapters(text, branch.textAdapters.filter(entry => adapters(entry._1)._2))
       val blank = if supportsBlank && name.endsWith("_neg") && branch.text.isEmpty then ", sdxl_blank_negative = true" else ""
       val condition = s"${name}_cond"
       lines += s"$condition = encode_prompt($encoder, ${quoted(branch.text)}, $enc)"
-      def unetWeights(weights: Vector[(String, Double)]): Vector[(String, Double)] =
-        weights.filter(entry => adapters(entry._1)._3)
       val timeline = branch.unetSchedule
       def predict(symbol: String, weights: Vector[(String, Double)]): String =
         val active = unetWeights(weights)
-        val denoiser = applyAdapters(unet, active)
         val effective = active.toMap
+        val denoiser = sharedDenoiser.getOrElse(applyAdapters(unet, active))
+        val runtime = sharedDenoiser.fold("") { _ =>
+          scheduledNames.map(effective.getOrElse(_, 0.0)).mkString(", runtime_lora_weights = [", ", ", "]")
+        }
         val trace = tracePass.filter(_ => tracedNames.nonEmpty).fold("") { pass =>
           val label = VulkanLoraTrace.label(pass, name, branch.text, name.endsWith("_neg"),
             tracedNames.map(adapter => adapter -> effective.getOrElse(adapter, 0.0).toFloat.toDouble))
           s", lora_trace = ${quoted(label)}"
         }
-        lines += s"$symbol = predictor($denoiser, $condition$concat$blank$trace)"
+        lines += s"$symbol = predictor($denoiser, $condition$concat$blank$trace$runtime)"
         symbol
       val distinct = timeline.distinct
       val scheduleSource = if distinct.size <= 1 then

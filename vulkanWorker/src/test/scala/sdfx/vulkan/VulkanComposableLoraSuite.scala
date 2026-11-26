@@ -3,6 +3,68 @@ package sdfx.vulkan
 import sdfx.core.model.LoraRef
 
 class VulkanComposableLoraSuite extends munit.FunSuite:
+  test("math commands use legacy helpers, window progress and the preparation clock") {
+    val sine = VulkanLoraSteps.parse("""fox [<lora:A:2> #cmd\(sin\(life\)\):10]""")
+    assertEquals(sine.prompt, "fox")
+    assertEqualsDouble(sine.weights(15, 20).head._2, 1.0, 1e-12)
+    assertEquals(sine.weights(-1, 20).head._2, 1.0)
+    val warmup = VulkanLoraSteps.parse("""[<lora:A:2> \u0023cmd\(warmup\(0.5\)\):10]""")
+    assertEqualsDouble(warmup.weights(12, 20).head._2, .4, 1e-12)
+    val cubeRoot = VulkanLoraSteps.parse("[<lora:A:1> #cmd(cbrt(-8)):10]")
+    assertEqualsDouble(cubeRoot.weights(15, 20).head._2, -2.0, 1e-12)
+  }
+
+  test("math command comparisons leave outer AND routing intact and recognize the negative branch") {
+    val plan = VulkanComposableLora.plan(
+      "fox [<lora:fur:1> #cmd(.4 if step > 2 and not is_negative else 0)] AND owl",
+      "blur", Some(Nil), Nil, ujson.Obj("with_step" -> true), steps = 4)
+    assertEquals(plan.positive.map(_.text), Vector("fox", "owl"))
+    assertEquals(plan.positive.head.unetSchedule,
+      Vector(Vector.empty, Vector.empty, Vector("fur" -> .4), Vector("fur" -> .4)))
+    val single = VulkanComposableLora.plan(
+      "fox [<lora:fur:1> #cmd(.3 if is_negative else .5)]", "blur",
+      Some(Nil), Nil, ujson.Obj("with_step" -> true), steps = 2)
+    assertEquals(single.negative.unetSchedule, Vector.fill(2)(Vector("fur" -> .3)))
+    assertEquals(single.positive.head.unetSchedule, Vector.fill(2)(Vector("fur" -> .5)))
+  }
+
+  test("non-finite controller results fail before native inference") {
+    val command = VulkanLoraSteps.parse("[<lora:A:1> #cmd(1e309):10]")
+    val error = intercept[sdfx.core.protocol.EngineError](command.weights(15, 20))
+    assert(error.getMessage.contains("finite"), error.getMessage)
+  }
+
+  test("weight in a command uses the selected U-Net component or the legacy tag before ratio") {
+    val prompt = "fox [<lora:fur:.2:.8> #cmd(weight)]"
+    val config = ujson.Obj("with_step" -> true)
+    val modern = VulkanComposableLora.plan(prompt, "", Some(Nil), Nil, config)
+    assertEqualsDouble(modern.positive.head.unetSchedule.head.head._2, .64, 1e-12)
+    val legacy = VulkanComposableLora.plan(prompt, "", None, Seq(LoraRef("fur", .2, Some(.8))), config)
+    assertEqualsDouble(legacy.positive.head.unetSchedule.head.head._2, .16, 1e-12)
+  }
+
+  test("scheduled predictors use one runtime adapter set and put each branch weight in binding order") {
+    import java.nio.file.Files
+    import sdfx.core.model.GenerationParams
+    import sdfx.core.protocol.GenerationRequest
+
+    VulkanClipIo.withScratch("clora-schedule-test-") { directory =>
+      val a = Files.createFile(directory.resolve("a.pt"))
+      val z = Files.createFile(directory.resolve("z.pt"))
+      val prompt = "fox [<lora:z:0:.5> #cmd(step / steps)] AND owl <lora:a:0:.8>"
+      val request = GenerationRequest(GenerationParams(prompt = prompt), directory.toString,
+        loraPaths = Map("a" -> a.toString, "z" -> z.toString))
+      val plan = VulkanComposableLora.plan(prompt, "", Some(Nil), Nil, ujson.Obj("with_step" -> true), steps = 2)
+      val lines = VulkanComposableLora.prepare(plan, request, "clora", "unet", "text", "encoding", "",
+        supportsBlank = false, runtimeWeights = true)
+      assertEquals(lines.filter(_.contains(" = apply_lora(")).size, 2)
+      assert(lines.exists(line => line.startsWith("clora_neg = predictor") && line.contains("[0.0, 0.0]")))
+      assert(lines.exists(line => line.startsWith("clora_branch0_stage0 = predictor") && line.contains("[0.0, 0.25]")))
+      assert(lines.exists(line => line.startsWith("clora_branch0_stage1 = predictor") && line.contains("[0.0, 0.5]")))
+      assert(lines.exists(line => line.startsWith("clora_branch1 = predictor") && line.contains("[0.8, 0.0]")))
+    }
+  }
+
   test("step controllers respect inclusive fractional windows, alternating branches, and ramps") {
     val plan = VulkanComposableLora.plan(
       "fox [[<lora:fur:1:1> #increment::.75]:.25] AND owl [<lora:a:1>|<lora:b:1>]", "",
