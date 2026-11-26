@@ -130,7 +130,13 @@ The native worker reads the SDXL attention-projection adapters from the selected
 
 The official Canny model applied 136 projections per evaluation in the standalone SDXL Vulkan tests. RTX 3090 exercised reference attention, a second published adapter, a partial timestep window and the nine-channel Inpaint checkpoint at 832 × 832 in Hires. Radeon 780M ran SDXL masked img2img at 512 × 512. The masked comparisons preserved all source pixels outside the edit, and a later same-seed Canny replay matched pixel for pixel. LLLite also ran with ordinary Canny in the separate Img2Img Hires Fix.
 
-Further Python generation hooks without a corresponding verified implementation in this inventory include `aesthetic_gradients`, `characteristic_guidance`, `compile`, `composable_lora`, `incantations` and `llul`.
+### LLuL
+
+LLuL crops a selected U-Net feature region, enlarges it for a second layer evaluation and blends the reduced result back into the original region. The Vulkan graph supports the output layer, residual blocks, spatial transformers, self-attention and cross-attention. It uses the configured evaluation window, layer filters, region and scale factor. The resize operators support nearest-exact, bilinear, bicubic, area and fixed-window pooling, with antialiasing for bilinear and bicubic. The optional grayscale blend mask is independent of the img2img paint mask. The spherical blend evaluates an angle approximation in FP32. [Original LLuL extension](https://github.com/hnmr293/sd-webui-llul).
+
+The packaged executable ran masked SD1.5 and SDXL img2img through MCP on Radeon 780M and RTX 3090 respectively. Direct tests also covered the four advanced layer types, odd-width feature grids and both SDXL Latent Hires passes. [Verification and tested limits](vulkan-worker-verification.md#windows-v053--llul).
+
+Further Python generation hooks without a corresponding verified implementation in this inventory include `aesthetic_gradients`, `characteristic_guidance`, `compile`, `composable_lora` and `incantations`.
 
 ### Boundaries of the port
 

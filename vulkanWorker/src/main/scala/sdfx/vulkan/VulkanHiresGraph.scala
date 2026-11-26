@@ -1,10 +1,17 @@
 package sdfx.vulkan
 
 import sdfx.core.model.LoraRef
+import sdfx.core.model.GenerationParams
 import sdfx.core.protocol.GenerationRequest
 
 private[vulkan] object VulkanHiresGraph:
   private def q(value: String) = ujson.write(ujson.Str(value))
+
+  def fullSteps(p: GenerationParams): Int =
+    val h = p.hires
+    val requested = if h.secondPassSteps == 0 then p.steps else h.secondPassSteps
+    if h.denoisingStrength == 0 then requested
+    else math.ceil(requested/h.denoisingStrength.min(.999) - 1e-9).toInt
 
   /** The first pass leaves its diffusion latent in `latent`; sample again at the target resolution. */
   def refinement(req: GenerationRequest, firstPrompt: String, firstLoras: Seq[LoraRef], seed: Long,
@@ -12,7 +19,8 @@ private[vulkan] object VulkanHiresGraph:
       cdTuner: Option[VulkanCdTuner.Options] = None, cacheArgs: String = "",
       reference: Option[VulkanReference.Config] = None,
       agent: Option[VulkanAgentAttention.Config] = None, controlWeight: Option[Double] = None,
-      inpaint: Boolean = false, lllite: Option[(VulkanLLLite.Config, String)] = None): Vector[String] =
+      inpaint: Boolean = false, lllite: Option[(VulkanLLLite.Config, String)] = None,
+      llul: Option[VulkanLlul.Config] = None): Vector[String] =
     import VulkanProtocol.{invalid,unsupported}
     val p = req.params
     val h = p.hires
@@ -50,13 +58,17 @@ private[vulkan] object VulkanHiresGraph:
     val baseSteps = p.img2img.fold(p.steps)(i => ((p.steps * i.denoisingStrength).toInt + 1).min(p.steps))
     reference.foreach(config => lines ++= config.prepare("hr_ref", tiled))
     val agentArgs = agent.fold("")(_.args(seed, hires = true))
+    val full = fullSteps(p)
+    require(full <= 10000,"Hires schedule exceeds 10000 steps")
+    val llulArgs = llul.filter(_.canApply(full)).fold("")(_.args(width, height, "llul_mask", full))
     controlWeight.foreach(_ => lines += "hr_control_hint = image::to_f32(hr_control_image)")
     val concat = if inpaint then
       lines += s"hr_inpaint_condition = tensor::interpolate(inpaint_condition, size = [${width/8},${height/8}])"
       ", concat = hr_inpaint_condition"
     else ""
     val aa = h.upscaler.contains("antialiased")
-    lines += s"""hr_rng = make_rng("cpu", seed = $seed)"""
+    val randomAlgorithm = if llul.nonEmpty then "cuda" else "cpu"
+    lines += s"""hr_rng = make_rng("$randomAlgorithm", seed = $seed)"""
     if h.upscaler.startsWith("Latent") then
       lines += s"hr_base = tensor::interpolate(latent, size = [${width/8},${height/8}], mode = ${q(method)}, antialias = $aa)"
     else
@@ -84,18 +96,18 @@ private[vulkan] object VulkanHiresGraph:
         colorShift = grown, high = true, colorMapped = grown))
       val ref = reference.fold("")(_.args("hr_ref", positive = name == "pos"))
       val encoded = s"encode_prompt($text, ${q(prompt)}, $encoding)"
-      val blank = if lllite.nonEmpty && name == "neg" && prompt.isEmpty then ", lllite_blank_negative = true" else ""
+      val blank = if name != "neg" || prompt.nonEmpty then ""
+        else if lllite.nonEmpty then ", lllite_blank_negative = true"
+        else if llul.nonEmpty then ", llul_blank_negative = true"
+        else ""
       val condition = controlWeight.fold(encoded)(weight =>
         s"controlnet::apply($encoded, control_model, hr_control_hint, strength = $weight)")
-      lines += s"hr_$name = predictor($unet, $condition$concat$cdt$cacheArgs$ref$agentArgs$llliteArgs$blank)"
+      lines += s"hr_$name = predictor($unet, $condition$concat$cdt$cacheArgs$ref$agentArgs$llliteArgs$llulArgs$blank)"
     val sampler = h.samplerName.getOrElse(p.samplerName)
     val nativeMethod = VulkanProtocol.samplers.getOrElse(sampler,unsupported(s"hires sampler $sampler"))
     val schedule = h.scheduler.getOrElse(p.scheduler)
     val name = if schedule == "Automatic" then VulkanProtocol.defaultSchedule(sampler) else schedule
     val scheduler = VulkanProtocol.schedulers.getOrElse(name,unsupported(s"hires scheduler $name"))
-    val requested = if h.secondPassSteps == 0 then p.steps else h.secondPassSteps
-    val full = if h.denoisingStrength == 0 then requested else math.ceil(requested/h.denoisingStrength.min(.999) - 1e-9).toInt
-    require(full <= 10000,"Hires schedule exceeds 10000 steps")
     val count = (full*h.denoisingStrength).toInt.min(full).max(1)
     val cfg = h.cfgScale.getOrElse(p.cfgScale)
     val cfgTiming = if cacheArgs.nonEmpty then VulkanGraph.cacheCfgArguments(p.hooks, cfg, count) else ""

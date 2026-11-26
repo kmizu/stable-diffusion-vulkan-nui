@@ -3,6 +3,16 @@
 
 
 
+## Windows v0.53 — LLuL
+
+The staged `SDV-NUI.exe` ran the LLuL output-layer hook through MCP `img2img` on Radeon 780M with SD1.5 at 512 × 512 and on RTX 3090 with SDXL at 768 × 768. Both runs used weight 0.15 and a system-only PATH, reported `cuda=false`, recorded LLuL settings in the PNG and preserved every RGB channel outside the img2img mask.
+
+The ZIP SHA-256 is `34d1ae2bda957c7d8aa131b9161ae18840e993fab005325bba8d872600421ebf`. The archived launcher, desktop JAR, worker JAR and inference DLL matched the staged files byte for byte.
+
+Direct tests on RTX 3090 exercised the region coordinates, spherical blending, bicubic antialiasing and the four advanced layer types. The `OUT03` filter ran ten region operations per active evaluation. Zero weight, an unreachable start and an unmatched filter preserved the baseline. A black LLuL blend mask matched the graph with no active layer, and the same-seed replay matched exactly. A seven-step sliced Heun run applied LLuL on evaluation eight with automatic Max Steps. A 576 × 512 SD1.5 test distinguished area from fixed average pooling in the U-Net's odd-width middle blocks.
+
+An 832 × 832 SDXL Latent Hires run on RTX 3090 applied LLuL in both sampling passes. An earlier concurrent run reached the runtime's host-memory guard at the second pass. All 48 Vulkan worker tests and seven LLuL plugin tests passed. The images were inspected. Strong output-layer blending at weight 1 produced color artifacts in the selected region on both adapters. Two direct SDXL requests at 776 × 768 and 800 × 768 hit an encoded-latent shape mismatch during image preparation.
+
 ## Windows v0.52 — ControlNet-LLLite
 
 The ZIP SHA-256 is `5656197d6b5f02fe6df292bc5dd1d7ea40a03f9c6ec017d76038c578d039500b`. Using a system-only PATH, the staged `SDV-NUI.exe` found the named Canny adapter through the model catalog and accepted its hint through MCP. The worker reported Vulkan with `cuda=false` on both adapters. Both PNGs recorded the adapter and kept every unmasked pixel. The ZIP contains the tested launcher, worker JAR and native inference DLL byte for byte.

@@ -1,0 +1,511 @@
+--- /dev/null
++++ b/src/model/common/llul.h
+@@ -0,0 +1,36 @@
++#pragma once
++
++#include <functional>
++#include <memory>
++#include <string>
++#include <vector>
++
++#include "core/tensor.hpp"
++
++struct GGMLRunnerContext;
++struct ggml_tensor;
++
++namespace sd::nui {
++    enum LlulLayer { LlulResblock = 1, LlulTransformer = 2, LlulSelf = 4, LlulCross = 8, LlulOutput = 16 };
++    enum LlulScale { LlulNearest, LlulBilinear, LlulBicubic, LlulMean, LlulMax };
++
++    struct LlulConfig {
++        int layers = 0, factor = 2, start = 5, end = 0;
++        double x = .25, y = .25;
++        float weight = .15f;
++        int up = LlulBilinear, down = LlulBilinear;
++        bool up_aa = false, down_aa = false, slerp = false, force_float = false;
++        std::vector<std::string> filters;
++        std::shared_ptr<const sd::Tensor<float>> mask;
++        bool operator==(const LlulConfig& other) const {
++            return layers == other.layers && factor == other.factor && start == other.start && end == other.end &&
++                   x == other.x && y == other.y && weight == other.weight && up == other.up && down == other.down &&
++                   up_aa == other.up_aa && down_aa == other.down_aa && slerp == other.slerp &&
++                   force_float == other.force_float && filters == other.filters && mask == other.mask;
++        }
++    };
++
++    struct LlulGraphData;
++    ggml_tensor* llul_forward(GGMLRunnerContext* ctx, ggml_tensor* input, LlulLayer kind,
++                              const std::string& layer, const std::function<ggml_tensor*(ggml_tensor*)>& forward);
++}
+--- /dev/null
++++ b/src/model/common/llul.cpp
+@@ -0,0 +1,230 @@
++#include "model/common/llul.h"
++
++#include <algorithm>
++#include <cmath>
++#include <limits>
++#include <map>
++#include <regex>
++#include <stdexcept>
++#include <tuple>
++
++#include "core/ggml_runner.h"
++#include "model/common/nui_unet_hooks.hpp"
++
++namespace sd::nui {
++    constexpr int LlulArea = 5;
++
++    struct LlulGraphData {
++        std::map<std::tuple<int, int, int, int, int, bool, int>, std::vector<float>> matrices;
++        ggml_tensor* mask = nullptr;
++    };
++
++    static std::string layer_label(const std::string& name, LlulLayer kind) {
++        static const std::regex pattern(R"((input_blocks|output_blocks)\.([0-9]+)\.([01])|middle_block\.([012]))");
++        static const std::regex depth_pattern(R"(transformer_blocks\.([0-9]+))");
++        std::smatch match;
++        if (!std::regex_search(name, match, pattern))
++            return {};
++        const auto two = [](int n) { return (n < 10 ? "0" : "") + std::to_string(n); };
++        const bool middle = match[4].matched;
++        int index = middle ? 0 : std::stoi(match[2].str());
++        int slot = kind == LlulResblock && middle && match[4].str() == "2" ? 1 : 0;
++        auto label = (middle ? "M" : match[1].str() == "input_blocks" ? "IN" : "OUT") + two(index) + "_" + two(slot);
++        if (kind == LlulResblock)
++            return label + "_resblock";
++        if (kind == LlulTransformer)
++            return label + "_trans";
++        if (!std::regex_search(name, match, depth_pattern))
++            return {};
++        return label + "_" + two(std::stoi(match[1].str())) + (kind == LlulSelf ? "_sattn" : "_xattn");
++    }
++
++    static double interpolation_kernel(double distance, int mode, bool antialias) {
++        distance = std::abs(distance);
++        if (mode == LlulBilinear)
++            return std::max(0., 1. - distance);
++        const double a = antialias ? -.5 : -.75;
++        if (distance < 1.)
++            return ((a + 2.) * distance - (a + 3.)) * distance * distance + 1.;
++        if (distance < 2.)
++            return ((a * distance - 5. * a) * distance + 8. * a) * distance - 4. * a;
++        return 0.;
++    }
++
++    static ggml_tensor* resize_axis(GGMLRunnerContext& ctx, ggml_tensor* input, int target,
++                                    int before, int after, int mode, bool aa, int step) {
++        const int source = int(input->ne[0]);
++        if (source == target && before == 0 && after == 0)
++            return input;
++        const int output = target + before + after;
++        auto& cache = active.llul_graph->matrices;
++        auto [slot, build] = cache.try_emplace({source, target, before, after, mode, aa, step});
++        auto& weights = slot->second;
++        if (build) {
++            weights.resize(size_t(source) * output);
++            const double scale = step > 0 ? step : double(source) / target;
++            const double kernel_scale = aa ? std::max(1., scale) : 1.;
++            const double support = (mode == LlulBicubic ? 2. : 1.) * kernel_scale;
++            for (int j = 0; j < output; ++j) {
++                const int position = std::clamp(j - before, 0, target - 1);
++                auto* row = weights.data() + size_t(j) * source;
++                if (mode == LlulArea) {
++                    // Adaptive average pooling includes overlapping edge bins on odd grids.
++                    const int first = int(int64_t(position) * source / target);
++                    const int last = int((int64_t(position + 1) * source + target - 1) / target);
++                    std::fill(row + first, row + last, 1.f / (last - first));
++                    continue;
++                }
++                if (mode == LlulNearest) {
++                    row[std::clamp(int(std::floor((position + .5) * scale)), 0, source - 1)] = 1.f;
++                    continue;
++                }
++                const double centre = (position + .5) * scale - .5;
++                double sum = 0;
++                for (int k = int(std::floor(centre - support)); k <= int(std::ceil(centre + support)); ++k) {
++                    if (aa && (k < 0 || k >= source))
++                        continue;
++                    const double weight = interpolation_kernel((k - centre) / kernel_scale, mode, aa);
++                    row[std::clamp(k, 0, source - 1)] += float(weight);
++                    sum += weight;
++                }
++                for (int k = 0; k < source; ++k)
++                    row[k] = float(row[k] / sum);
++            }
++        }
++        auto* graph = ctx.ggml_ctx;
++        auto* kernel = ggml_new_tensor_2d(graph, GGML_TYPE_F32, source, output);
++        ctx.set_backend_tensor_data(kernel, weights.data());
++        return ggml_mul_mat(graph, kernel, input);
++    }
++
++    static ggml_tensor* resize(GGMLRunnerContext& ctx, ggml_tensor* input, int w, int h,
++                               int pad_w, int pad_h, int mode, bool aa, int step = 0) {
++        auto* graph = ctx.ggml_ctx;
++        auto* x = resize_axis(ctx, input, w, pad_w / 2, pad_w - pad_w / 2, mode, aa, step);
++        if (x->ne[1] == h && !pad_h)
++            return x;
++        x = ggml_cont(graph, ggml_transpose(graph, x));
++        x = resize_axis(ctx, x, h, pad_h / 2, pad_h - pad_h / 2, mode, aa, step);
++        return ggml_cont(graph, ggml_transpose(graph, x));
++    }
++
++    static ggml_tensor* crop(ggml_context* graph, ggml_tensor* image, int x, int y, int w, int h) {
++        return ggml_view_4d(graph, image, w, h, image->ne[2], image->ne[3],
++                            image->nb[1], image->nb[2], image->nb[3], x * image->nb[0] + y * image->nb[1]);
++    }
++
++    static int region_origin(int size, int extent, double fraction) {
++        const double value = size * fraction;
++        if (value <= -1.)
++            throw std::runtime_error("LLuL region starts outside the image");
++        return int(std::clamp(value, 0., double(size - extent)));
++    }
++
++    static ggml_tensor* spherical(ggml_context* g, ggml_tensor* low, ggml_tensor* high, float weight) {
++        const auto pack = [&](ggml_tensor* t) { return ggml_cont(g, ggml_permute(g, t, 1, 2, 0, 3)); };
++        auto* a = pack(low);
++        auto* b = pack(high);
++        auto* an = ggml_sqrt(g, ggml_sum_rows(g, ggml_sqr(g, a)));
++        auto* bn = ggml_sqrt(g, ggml_sum_rows(g, ggml_sqr(g, b)));
++        constexpr auto max = std::numeric_limits<float>::max();
++        auto* denom = ggml_clamp(g, ggml_mul(g, an, bn), 1e-30f, max);
++        auto* dot = ggml_clamp(g, ggml_div(g, ggml_sum_rows(g, ggml_mul(g, a, b)), denom), -1.f, 1.f);
++        auto* x = ggml_abs(g, dot);
++        // Minimax acos approximation on [0, 1], reflected for negative dot products.
++        auto* poly = ggml_scale_bias(g, x, -.0187293f, .0742610f);
++        poly = ggml_scale_bias(g, ggml_mul(g, poly, x), 1.f, -.2121144f);
++        poly = ggml_scale_bias(g, ggml_mul(g, poly, x), 1.f, 1.5707288f);
++        auto* acute = ggml_mul(g, poly, ggml_sqrt(g, ggml_scale_bias(g, x, -1.f, 1.f)));
++        auto* negative = ggml_step(g, ggml_scale(g, dot, -1.f));
++        auto* angle = ggml_add(g, acute, ggml_mul(g, negative, ggml_scale_bias(g, acute, -2.f, 3.141592653589793f)));
++        auto* sine = ggml_abs(g, ggml_sin(g, angle));
++        auto* nonzero = ggml_step(g, ggml_scale_bias(g, sine, 1.f, -1e-6f));
++        nonzero = ggml_mul(g, nonzero, ggml_step(g, ggml_mul(g, an, bn)));
++        auto* safe = ggml_clamp(g, sine, 1e-6f, max);
++        auto* wa = ggml_div(g, ggml_sin(g, ggml_scale(g, angle, 1.f - weight)), safe);
++        auto* wb = ggml_div(g, ggml_sin(g, ggml_scale(g, angle, weight)), safe);
++        auto* curved = ggml_add(g, ggml_mul(g, a, wa), ggml_mul(g, b, wb));
++        auto* linear = ggml_add(g, a, ggml_scale(g, ggml_sub(g, b, a), weight));
++        auto* blended = ggml_add(g, linear, ggml_mul(g, ggml_sub(g, curved, linear), nonzero));
++        return ggml_cont(g, ggml_permute(g, blended, 2, 0, 1, 3));
++    }
++
++    ggml_tensor* llul_forward(GGMLRunnerContext* ctx, ggml_tensor* input, LlulLayer kind,
++                              const std::string& layer, const std::function<ggml_tensor*(ggml_tensor*)>& forward) {
++        auto& pass = active;
++        const auto* config = pass.llul;
++        if (!config || !(config->layers & kind))
++            return forward(input);
++        if (kind != LlulOutput && !config->filters.empty()) {
++            const auto label = layer_label(layer, kind);
++            if (label.empty() || std::none_of(config->filters.begin(), config->filters.end(),
++                                               [&](const auto& filter) { return label.find(filter) != std::string::npos; }))
++                return forward(input);
++        }
++        const bool tokens = kind == LlulSelf || kind == LlulCross;
++        const int width = int(tokens ? pass.spatial_w : input->ne[0]);
++        const int height = int(tokens ? pass.spatial_h : input->ne[1]);
++        if (tokens && int64_t(width) * height != input->ne[1])
++            return forward(input);
++        const int factor = config->factor, w = width / factor, h = height / factor;
++        if (w == 0 || h == 0)
++            return forward(input);
++        ++pass.llul_regions;
++        pass.llul_layers |= kind;
++        if (!pass.llul_graph)
++            pass.llul_graph = std::make_shared<LlulGraphData>();
++
++        auto* graph = ctx->ggml_ctx;
++        const auto to_image = [&](ggml_tensor* t) {
++            if (!tokens)
++                return t;
++            const auto batch = t->ne[2], channels = t->ne[0];
++            auto* planar = ggml_cont(graph, ggml_permute(graph, t, 1, 0, 2, 3));
++            return ggml_reshape_4d(graph, planar, width, height, channels, batch);
++        };
++        const auto to_tokens = [&](ggml_tensor* t) {
++            if (!tokens)
++                return t;
++            auto* planar = ggml_reshape_3d(graph, ggml_cont(graph, t), width * height, t->ne[2], t->ne[3]);
++            return ggml_cont(graph, ggml_permute(graph, planar, 1, 0, 2, 3));
++        };
++        const int x = region_origin(width, w, config->x), y = region_origin(height, h, config->y);
++        auto* image = to_image(input);
++        auto* region = ggml_cont(graph, crop(graph, image, x, y, w, h));
++        if (region->type != GGML_TYPE_F32)
++            region = ggml_cast(graph, region, GGML_TYPE_F32);
++        auto* extra = resize(*ctx, region, w * factor, h * factor,
++                             width - w * factor, height - h * factor, config->up, config->up_aa);
++        auto* base = to_image(forward(input));
++        extra = to_image(forward(to_tokens(extra)));
++        auto* reduced = config->down == LlulMean || config->down == LlulMax
++            ? ggml_pool_2d(graph, extra, config->down == LlulMean ? GGML_OP_POOL_AVG : GGML_OP_POOL_MAX,
++                           factor, factor, factor, factor, 0, 0)
++            : resize(*ctx, extra, w, h, 0, 0, config->down, config->down_aa, factor);
++        auto* low = ggml_cont(graph, crop(graph, base, x, y, w, h));
++        if (config->force_float || low->type != GGML_TYPE_F32)
++            low = ggml_cast(graph, low, GGML_TYPE_F32);
++        auto* delta = ggml_sub(graph, reduced, low);
++        ggml_tensor* mixed;
++        if (config->mask) {
++            auto& mask = pass.llul_graph->mask;
++            if (!mask) {
++                const auto& s = config->mask->shape();
++                mask = ggml_new_tensor_4d(graph, GGML_TYPE_F32, s[0], s[1], 1, 1);
++                ctx->set_backend_tensor_data(mask, config->mask->data());
++            }
++            auto* weights = resize(*ctx, mask, w, h, 0, 0, LlulBilinear, true);
++            mixed = ggml_add(graph, low, ggml_mul(graph, delta, ggml_scale(graph, weights, config->weight)));
++        } else if (config->slerp) {
++            mixed = spherical(graph, low, reduced, config->weight);
++        } else {
++            mixed = ggml_add(graph, low, ggml_scale(graph, delta, config->weight));
++        }
++        base = ggml_cont(graph, base);
++        if (mixed->type != base->type)
++            mixed = ggml_cast(graph, mixed, base->type);
++        return to_tokens(ggml_set(graph, base, mixed, base->nb[1], base->nb[2], base->nb[3],
++                                  x * base->nb[0] + y * base->nb[1]));
++    }
++}
+--- a/src/model/common/nui_unet_hooks.hpp
++++ b/src/model/common/nui_unet_hooks.hpp
+@@ -3,6 +3,7 @@
+ #include <utility>
+ #include <deque>
+ #include <optional>
++#include <memory>
+ #include <random>
+ #include <vector>
+ struct ggml_tensor;
+@@ -10,6 +11,8 @@
+
+ namespace sd::nui {
+     struct LLLiteBinding;
++    struct LlulConfig;
++    struct LlulGraphData;
+
+     struct DeepCacheHistory {
+         int last = -1, previous = -1;
+@@ -78,6 +81,9 @@
+         int reference_layers = 0;
+         const LLLiteBinding* lllite = nullptr;
+         ggml_tensor* lllite_image = nullptr;
++        const LlulConfig* llul = nullptr;
++        std::shared_ptr<LlulGraphData> llul_graph;
++        int llul_regions = 0, llul_layers = 0;
+         int lllite_matched = 0, lllite_applied = 0;
+         int agent_layers = 0, agent_attention_layers = 0;
+         std::deque<std::vector<int32_t>> agent_indices;
+--- a/src/dgl/models/diffusion_prediction.h
++++ b/src/dgl/models/diffusion_prediction.h
+@@ -9,6 +9,7 @@
+ #include "core/tensor.hpp"
+ #include "model/common/nui_unet_hooks.hpp"
+ #include "model/common/lllite.h"
++#include "model/common/llul.h"
+ #include "model/common/rope_circular.hpp"
+
+ struct AttentionProcessor;
+@@ -39,6 +40,7 @@
+         sd::nui::UNetOptions unet_hooks;
+         std::shared_ptr<const sd::Tensor<float>> reference_latent, reference_noise;
+         std::shared_ptr<const sd::nui::LLLiteBinding> lllite;
++        std::shared_ptr<const sd::nui::LlulConfig> llul;
+         std::shared_ptr<const sd::Tensor<float>> cdt_regions;
+         std::array<float, 4> cdt_shifts{};
+         float cdt_shift_delay = 0.f, cdt_map_strength = 0.f;
+--- a/src/dgl/bindings/registration.cpp
++++ b/src/dgl/bindings/registration.cpp
+@@ -603,6 +603,15 @@
+              optional("reference_latent", Kind::Tensor), optional("reference_noise", Kind::Tensor),
+              optional("lllite_path", Kind::String), optional("lllite_hint", Kind::Tensor),
+              optional("lllite_blank_negative", Kind::Boolean, false),
++             integer("llul_kinds", 0, 31, 0), integer("llul_factor", 1, 32, 2),
++             integer("llul_start", 1, INT_MAX, 5), integer("llul_end", 0, INT_MAX, 0),
++             number("llul_weight", -std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), .15),
++             number("llul_x", -std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), .25), number("llul_y", -std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), .25),
++             integer("llul_up", 0, 2, 1), integer("llul_down", 0, 5, 1),
++             optional("llul_up_aa", Kind::Boolean, false), optional("llul_down_aa", Kind::Boolean, false),
++             optional("llul_slerp", Kind::Boolean, false), optional("llul_fp32", Kind::Boolean, false),
++             optional("llul_blank_negative", Kind::Boolean, false),
++             optional_list("llul_filters", Kind::String), optional("llul_mask", Kind::Tensor),
+              number("lllite_strength", 0, 10, 1), number("lllite_start", 0, 1, 0), number("lllite_end", 0, 1, 1),
+              number("reference_weight", 0, 2, 0), number("reference_style", 0, 1, 0.5),
+              optional("reference_positive", Kind::Boolean, false),
+--- a/src/dgl/bindings/predictor.cpp
++++ b/src/dgl/bindings/predictor.cpp
+@@ -254,6 +254,34 @@
+             binding->last_t = 999.f * (1.f - float(get_number(args, "lllite_end")));
+             output.options.lllite = std::move(binding);
+         }
++        if (const auto kinds = get_int(args, "llul_kinds")) {
++            if (!sd_version_is_unet(engine.version()))
++                throw std::runtime_error("LLuL requires a Stable Diffusion U-Net");
++            auto config = std::make_shared<sd::nui::LlulConfig>();
++            config->layers = int(kinds);
++            config->factor = int(get_int(args, "llul_factor"));
++            config->start = int(get_int(args, "llul_start"));
++            config->end = int(get_int(args, "llul_end"));
++            config->x = get_number(args, "llul_x");
++            config->y = get_number(args, "llul_y");
++            config->weight = float(get_number(args, "llul_weight"));
++            config->up = int(get_int(args, "llul_up"));
++            config->down = int(get_int(args, "llul_down"));
++            config->up_aa = get_bool(args, "llul_up_aa");
++            config->down_aa = get_bool(args, "llul_down_aa");
++            config->slerp = get_bool(args, "llul_slerp");
++            config->force_float = get_bool(args, "llul_fp32");
++            if (args.count("llul_filters"))
++                for (const auto& field : args.at("llul_filters").items)
++                    config->filters.push_back(field.scalar.get<std::string>());
++            if (args.count("llul_mask")) {
++                const auto& mask = float_tensor(args, "llul_mask");
++                if (mask.dim() != 4 || mask.shape()[2] != 1 || mask.shape()[3] != 1)
++                    throw std::runtime_error("LLuL mask must be a single grayscale image");
++                config->mask = std::shared_ptr<const sd::Tensor<float>>(object<sd_tensor_t>(args, "llul_mask"), &mask);
++            }
++            output.options.llul = std::move(config);
++        }
+         const auto& condition = args.at("condition").fields;
+         if (const auto controls = condition.find("controls"); controls != condition.end()) {
+             output.controls = controls->second.as<models::ControlBindings>();
+@@ -274,7 +302,8 @@
+         }
+         output.condition = read_condition(condition, args);
+         auto& c          = output.condition;
+-        if (output.options.lllite && get_bool(args, "lllite_blank_negative") &&
++        if (((output.options.lllite && get_bool(args, "lllite_blank_negative")) ||
++             (output.options.llul && sd_version_is_sdxl(engine.version()) && get_bool(args, "llul_blank_negative"))) &&
+             output.resolved_parameterization().prediction() != EDM_V_PRED) {
+             if (c.c_vector.empty() || c.c_vector.shape()[0] < 1280)
+                 throw std::runtime_error("SDXL negative conditioning is missing its pooled embedding");
+--- a/src/dgl/models/dit.cpp
++++ b/src/dgl/models/dit.cpp
+@@ -346,6 +346,11 @@
+         if (auto* agent = options.unet_hooks.agent_timeline)
+             agent->advance(sd::nui::active.timestep, options.unet_hooks.agent_switch, options.unet_hooks.agent_seed);
+         sd::nui::active.evaluation = step.unet_evaluation;
++        if (const auto& config = options.llul) {
++            const int end = config->end > 0 ? config->end : std::max(1, int(step.schedule_size) - 1);
++            if (config->weight != 0.f && step.unet_evaluation >= config->start && step.unet_evaluation <= end)
++                sd::nui::active.llul = config.get();
++        }
+         const int gate = options.unet_hooks.tgate_step;
+         if (gate > 0 && step.schedule_size > size_t(gate + 1) && sd_version_is_unet(version())) {
+             sd::nui::active.tgate_step = gate;
+@@ -426,7 +431,7 @@
+             if (step.compute_controls) {
+                 const sd::nui::UNetOptions neutral;
+                 std::optional<sd::nui::UNetPassScope> control_scope;
+-                if (options.reference_latent || options.unet_hooks.agent_timeline || options.lllite)
++                if (options.reference_latent || options.unet_hooks.agent_timeline || options.lllite || options.llul)
+                     control_scope.emplace(neutral, int(shape[0]), int(shape[1]), uint32_t(step.index));
+                 unet_controls = step.compute_controls(input, timesteps, condition);
+             }
+@@ -510,6 +515,9 @@
+         if (result.empty())
+             compute_error();
+         const auto& attention = sd::nui::active;
++        if (attention.llul_regions)
++            LOG_INFO("LLuL evaluation %d: %d regions (layer kinds %d)", step.unet_evaluation,
++                     attention.llul_regions, attention.llul_layers);
+         if (attention.lllite && !attention.lllite_matched)
+             throw std::runtime_error("No ControlNet-LLLite projections match this U-Net");
+         if (attention.lllite_applied)
+--- a/src/dgl/ops/predictor.cpp
++++ b/src/dgl/ops/predictor.cpp
+@@ -542,6 +542,11 @@
+                 !pos->condition.c_ref_images.empty() || !neg->condition.c_ref_images.empty())
+                 return;
+
++            const auto& pos_llul = pos->options.llul;
++            const auto& neg_llul = neg->options.llul;
++            if (bool(pos_llul) != bool(neg_llul) || (pos_llul && !(*pos_llul == *neg_llul)))
++                return;
++
+             const auto& pos_lite = pos->options.lllite;
+             const auto& neg_lite = neg->options.lllite;
+             if (bool(pos_lite) != bool(neg_lite) || (pos_lite &&
+--- a/src/model/common/block.hpp
++++ b/src/model/common/block.hpp
+@@ -9,6 +9,7 @@
+ #include "model/common/ggml_block.hpp"
+ #include "model/common/agent_attention.hpp"
+ #include "model/common/lllite.h"
++#include "model/common/llul.h"
+
+ class DownSampleBlock : public GGMLBlock {
+ protected:
+@@ -366,6 +367,8 @@
+         // to_out_1 is nn.Dropout(), skip for inference
+     }
+
++    const std::string& attention_name() const { return layer_name; }
++
+     ggml_tensor* attend_agents(GGMLRunnerContext* ctx, ggml_tensor* x, ggml_tensor* agents) {
+         auto* graph = ctx->ggml_ctx;
+         const auto project = [&](const char* key, ggml_tensor* input) {
+@@ -558,7 +561,8 @@
+
+         auto r = x;
+         x      = norm1->forward(ctx, x);
+-        x      = attn1->self_attention(ctx, x, r);  // self-attention
++        x      = sd::nui::llul_forward(ctx, x, sd::nui::LlulSelf, attn1->attention_name(),
++                         [&](ggml_tensor* input) { return attn1->self_attention(ctx, input, r); });
+         x      = ggml_add(ctx->ggml_ctx, x, r);
+         r = x;
+         auto& pass = sd::nui::active;
+@@ -587,7 +591,8 @@
+             x = cached;
+             ++pass.tgate_reuses;
+         } else {
+-            x = attn2->forward(ctx, norm2->forward(ctx, x), context);
++            x = sd::nui::llul_forward(ctx, norm2->forward(ctx, x), sd::nui::LlulCross, attn2->attention_name(),
++                         [&](ggml_tensor* input) { return attn2->forward(ctx, input, context); });
+             if (tgate) {
+                 auto* stored = x;
+                 if (pair) {
+--- a/src/model/diffusion/unet.hpp
++++ b/src/model/diffusion/unet.hpp
+@@ -506,7 +506,8 @@
+         } else {
+             auto block = std::dynamic_pointer_cast<ResBlock>(blocks[name]);
+
+-            return block->forward(ctx, x, emb);
++            return sd::nui::llul_forward(ctx, x, sd::nui::LlulResblock, name,
++                [&](ggml_tensor* input) { return block->forward(ctx, input, emb); });
+         }
+     }
+
+@@ -527,7 +528,8 @@
+         } else {
+             auto block = std::dynamic_pointer_cast<SpatialTransformer>(blocks[name]);
+
+-            return block->forward(ctx, x, context);
++            return sd::nui::llul_forward(ctx, x, sd::nui::LlulTransformer, name,
++                [&](ggml_tensor* input) { return block->forward(ctx, input, context); });
+         }
+     }
+
+@@ -878,11 +880,13 @@
+         }
+
+         // out
+-        h = cdt ? out_0->forward(ctx, h, 1.f - cdt->cdt_detail2 * 0.01f, 1.f + cdt->cdt_detail2 * 0.02f)
+-                : out_0->forward(ctx, h);
+-        h = ggml_silu_inplace(ctx->ggml_ctx, h);
+-        h = cdt ? out_2->forward_scaled(ctx, h, 1.f, 1.f, cdt->cdt_contrast * 0.02f)
+-                : out_2->forward(ctx, h);
++        h = sd::nui::llul_forward(ctx, h, sd::nui::LlulOutput, "", [&](ggml_tensor* input) {
++            auto* normalized = cdt ? out_0->forward(ctx, input, 1.f - cdt->cdt_detail2 * 0.01f, 1.f + cdt->cdt_detail2 * 0.02f)
++                                   : out_0->forward(ctx, input);
++            normalized = ggml_silu_inplace(ctx->ggml_ctx, normalized);
++            return cdt ? out_2->forward_scaled(ctx, normalized, 1.f, 1.f, cdt->cdt_contrast * 0.02f)
++                       : out_2->forward(ctx, normalized);
++        });
+         ggml_set_name(h, "bench-end");
+         return h;  // [N, out_channels, h, w]
+     }
