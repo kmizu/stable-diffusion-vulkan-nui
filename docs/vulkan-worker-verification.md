@@ -3,6 +3,10 @@
 
 
 
+## Windows v0.44
+
+The ZIP SHA-256 is `cbe8d5908949acacca63ca626f9a40c39092938a40cc3ac8df7d3a616bfec17e`. The packaged MCP `img2img` tool ran FreeU inpainting with a PNG mask and zero mask blur. The staged executable ran SD1.5 at 512 × 512 on Radeon 780M. The executable from a fresh ZIP extraction ran SDXL at 768 × 768 on RTX 3090. Both kept every source pixel outside the mask, used a system-only PATH and reported `cuda=false`.
+
 ## Windows v0.43
 
 The ZIP SHA-256 is `4e694e00d5ef40d1012839be265b6737e2907078eeb6926be02572c081b41b9d`. The packaged MCP `img2img` tool applied Latent Modifier sharpness, tone mapping, spectral clamp and seeded noise. The staged executable generated SD1.5 at 512 × 512 on Radeon 780M. The executable from a fresh ZIP extraction generated SDXL at 768 × 768 on RTX 3090. Both used the bundled Java 25 and Vulkan DLL with a system-only PATH and reported `cuda=false`.
