@@ -3,6 +3,10 @@
 
 
 
+## Windows v0.43
+
+The ZIP SHA-256 is `4e694e00d5ef40d1012839be265b6737e2907078eeb6926be02572c081b41b9d`. The packaged MCP `img2img` tool applied Latent Modifier sharpness, tone mapping, spectral clamp and seeded noise. The staged executable generated SD1.5 at 512 × 512 on Radeon 780M. The executable from a fresh ZIP extraction generated SDXL at 768 × 768 on RTX 3090. Both used the bundled Java 25 and Vulkan DLL with a system-only PATH and reported `cuda=false`.
+
 ## Windows v0.42
 
 The ZIP SHA-256 is `41847f4897f95d97fa9dd6fd9eb3bc2cfae74ac7724c01919d92714134b8cecc`. The packaged executable ran MultiDiffusion through the MCP `img2img` tool with 320 × 320 tiles, 64 px overlap, and Gaussian blending. SD1.5 completed at 512 × 512 on Radeon 780M, and SDXL completed at 768 × 768 on RTX 3090 from a fresh ZIP extraction. Both runs used a system-only PATH and reported `cuda=false`.
