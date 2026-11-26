@@ -20,11 +20,11 @@ private[vulkan] object VulkanUnetHooks:
     width/8 > tw || height/8 > th
 
   final case class Settings(args: String, regions: Int, pagScale: Double, adaptive: Double, sagScale: Double):
-    def guidance(cfg: Double, concat: String, condition: String): String =
-      if pagScale == 0 then s"guided = cfg(pos, neg, scale = $cfg, sag_scale = $sagScale)"
+    def guidance(cfg: Double, concat: String, condition: String, post: String): String =
+      if pagScale == 0 then s"guided = cfg(pos, neg, scale = $cfg, sag_scale = $sagScale$post)"
       else
         val g = math.max(1.0,cfg)
-        val guided = if cfg > 1 then s"cfg(enhanced,neg,scale=$cfg)" else "enhanced"
+        val guided = if cfg > 1 then s"cfg(enhanced,neg,scale=$cfg$post)" else "enhanced"
         s"perturbed = predictor(unet,$condition$concat$args,pag_regions=$regions)\n" +
           s"enhanced = cfg(pos,perturbed,scale=${1+pagScale/g},pag_adaptive_decay=${adaptive/g})\n" +
           s"guided = $guided"

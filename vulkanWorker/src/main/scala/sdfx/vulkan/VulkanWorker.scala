@@ -91,6 +91,7 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
       (if backend.supportsUnetHooks() then VulkanUnetHooks.attentionHooks.toVector.sorted else Vector.empty) ++
       (if backend.supportsUnetResize() then VulkanUnetHooks.resizeHooks.toVector.sorted else Vector.empty) ++
       Option.when(backend.supportsTiledDiffusion())(VulkanUnetHooks.tiledDiffusion).toVector ++
+      Option.when(backend.supportsLatentModifier())(VulkanLatentModifier.id).toVector ++
       Option.when(backend.supportsDynamicThreshold())("dynamic_thresholding") ++
       (if backend.supportsSvd() then Vector("img2vid","novel_view") else Vector.empty) ++ Option.when(sdfx.vulkan.tools.VulkanCharaImport.available)("chara_searcher") ++ Option.when(sdfx.vulkan.tools.VulkanBlip.available && !sdfx.vulkan.tools.VulkanWdTagger.available)("caption") ++ Option.when(sdfx.vulkan.tools.VulkanCustomCode.enabled)("custom_code") ++ sdfx.vulkan.tools.VulkanWdTagger.features ++ Option.when(sdfx.vulkan.tools.VulkanFaceRestore.available)("face_restore") ++ Vector("vulkan_nsfw") ++ Option.when(sdfx.vulkan.tools.VulkanSafety.available)("nsfw_checker")))
 
@@ -488,9 +489,10 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
       val image = sdfx.vulkan.tools.DiffusionImageInput.readRgb(Path.of(path), maxBytes = 200000000L)
       (image, VulkanTools.differenceMask(config, image, () => job.cancelled))
     }
-    val graph = p.hooks.iterator.collectFirst { case (key, config) if VulkanGraph.hooks(key) &&
+    val graph = p.hooks.iterator.collectFirst { case (key, config) if key != VulkanLatentModifier.id && VulkanGraph.hooks(key) &&
       !config.obj.get("enabled").contains(ujson.Bool(false)) && VulkanFusionPrompt.applies(key,p.prompt,p.negativePrompt) &&
       (key != VulkanUnetHooks.tiledDiffusion || VulkanUnetHooks.needsTiles(config,p.width,p.height)) => key }
+      .orElse(VulkanLatentModifier.config(p).map(_ => VulkanLatentModifier.id))
       .orElse(Option.when(tweak.nonEmpty || separateHires && p.hires.upscaler.startsWith("Latent"))(VulkanGraph.latentHires))
     val graphRequest = if graph.nonEmpty || refinement.nonEmpty then req.copy(controlnetPaths = resolveControls(req,job)) else req
     val temperature = p.hooks.get("gpu_temperature_guard").filterNot(_.obj.get("enabled").contains(ujson.Bool(false))).map { h =>
@@ -594,9 +596,12 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
             }
             val tiled = unetHooks.get(VulkanUnetHooks.tiledDiffusion).exists(VulkanUnetHooks.needsTiles(_,w,ht))
             if tiled && (clip.nonEmpty || textGraph.nonEmpty) then unsupported("MultiDiffusion and custom text conditioning in the same refinement")
+            val modifier = VulkanLatentModifier.config(refinementParams).map(VulkanLatentModifier.id -> _)
             val refinementGraph = clip.map(value => VulkanClipIo.id -> Map(VulkanClipIo.id -> value))
               .orElse(textGraph.map(_ -> scheduleHooks))
               .orElse(Option.when(tiled)(VulkanUnetHooks.tiledDiffusion -> unetHooks))
+              .orElse(modifier.map(entry => VulkanLatentModifier.id -> Map(entry)))
+              .map((key,hooks) => key -> (hooks ++ modifier))
             refinementGraph match
               case Some((hook, hooks)) =>
                 val params = refinementParams.copy(prompt = prompt, negativePrompt = negative,

@@ -1,0 +1,445 @@
+diff --git a/src/dgl/ops/predictor.h b/src/dgl/ops/predictor.h
+--- a/src/dgl/ops/predictor.h
++++ b/src/dgl/ops/predictor.h
+@@ -17,6 +17,7 @@
+ #include "dgl/models/diffusion_prediction.h"
+ #include "dgl/ops/control.h"
+ #include "dgl/ops/ip_adapter.h"
++#include "dgl/ops/latent_modifier.h"
+ #include "dgl/ops/pulid.h"
+ #include "runtime/guidance.h"
+
+@@ -49,6 +50,7 @@
+         float image_scale = 1.f;
+         float pag_adaptive_decay = 0.f;
+         float sag_scale = 0.f;
++        LatentModifierOptions latent_modifier;
+         std::vector<float> scale_schedule;
+
+         float scale_at(int step) const;
+@@ -116,6 +118,7 @@
+         const Predictor& root_;
+         std::unique_ptr<Resources> resources_;
+         std::map<const ApgPredictor*, sd::guidance::AdaptiveProjectedGuidance> apg_;
++        std::map<const GuidanceBranches*, std::mt19937> latent_noise_;
+
+     public:
+         PredictionExecution(const Predictor& root, const std::vector<float>& sigmas, const PredictionExecutionOptions& options);
+diff --git a/src/dgl/ops/predictor.cpp b/src/dgl/ops/predictor.cpp
+--- a/src/dgl/ops/predictor.cpp
++++ b/src/dgl/ops/predictor.cpp
+@@ -609,6 +609,17 @@
+             return (original.output-degraded.output)*original.output_scale;
+         }
+
++        Tensor<float> modify_latent(const GuidanceBranches& branches, float scale, Tensor<float> value) {
++            const auto& modifier = branches.latent_modifier;
++            if (scale > 1.f && modifier.enabled()) {
++                const auto& parameterization = primary_predictor(*branches.positive).resolved_parameterization();
++                const auto progress = 1. - std::clamp<double>(parameterization.timestep(sigma_),0.,999.) / 999.;
++                auto& random = execution_.latent_noise_.try_emplace(&branches,modifier.seed).first->second;
++                latent_modifier::apply(value,modifier,progress,random);
++            }
++            return value;
++        }
++
+         Result cfg(const GuidanceBranches& branches) {
+             auto scale = branches.scale_at(step_.index);
+             if (branches.pag_adaptive_decay > 0.f) {
+@@ -621,19 +632,19 @@
+             if (branches.image_only) {
+                 const auto& neg = denoised(*branches.negative);
+                 const auto& img = denoised(*branches.image_only);
+-                return {{}, neg + (img - neg) * branches.image_scale + (pos - img) * scale};
++                return {{}, modify_latent(branches,scale,neg + (img - neg) * branches.image_scale + (pos - img) * scale)};
+             }
+             if (branches.sag_scale > 0.f) {
+                 const auto& branch = scale <= 1.f ? *branches.positive : *branches.negative;
+                 auto correction = sag_correction(branch) * branches.sag_scale;
+                 if (scale <= 1.f) return {{}, pos + correction};
+                 const auto& neg = denoised(*branches.negative);
+-                return {{}, neg + (pos - neg)*scale + correction};
++                return {{}, modify_latent(branches,scale,neg + (pos - neg)*scale + correction)};
+             }
+             if (scale == 1.f)
+                 return {{}, pos};
+             const auto& neg = denoised(*branches.negative);
+-            return {{}, neg + (pos - neg) * scale};
++            return {{}, modify_latent(branches,scale,neg + (pos - neg) * scale)};
+         }
+
+         Result apg(const ApgPredictor& node) {
+@@ -658,7 +669,7 @@
+             input.pred_img_uncond = img ? &neg : nullptr;
+             guidance.set_guidance_scale(scale);
+             auto result = guidance.forward(input, {});
+-            return {{}, to_denoised(prediction, result.pred)};
++            return {{}, modify_latent(branches,scale,to_denoised(prediction, result.pred))};
+         }
+
+         Result slg(const SkipLayerPredictor& node) {
+diff --git a/src/dgl/bindings/predictor.cpp b/src/dgl/bindings/predictor.cpp
+--- a/src/dgl/bindings/predictor.cpp
++++ b/src/dgl/bindings/predictor.cpp
+@@ -210,6 +210,37 @@
+         output.image_scale = float(get_number(args, "image_scale"));
+         output.pag_adaptive_decay = float(get_number(args,"pag_adaptive_decay"));
+         output.sag_scale = float(get_number(args,"sag_scale"));
++        if (args.count("latent_modifier")) {
++            const auto& fields = args.at("latent_modifier").fields;
++            auto& m = output.latent_modifier;
++            const auto scalar = [&](const char* key, double fallback) {
++                const auto value = fields.count(key) ? double(get_number(fields,key)) : fallback;
++                if (!std::isfinite(value))
++                    throw std::runtime_error(std::string("Invalid Latent Modifier value: ") + key);
++                return value;
++            };
++            const auto text = [&](const char* key, const char* fallback) {
++                return fields.count(key) ? get_string(fields,key) : std::string(fallback);
++            };
++            m.sharpness = scalar("sharpness_multiplier",0);
++            m.broad_gaussian = text("sharpness_method","anisotropic") == "gaussian";
++            m.tonemap = scalar("tonemap_multiplier",0);
++            m.tonemap_method = text("tonemap_method","reinhard");
++            m.tonemap_percentile = scalar("tonemap_percentile",100);
++            m.contrast = scalar("contrast_multiplier",0);
++            m.drift = scalar("combat_cfg_drift",0);
++            m.median = text("combat_method","subtract") == "median";
++            m.noise = scalar("extra_noise_multiplier",0);
++            m.uniform = text("extra_noise_type","gaussian") == "uniform";
++            m.noise_lowpass = int(std::clamp(scalar("extra_noise_lowpass",100),0.,100.));
++            m.divisive = scalar("divisive_norm_multiplier",0);
++            m.divisive_size = int(std::clamp(scalar("divisive_norm_size",127),1.,255.));
++            m.spectral = scalar("spectral_mod_multiplier",0);
++            m.spectral_percentile = scalar("spectral_mod_percentile",5);
++            m.soft_clamp = text("spectral_mod_mode","hard_clamp") == "soft_clamp";
++            if (fields.count("seed"))
++                m.seed = uint32_t(get_int(fields,"seed"));
++        }
+         if (args.count("image_only"))
+             output.image_only = object<Predictor>(args, "image_only");
+         if (args.count("schedule")) {
+diff --git a/src/dgl/bindings/registration.cpp b/src/dgl/bindings/registration.cpp
+--- a/src/dgl/bindings/registration.cpp
++++ b/src/dgl/bindings/registration.cpp
+@@ -609,7 +609,8 @@
+             {Kind::Predictor}, make_predictor);
+         const std::vector<Argument> guidance_branches{
+             required("positive", Kind::Predictor), required("negative", Kind::Predictor), number("scale", 0, 1000),
+-            optional("image_only", Kind::Predictor), number("image_scale", 0, 1000, 1), optional_list("schedule", Kind::Number), number("pag_adaptive_decay",0,1,0), number("sag_scale",0,30,0)};
++            optional("image_only", Kind::Predictor), number("image_scale", 0, 1000, 1), optional_list("schedule", Kind::Number), number("pag_adaptive_decay",0,1,0), number("sag_scale",0,30,0),
++            optional("latent_modifier", Kind::Dict)};
+         registry["cfg"] = make_operation(guidance_branches, {Kind::Predictor}, make_cfg);
+         auto apg        = guidance_branches;
+         apg.insert(apg.end(),
+diff --git a/src/dgl/ops/latent_modifier.h b/src/dgl/ops/latent_modifier.h
+new file mode 100644
+--- /dev/null
++++ b/src/dgl/ops/latent_modifier.h
+@@ -0,0 +1,29 @@
++#ifndef __SD_DGL_OPS_LATENT_MODIFIER_H__
++#define __SD_DGL_OPS_LATENT_MODIFIER_H__
++
++#include <cstdint>
++#include <random>
++#include <string>
++
++#include "core/tensor.hpp"
++
++namespace sd::dgl::ops {
++    struct LatentModifierOptions {
++        double sharpness = 0, tonemap = 0, tonemap_percentile = 100, contrast = 0, drift = 0;
++        double noise = 0, divisive = 0, spectral = 0, spectral_percentile = 5;
++        int noise_lowpass = 100, divisive_size = 127;
++        uint32_t seed = 0;
++        bool broad_gaussian = false, median = false, uniform = false, soft_clamp = false;
++        std::string tonemap_method = "reinhard";
++
++        bool enabled() const {
++            return sharpness || tonemap || contrast || drift || noise || divisive || spectral;
++        }
++    };
++
++    namespace latent_modifier {
++        void apply(Tensor<float>& tensor, const LatentModifierOptions& options, double progress, std::mt19937& random);
++    }
++}
++
++#endif
+diff --git a/src/dgl/ops/latent_modifier.cpp b/src/dgl/ops/latent_modifier.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/dgl/ops/latent_modifier.cpp
+@@ -0,0 +1,272 @@
++#include "dgl/ops/latent_modifier.h"
++
++#include <algorithm>
++#include <cmath>
++#include <complex>
++#include <numeric>
++#include <stdexcept>
++#include <vector>
++
++namespace sd::dgl::ops {
++    namespace latent_modifier {
++        namespace {
++            using Complex = std::complex<double>;
++            constexpr double pi = 3.14159265358979323846;
++
++            void radix2(std::vector<Complex>& data, bool inverse) {
++                const auto n = data.size();
++                for (size_t i = 1, j = 0; i < n; ++i) {
++                    auto bit = n >> 1;
++                    while (j & bit) {
++                        j ^= bit;
++                        bit >>= 1;
++                    }
++                    j ^= bit;
++                    if (i < j)
++                        std::swap(data[i], data[j]);
++                }
++                for (size_t width = 2; width <= n; width *= 2) {
++                    const auto phase = std::polar(1.0, (inverse ? 2 : -2)*pi/width);
++                    for (size_t base = 0; base < n; base += width) {
++                        auto offset = Complex(1.);
++                        for (size_t i = 0; i < width/2; ++i) {
++                            const auto left = data[base+i];
++                            const auto right = data[base+i+width/2] * offset;
++                            data[base+i] = left + right;
++                            data[base+i+width/2] = left - right;
++                            offset *= phase;
++                        }
++                    }
++                }
++                if (inverse)
++                    for (auto& value : data)
++                        value /= static_cast<double>(n);
++            }
++
++            class FourierLine {
++                size_t size_;
++                std::vector<Complex> chirp_, kernel_;
++
++            public:
++                explicit FourierLine(size_t size) : size_(size) {
++                    if ((size & (size-1)) == 0)
++                        return;
++                    size_t padded = 1;
++                    while (padded < 2*size - 1)
++                        padded *= 2;
++                    chirp_.resize(size);
++                    kernel_.resize(padded);
++                    for (size_t k = 0; k < size; ++k) {
++                        chirp_[k] = std::polar(1., -pi*double(k)*double(k)/size);
++                        kernel_[k] = std::conj(chirp_[k]);
++                        if (k > 0)
++                            kernel_[padded-k] = kernel_[k];
++                    }
++                    radix2(kernel_, false);
++                }
++
++                void apply(std::vector<Complex>& line, bool inverse) const {
++                    if (kernel_.empty()) {
++                        radix2(line, inverse);
++                        return;
++                    }
++                    // Bluestein's convolution preserves the frequency bins at non-power-of-two sizes.
++                    std::vector<Complex> work(kernel_.size());
++                    for (size_t i = 0; i < size_; ++i)
++                        work[i] = (inverse ? std::conj(line[i]) : line[i])*chirp_[i];
++                    radix2(work, false);
++                    for (size_t i = 0; i < work.size(); ++i)
++                        work[i] *= kernel_[i];
++                    radix2(work, true);
++                    for (size_t i = 0; i < size_; ++i) {
++                        const auto value = work[i]*chirp_[i];
++                        line[i] = inverse ? std::conj(value)/double(size_) : value;
++                    }
++                }
++            };
++
++            void transform_plane(Complex* plane, size_t width, size_t height,
++                                        const FourierLine& horizontal, const FourierLine& vertical, bool inverse) {
++                std::vector<Complex> row(width), col(height);
++                for (size_t y = 0; y < height; ++y) {
++                    std::copy_n(plane+y*width,width,row.begin());
++                    horizontal.apply(row,inverse);
++                    std::copy(row.begin(),row.end(),plane+y*width);
++                }
++                for (size_t x = 0; x < width; ++x) {
++                    for (size_t y = 0; y < height; ++y)
++                        col[y] = plane[y*width+x];
++                    vertical.apply(col,inverse);
++                    for (size_t y = 0; y < height; ++y)
++                        plane[y*width+x] = col[y];
++                }
++            }
++
++            double quantile(std::vector<double> values, double q) {
++                const auto index = std::clamp(q,0.,1.)*(values.size()-1);
++                const auto lo = static_cast<size_t>(index);
++                const auto hi = std::min(lo+1,values.size()-1);
++                std::nth_element(values.begin(),values.begin()+lo,values.end());
++                const auto v = values[lo];
++                if (hi == lo)
++                    return v;
++                const auto next = *std::min_element(values.begin()+hi,values.end());
++                return v + (next-v)*(index-lo);
++            }
++
++            std::vector<float> blur(const std::vector<float>& input, int64_t width, int64_t height,
++                                           const std::vector<double>& kernel, bool reflect) {
++                const auto radius = static_cast<int64_t>(kernel.size()/2);
++                auto coord = [&](int64_t pos, int64_t limit) {
++                    if (!reflect)
++                        return std::clamp<int64_t>(pos,0,limit-1);
++                    return pos < 0 ? -pos : pos >= limit ? 2*limit-2-pos : pos;
++                };
++                std::vector<float> temp(input.size()), result(input.size());
++                for (int axis = 0; axis < 2; ++axis) {
++                    const auto& src = axis ? temp : input;
++                    auto& dst = axis ? result : temp;
++                    tensor_for_each(input.size(), [&](int64_t i) {
++                        const auto x = i % width, y = i/width % height;
++                        const auto origin = i-x-y*width;
++                        double acc = 0;
++                        for (int64_t k = -radius; k <= radius; ++k) {
++                            const auto xx = axis ? x : coord(x+k,width);
++                            const auto yy = axis ? coord(y+k,height) : y;
++                            acc += src[origin+yy*width+xx]*kernel[k+radius];
++                        }
++                        dst[i] = static_cast<float>(acc);
++                    });
++                }
++                return result;
++            }
++
++            std::vector<float> gaussian(const std::vector<float>& input, int64_t width, int64_t height, double sigma) {
++                const auto radius = std::max(1,int(std::ceil(sigma*2)));
++                std::vector<double> kernel(2*radius+1);
++                for (int k = -radius; k <= radius; ++k)
++                    kernel[k+radius] = std::exp(-k*k/(2*sigma*sigma));
++                const auto sum = std::accumulate(kernel.begin(),kernel.end(),0.);
++                for (auto& weight : kernel)
++                    weight /= sum;
++                return blur(input,width,height,kernel,std::min(width,height)>radius);
++            }
++
++        }
++
++        void apply(Tensor<float>& tensor, const LatentModifierOptions& options, double progress, std::mt19937& random) {
++            if (!options.enabled())
++                return;
++            if (tensor.dim() != 4)
++                throw std::runtime_error("Latent Modifier requires a 2D image latent");
++            const auto w = tensor.shape()[0], h = tensor.shape()[1], c = tensor.shape()[2], batches = tensor.shape()[3];
++            const auto plane_size = w*h, image_size = plane_size*c;
++            auto& y = tensor.values();
++            const auto fade = 1-std::clamp(progress,0.,1.);
++            if (options.sharpness) {
++                const auto blurred = gaussian(y,w,h,options.broad_gaussian ? 2. : 1.);
++                for (size_t i = 0; i < y.size(); ++i)
++                    y[i] = static_cast<float>(y[i] + (y[i]-blurred[i])*options.sharpness*fade);
++            }
++            if (options.contrast) {
++                for (int64_t base = 0; base < tensor.numel(); base += plane_size) {
++                    auto* plane = y.data()+base;
++                    const auto mean = std::accumulate(plane,plane+plane_size,0.)/plane_size;
++                    for (int64_t i = 0; i < plane_size; ++i)
++                        plane[i] = static_cast<float>(mean + (plane[i]-mean)*(1+options.contrast));
++                }
++            }
++            if (options.tonemap) {
++                for (int64_t b = 0; b < batches; ++b) {
++                    auto* image = y.data()+b*image_size;
++                    std::vector<double> mag(plane_size,0.);
++                    for (int64_t channel = 0; channel < c; ++channel)
++                        for (int64_t i = 0; i < plane_size; ++i)
++                            mag[i] += double(image[channel*plane_size+i])*image[channel*plane_size+i];
++                    for (auto& value : mag)
++                        value = std::sqrt(value);
++                    const auto top = std::max(1e-6,quantile(mag,options.tonemap_percentile/100));
++                    for (int64_t i = 0; i < plane_size; ++i) {
++                        const auto norm = mag[i]/top;
++                        const auto mapped = options.tonemap_method == "arctan"
++                            ? top*(2/pi)*std::atan(norm*pi/2)
++                            : options.tonemap_method == "clamp" ? std::min(mag[i],top) : top*norm/(1+norm);
++                        const auto gain = 1+(mapped/std::max(mag[i],1e-6)-1)*options.tonemap;
++                        for (int64_t channel = 0; channel < c; ++channel)
++                            image[channel*plane_size+i] = static_cast<float>(image[channel*plane_size+i]*gain);
++                    }
++                }
++            }
++            if (options.drift) {
++                for (int64_t base = 0; base < tensor.numel(); base += plane_size) {
++                    auto* plane = y.data()+base;
++                    double center = 0.;
++                    if (options.median) {
++                        std::vector<float> values(plane,plane+plane_size);
++                        const auto middle = values.begin()+(plane_size-1)/2;
++                        std::nth_element(values.begin(),middle,values.end());
++                        center = *middle;
++                    } else {
++                        center = std::accumulate(plane,plane+plane_size,0.)/plane_size;
++                    }
++                    for (int64_t i = 0; i < plane_size; ++i)
++                        plane[i] = static_cast<float>(plane[i] - center*options.drift);
++                }
++            }
++            if (options.divisive) {
++                auto absolute = y;
++                for (auto& v : absolute)
++                    v = std::abs(v);
++                const auto size = std::max<int64_t>(3,std::min<int64_t>(options.divisive_size,2*std::min(w,h)-1)) | 1;
++                auto local = blur(absolute,w,h,std::vector<double>(size,1./size),false);
++                for (auto& v : local)
++                    v = std::max(v,1e-4f);
++                for (int64_t base = 0; base < tensor.numel(); base += plane_size) {
++                    const auto mean = std::accumulate(local.begin()+base,local.begin()+base+plane_size,0.)/plane_size;
++                    for (int64_t i = base; i < base+plane_size; ++i)
++                        y[i] = static_cast<float>(y[i] + (y[i]/local[i]*mean-y[i])*options.divisive);
++                }
++            }
++            if (options.spectral) {
++                FourierLine horizontal(w), vertical(h);
++                for (int64_t b = 0; b < batches; ++b) {
++                    auto* image = y.data()+b*image_size;
++                    std::vector<Complex> frequency(image,image+image_size);
++                    for (int64_t channel = 0; channel < c; ++channel)
++                        transform_plane(frequency.data()+channel*plane_size,w,h,horizontal,vertical,false);
++                    std::vector<double> magnitudes(image_size);
++                    std::transform(frequency.begin(),frequency.end(),magnitudes.begin(),[](Complex v) { return std::abs(v); });
++                    const auto threshold = quantile(magnitudes,1-options.spectral_percentile/100);
++                    for (int64_t i = 0; i < image_size; ++i) {
++                        if (magnitudes[i] > threshold) {
++                            const auto ratio = threshold/std::max(magnitudes[i],1e-6);
++                            const auto scale = options.soft_clamp ? std::sqrt(ratio) : ratio;
++                            frequency[i] *= 1+(scale-1)*options.spectral;
++                        }
++                    }
++                    for (int64_t channel = 0; channel < c; ++channel)
++                        transform_plane(frequency.data()+channel*plane_size,w,h,horizontal,vertical,true);
++                    for (int64_t i = 0; i < image_size; ++i)
++                        image[i] = static_cast<float>(frequency[i].real());
++                }
++            }
++            if (options.noise && fade) {
++                std::vector<float> noise(y.size());
++                const auto limit = std::sqrt(3.f);
++                std::uniform_real_distribution<float> uniform(-limit,limit);
++                std::normal_distribution<float> gaussian_distribution;
++                for (auto& v : noise)
++                    v = options.uniform ? uniform(random) : gaussian_distribution(random);
++                if (options.noise_lowpass > 0 && options.noise_lowpass < 100)
++                    noise = gaussian(noise,w,h,std::max(.5,(100-options.noise_lowpass)/25.));
++                const auto mean = std::accumulate(y.begin(),y.end(),0.)/y.size();
++                double sq = 0;
++                for (const auto v : y)
++                    sq += (v-mean)*(v-mean);
++                const auto scale = options.noise*fade*std::sqrt(sq/std::max<size_t>(1,y.size()-1));
++                for (size_t i = 0; i < y.size(); ++i)
++                    y[i] = static_cast<float>(y[i] + noise[i]*scale);
++            }
++        }
++    }
++}
