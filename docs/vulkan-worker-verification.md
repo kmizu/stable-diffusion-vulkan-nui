@@ -3,6 +3,10 @@
 
 
 
+## Windows v0.40
+
+The ZIP SHA-256 is `e08c17493fe1be4a16b4b4f347889fcac30818c2abcc9f0c627064653c1027ef`. The executable ran Prompt Fusion through the MCP `img2img` tool using the bundled JDK 25 and Vulkan DLL with a system-only PATH. The staged package generated at 512 × 512 on Radeon 780M with SD1.5 and at 768 × 768 on RTX 3090 with SDXL. A fresh ZIP extraction repeated the SDXL test on RTX 3090. The worker reported a Vulkan device and `cuda=false` in all three runs.
+
 ## Windows v0.39
 
 The ZIP SHA-256 is `6829b85761a96f35318f66999ebe6380bb0baa60cb0285e82541534b4f122a31`. Using the bundled JDK and Vulkan DLL over MCP, the executable exported an unpadded conditioning PT and read it back for img2img. That image matched a `?prompt(..., no_padding=True)` and identity `?eval` on both Radeon 780M with SD1.5 at 512 x 512 and RTX 3090 with SDXL at 768 x 768. A fresh extraction of the ZIP also passed the MCP replay with SD1.5 on RTX 3090.

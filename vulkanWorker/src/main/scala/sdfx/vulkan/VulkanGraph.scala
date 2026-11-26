@@ -9,7 +9,7 @@ import ujson.Value
 
 /** Builds the motion/identity model graphs using the pinned library's DGL operations. */
 private[vulkan] object VulkanGraph:
-  val hooks = Set("animatediff", "photomaker", "ip_adapter", "revision","sonar","semantic_guidance","neutral_prompt","latent_upscale","soft_inpainting","img2imgalt","postdiff",VulkanClipIo.id,VulkanFusionPrompt.id) ++ VulkanLatentGraph.hooks ++ VulkanUnetHooks.hooks
+  val hooks = Set("animatediff", "photomaker", "ip_adapter", "revision","sonar","semantic_guidance","neutral_prompt","latent_upscale","soft_inpainting","img2imgalt","postdiff",VulkanClipIo.id) ++ VulkanFusionPrompt.textHooks ++ VulkanLatentGraph.hooks ++ VulkanUnetHooks.hooks
   val latentHires = "latent hires refinement"
   private def quoted(s: String): String = ujson.write(ujson.Str(s))
   private def path(s: String): String = quoted(VulkanConditioning.file(s, "DGL model"))
@@ -27,7 +27,7 @@ private[vulkan] object VulkanGraph:
         session.publish()
         images
       }
-    else if hook == VulkanFusionPrompt.id then
+    else if VulkanFusionPrompt.textHooks(hook) then
       VulkanClipIo.withScratch("sdv-prompt-fusion-") { scratch =>
         renderGraph(engine, device, model, settings, req, hook, prompt, loras, seed, schedule,
           cancelled, tweak, None, Some(scratch), difference, refinementImage)
@@ -63,10 +63,10 @@ private[vulkan] object VulkanGraph:
     if soft.nonEmpty && !p.img2img.exists(_.mask.nonEmpty) then invalid("Soft Inpainting needs an img2img mask")
     if inverse && p.img2img.isEmpty then invalid("img2img Alternative needs an input image")
     val imageHooks = if customText then Set("conditioning_highres_fix", "inpaint_difference", "img2img_hires_fix") else Set.empty[String]
-    val permitted = Set(hook,"nsfw_checker","aesthetic_score","model_keyword","pnginfo_injection","adetailer","batch_face_swap") ++ imageHooks ++ Option.when(hiresPass)("hires_fix_tweaks") ++ (if latentHook then VulkanLatentGraph.hooks else Set.empty[String]) ++ (if unetHooks.nonEmpty then VulkanUnetHooks.hooks else Set.empty[String])
-    lazy val fusionActive = VulkanFusionPrompt.active(p.prompt) || VulkanFusionPrompt.active(p.negativePrompt)
+    val textHooks = if fusionScratch.nonEmpty then VulkanFusionPrompt.textHooks else Set.empty[String]
+    val permitted = Set(hook,"nsfw_checker","aesthetic_score","model_keyword","pnginfo_injection","adetailer","batch_face_swap") ++ imageHooks ++ textHooks ++ Option.when(hiresPass)("hires_fix_tweaks") ++ (if latentHook then VulkanLatentGraph.hooks else Set.empty[String]) ++ (if unetHooks.nonEmpty then VulkanUnetHooks.hooks else Set.empty[String])
     val other = p.hooks.filterNot { (key, value) =>
-      value.obj.get("enabled").contains(ujson.Bool(false)) || key == VulkanFusionPrompt.id && !fusionActive
+      value.obj.get("enabled").contains(ujson.Bool(false)) || !VulkanFusionPrompt.applies(key,p.prompt,p.negativePrompt)
     }.keySet -- permitted
     if other.nonEmpty || p.hires.enabled && !hiresPass || p.controlnet.exists(_.enabled) || VulkanConditioning.activeEmbeddings(req).nonEmpty then
       unsupported(s"$hook with other sampling hooks, hires, embeddings or ControlNet")
@@ -115,7 +115,9 @@ private[vulkan] object VulkanGraph:
     val enc = s"$size, clip_skip = ${p.clipSkip}"
     val fusion = fusionScratch.map { scratch =>
       val width = if family.startsWith("sdxl") then 2048 else if family.startsWith("sd2") then 1024 else 768
-      VulkanPromptFusion.prepare(engine,scratch,h,p,prompt,family.startsWith("sdxl"),width,textProgram,text,enc,() => check(),lines)
+      val config = p.hooks.get(VulkanFusionPrompt.id).filterNot(_.obj.get("enabled").contains(ujson.Bool(false)))
+        .getOrElse(ujson.Obj())
+      VulkanPromptFusion.prepare(engine,scratch,config,p,prompt,family.startsWith("sdxl"),width,textProgram,text,enc,() => check(),lines)
     }
     val frames = if isVideo then
       val context = h.obj.get("batch_size").fold(16)(_.num.toInt)

@@ -31,3 +31,12 @@ class VulkanFusionPromptSuite extends FunSuite:
     assertEquals(schedule("$pose($x) = portrait of $x\n$pose(a fox)",1),Vector(Plan.Leaf("portrait of a fox")))
     intercept[EngineError](schedule("$loop = $loop\n$loop",1))
   }
+
+  test("Weight Gradient alone leaves Fusion ramps literal and uses A1111 decimal boundaries") {
+    val frames = schedule("(accent:1,3) [old:new:1.0] {fox::1-2}",3,fusionClock = false,gradient = true)
+    assertEquals(frames,Vector(
+      Plan.Leaf("(accent:1,3) old (fox:1)"),
+      Plan.Leaf("(accent:1,3) old (fox:1.5)"),
+      Plan.Leaf("(accent:1,3) old (fox:2)")
+    ))
+  }

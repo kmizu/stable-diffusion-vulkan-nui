@@ -120,8 +120,11 @@ private[vulkan] object VulkanPromptFusion:
     if !options.scale.isFinite || !options.epsilon.isFinite || options.epsilon < 0 || options.epsilon > 1 then
       invalid("invalid spherical geometry")
     val steps = params.img2img.fold(params.steps)(i => math.min(params.steps,(i.denoisingStrength*params.steps).toInt+1))
-    val positive = VulkanFusionPrompt.schedule(prompt,steps)
-    val negative = VulkanFusionPrompt.schedule(params.negativePrompt,steps)
+    def enabled(key: String): Boolean = params.hooks.get(key).exists(!_.obj.get("enabled").contains(ujson.Bool(false)))
+    val fusion = enabled(VulkanFusionPrompt.id) && VulkanFusionPrompt.applies(VulkanFusionPrompt.id,prompt,params.negativePrompt)
+    val gradient = enabled(VulkanWeightGradient.id)
+    val positive = VulkanFusionPrompt.schedule(prompt,steps,fusion,gradient,Some(params.steps))
+    val negative = VulkanFusionPrompt.schedule(params.negativePrompt,steps,fusion,gradient,Some(params.steps))
     val prompts = mutable.LinkedHashSet("")
     (positive ++ negative).foreach(_.visit(text => prompts += text))
     if prompts.size > 513 then invalid("the two prompts exceed 512 conditioning leaves")
