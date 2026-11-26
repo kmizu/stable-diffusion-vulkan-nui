@@ -22,3 +22,14 @@ class VulkanClipEvalSuite extends FunSuite:
     val error = intercept[EngineError](VulkanClipEval.compile("torch.save(i)"))
     assertEquals(error.code, "invalid_params")
   }
+
+  test("img2img Hires inherits Clip I/O only on unchanged prompt sides") {
+    val original = ujson.Obj("input_enabled" -> true, "output_enabled" -> true,
+      "positive_mode" -> "directive", "negative_mode" -> "simple")
+    val refinement = VulkanClipIo.refinementConfig(original, samePositive = false, sameNegative = true).get
+    assertEquals(refinement("positive_mode").str, "off")
+    assertEquals(refinement("negative_mode").str, "simple")
+    assert(!refinement("output_enabled").bool)
+    assert(original("output_enabled").bool)
+    assertEquals(VulkanClipIo.refinementConfig(original, samePositive = false, sameNegative = false), None)
+  }

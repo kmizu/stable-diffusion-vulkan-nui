@@ -504,19 +504,7 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
       job.frames.foreach(_.begin(index,seed))
       val inputs = p.img2img.filter(_ => graph.isEmpty).map(VulkanImageInputs.prepare(_, p.width, p.height, seed, difference, () => job.cancelled))
       def maskConditioning(strength: Double): Double =
-        val mode = p.hooks.get("conditioning_highres_fix")
-          .filterNot(_.obj.get("enabled").contains(ujson.Bool(false)))
-          .flatMap(_.obj.get("mode"))
-          .fold("disabled")(_.str)
-        mode match
-          case "disabled" | "empty" => 1.0
-          case "lowest" => 1 - strength / 4
-          case "low" => 1 - strength / 2
-          case "medium" => .5
-          case "high" => strength / 2
-          case "highest" => strength / 4
-          case "full" => 0.0
-          case other => invalid(s"Unknown mask conditioning mode $other")
+        VulkanImageInputs.maskConditioning(p.hooks.get("conditioning_highres_fix"), strength)
       val imageOptions = new VulkanInference.ImageOptions(inputs.map(_.init).orNull,
         inputs.flatMap(_.mask).orNull, p.img2img.fold(0.75)(_.denoisingStrength), hires.filterNot(_ => separateHires).orNull, maskConditioning(p.img2img.fold(0.75)(_.denoisingStrength)))
       def progress(pass: Option[String]): VulkanInference.Progress = (stage, step, total) =>
@@ -534,7 +522,7 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
       }
       val rendered = graph match
         case Some(hook) => VulkanGraph.render(backend, device.id(), model, loadRequest.get, req, hook,
-          activePrompt, planned.fold(p.loras)(_.loras), seed, gen.scheduler, () => job.cancelled, pass)
+          activePrompt, planned.fold(p.loras)(_.loras), seed, gen.scheduler, () => job.cancelled, pass, difference)
         case None =>
           val generated = backend.generate(activePrompt, p.negativePrompt, p.width, p.height, p.steps, p.cfgScale, seed,
             samplers(p.samplerName), schedulers(gen.scheduler), p.clipSkip, imageOptions, activeConditioning, progress(None))
@@ -563,33 +551,47 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
             backend.generate(pass.prompt,pass.negativePrompt,w,ht,scheduleSteps,pass.cfgScale,seed,method,
               schedulers.getOrElse(schedule,unsupported(s"hires scheduler $schedule")),p.clipSkip,
               new VulkanInference.ImageOptions(source,mask,strength,null,maskConditioning(strength)),condition,progress(Some("hires")))
-          val first = inputs.fold(highres)(_.finish(highres))
-          val image = refinement.fold(first) { h =>
-            job.check()
-            val (w, ht) = Img2ImgHiresMetadata.targetSize(h, first.getWidth, first.getHeight)
-            val resized = VulkanTools.upscaleImage(h("upscaler").str, req.upscalerPaths, first, w, ht, modelUpscale)
-            val strength = h("denoise").num
-            if strength == 0 then resized
-            else
-              job.check()
-              def inherit(key: String, fallback: String) = Option(h(key).str).filter(_.nonEmpty).getOrElse(fallback)
-              val sampler = if h("sampler").str == "Use same sampler" then p.samplerName else h("sampler").str
-              val schedule = if h("scheduler").str == "Use same scheduler" then p.scheduler else h("scheduler").str
-              val method = samplers.getOrElse(sampler, unsupported(s"refinement sampler $sampler"))
-              val actualSchedule = if schedule == "Automatic" then defaultSchedule(sampler) else schedule
-              val steps = h("steps").num.toInt
-              val cfg = h("cfg").num
-              val refinementParams = p.copy(width = w, height = ht, steps = if steps == 0 then p.steps else steps, cfgScale = if cfg == 0 then p.cfgScale else cfg, hires = p.hires.copy(enabled = false),
-                loras = req.img2imgHiresLoras.getOrElse(planned.fold(p.loras)(_.loras)))
-              val conditioning2 = prepareConditioning(req.copy(params = refinementParams.copy(prompt = inherit("prompt",activePrompt))), job, resources)
-              backend.generate(inherit("prompt", activePrompt), inherit("negative_prompt", p.negativePrompt), w, ht,
-                if steps == 0 then p.steps else steps, if cfg == 0 then p.cfgScale else cfg, seed, method,
-                schedulers.getOrElse(actualSchedule, unsupported(s"refinement scheduler $actualSchedule")), p.clipSkip,
-                new VulkanInference.ImageOptions(resized, null, strength, null), conditioning2, progress(Some("img2img_hires")))
-          }
-          Seq(image)
-      rendered.map { initial =>
+          Seq(inputs.fold(highres)(_.finish(highres)))
+      rendered.map { first =>
         job.check()
+        val initial = refinement.fold(first) { h =>
+          val (w, ht) = Img2ImgHiresMetadata.targetSize(h, first.getWidth, first.getHeight)
+          val resized = VulkanTools.upscaleImage(h("upscaler").str, req.upscalerPaths, first, w, ht, modelUpscale)
+          val strength = h("denoise").num
+          if strength == 0 then resized
+          else
+            job.check()
+            def inherit(key: String, fallback: String) = Option(h(key).str).filter(_.nonEmpty).getOrElse(fallback)
+            val prompt = inherit("prompt", activePrompt)
+            val negative = inherit("negative_prompt", p.negativePrompt)
+            val sampler = if h("sampler").str == "Use same sampler" then p.samplerName else h("sampler").str
+            val schedule = if h("scheduler").str == "Use same scheduler" then p.scheduler else h("scheduler").str
+            val method = samplers.getOrElse(sampler, unsupported(s"refinement sampler $sampler"))
+            val actualSchedule = if schedule == "Automatic" then defaultSchedule(sampler) else schedule
+            val nativeSchedule = schedulers.getOrElse(actualSchedule, unsupported(s"refinement scheduler $actualSchedule"))
+            val steps = h("steps").num.toInt
+            val cfg = h("cfg").num
+            val refinementParams = p.copy(width = w, height = ht,
+              steps = if steps == 0 then p.steps else steps, cfgScale = if cfg == 0 then p.cfgScale else cfg,
+              hires = p.hires.copy(enabled = false), loras = req.img2imgHiresLoras.getOrElse(planned.fold(p.loras)(_.loras)))
+            val clip = graph.filter(_ == VulkanClipIo.id).flatMap { _ =>
+              VulkanClipIo.refinementConfig(p.hooks(VulkanClipIo.id), prompt == activePrompt, negative == p.negativePrompt)
+            }
+            clip match
+              case Some(config) =>
+                val params = refinementParams.copy(prompt = prompt, negativePrompt = negative,
+                  samplerName = sampler, scheduler = actualSchedule,
+                  img2img = p.img2img.map(_.copy(mask = None, denoisingStrength = strength)),
+                  hooks = Map(VulkanClipIo.id -> config))
+                VulkanGraph.render(backend, device.id(), model, loadRequest.get, req.copy(params = params),
+                  VulkanClipIo.id, prompt, params.loras, seed, actualSchedule, () => job.cancelled,
+                  refinementImage = Some(resized)).head
+              case None =>
+                val conditioning2 = prepareConditioning(req.copy(params = refinementParams.copy(prompt = prompt)), job, resources)
+                backend.generate(prompt, negative, w, ht, refinementParams.steps, refinementParams.cfgScale,
+                  seed, method, nativeSchedule, p.clipSkip,
+                  new VulkanInference.ImageOptions(resized, null, strength, null), conditioning2, progress(Some("img2img_hires")))
+        }
         val scaled = p.hooks.get("sonar").filterNot(_.obj.get("enabled").contains(ujson.Bool(false))).fold(initial){ h =>
           new VulkanSonar(h,p,seed).upscale(initial,req.upscalerPaths,modelUpscale)
         }

@@ -109,6 +109,19 @@ private[vulkan] object VulkanImageInputs:
           if box.contains(x,y) then mix(color,patch.getRGB(x-box.x,y-box.y),weights.getRGB(x,y)&255) else color
         }
 
+  def maskConditioning(config: Option[ujson.Value], strength: Double): Double =
+    val mode = config.filterNot(_.obj.get("enabled").contains(ujson.Bool(false)))
+      .flatMap(_.obj.get("mode")).fold("disabled")(_.str)
+    mode match
+      case "disabled" | "empty" => 1.0
+      case "lowest" => 1 - strength / 4
+      case "low" => 1 - strength / 2
+      case "medium" => .5
+      case "high" => strength / 2
+      case "highest" => strength / 4
+      case "full" => 0.0
+      case other => invalid(s"Unknown mask conditioning mode $other")
+
   def prepare(ip: Img2ImgParams, w: Int,h: Int,seed: Long,
       difference: Option[(BufferedImage, BufferedImage)] = None, cancelled: () => Boolean = () => false): Inputs =
     if ip.maskBlur < 0 || ip.maskBlur > 64 || ip.inpaintFullResPadding < 0 || ip.inpaintFullResPadding > 65536 then

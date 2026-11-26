@@ -12,6 +12,19 @@ import ujson.Value
 
 private[vulkan] object VulkanClipIo:
   val id = "clip_io"
+  def refinementConfig(config: Value, samePositive: Boolean, sameNegative: Boolean): Option[Value] =
+    if !config.obj.get("input_enabled").exists(_.bool) then return None
+    def retains(same: Boolean, key: String, default: String): Boolean =
+      same && config.obj.get(key).fold(default)(_.str).trim.toLowerCase(Locale.ROOT) != "off"
+    val positive = retains(samePositive, "positive_mode", "simple")
+    val negative = retains(sameNegative, "negative_mode", "off")
+    Option.when(positive || negative) {
+      val adjusted = ujson.Obj.from(config.obj)
+      adjusted("output_enabled") = false
+      if !positive then adjusted("positive_mode") = "off"
+      if !negative then adjusted("negative_mode") = "off"
+      adjusted
+    }
   private val Limit = 256L * 1024 * 1024
   private val MaxTokens = 64 * 77
   private lazy val tokenVocabulary = ClipFastTokenizer.loadBundled()
