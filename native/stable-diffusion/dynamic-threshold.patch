@@ -1,0 +1,61 @@
+diff --git a/src/dgl/bindings/components.h b/src/dgl/bindings/components.h
+--- a/src/dgl/bindings/components.h
++++ b/src/dgl/bindings/components.h
+@@ -15,6 +15,7 @@
+     Value latent_shape(Values& args, RunState&);
+     Value t_to_sigma(Values& args, RunState&);
+     Value denoiser_scalings(Values& args, RunState&);
++    Value dynthresh_scale(Values& args, RunState&);
+     Value make_sigmas(Values& args, RunState&);
+     Value sample_tensor(Values& args, RunState& state);
+     Value execute_load_pulid_embedding(Values& args, RunState&);
+diff --git a/src/dgl/bindings/components.cpp b/src/dgl/bindings/components.cpp
+--- a/src/dgl/bindings/components.cpp
++++ b/src/dgl/bindings/components.cpp
+@@ -226,6 +226,31 @@
+         return Value::literal(sigma);
+     }
+ 
++    Value dynthresh_scale(Values& args, RunState&) {
++        const auto predict = object<ops::Predictor>(args, "predict");
++        const auto& denoiser = ops::scaling_parameterization(*predict);
++        const auto timestep = denoiser.timestep(float(get_number(args, "sigma")));
++        const double fraction = 1.0 - std::clamp(double(timestep), 0.0, 999.0) / 999.0;
++        const double schedule = get_number(args, "schedule");
++        const double cycle = std::fmod(fraction * schedule, 1.0);
++        const auto mode = get_string(args, "mode");
++        double weight;
++        if (mode == "Linear Down") weight = 1.0 - fraction;
++        else if (mode == "Half Cosine Down") weight = std::cos(fraction);
++        else if (mode == "Cosine Down") weight = std::cos(fraction * 1.5707);
++        else if (mode == "Linear Up") weight = fraction;
++        else if (mode == "Half Cosine Up") weight = 1.0 - std::cos(fraction);
++        else if (mode == "Cosine Up") weight = 1.0 - std::cos(fraction * 1.5707);
++        else if (mode == "Power Up") weight = std::pow(fraction, schedule);
++        else if (mode == "Power Down") weight = 1.0 - std::pow(fraction, schedule);
++        else if (mode == "Linear Repeating") weight = 2.0 * std::abs(cycle - 0.5);
++        else if (mode == "Cosine Repeating") weight = 0.5 + 0.5 * std::cos(fraction * 6.28318 * schedule);
++        else if (mode == "Sawtooth") weight = cycle;
++        else throw std::runtime_error("unknown Dynamic Thresholding schedule");
++        const auto minimum = get_number(args, "minimum");
++        return Value::literal(minimum + weight * (get_number(args, "target") - minimum));
++    }
++
+     Value denoiser_scalings(Values& args, RunState&) {
+         const auto predict = object<ops::Predictor>(args, "predict");
+         const auto scales  = ops::scaling_parameterization(*predict).scalings(float(get_number(args, "sigma")));
+diff --git a/src/dgl/bindings/registration.cpp b/src/dgl/bindings/registration.cpp
+--- a/src/dgl/bindings/registration.cpp
++++ b/src/dgl/bindings/registration.cpp
+@@ -527,6 +527,11 @@
+         OutputSignature scaling_output{Kind::Dict};
+         for (const auto& [name, type] : scaling_fields)
+             scaling_output.fields.emplace(name, type);
++        registry["dynthresh_scale"] = make_operation(
++            {required("predict", Kind::Predictor), number("sigma", 0, sigma_limit),
++             required("target", Kind::Number), required("minimum", Kind::Number),
++             required("mode", Kind::String), required("schedule", Kind::Number)},
++            {Kind::Number}, dynthresh_scale);
+         registry["denoiser_scalings"] = make_operation(
+             {required("predict", Kind::Predictor), number("sigma", 0, sigma_limit)},
+             std::move(scaling_output), denoiser_scalings);

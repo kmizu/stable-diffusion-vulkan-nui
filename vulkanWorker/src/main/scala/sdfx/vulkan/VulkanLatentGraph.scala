@@ -5,7 +5,7 @@ import ujson.Value
 
 /** A one-step Euler integrator can be split at each supplied sigma without losing solver history. */
 private[vulkan] object VulkanLatentGraph:
-  val hooks = Set("latent_mirroring", "resharpen", "anti_burn", "color_grading", "vectorscope_cc", "detail_daemon", "cads", "cfg_cache", "mahiro", "rescale_cfg")
+  val hooks = Set("latent_mirroring", "resharpen", "anti_burn", "color_grading", "vectorscope_cc", "detail_daemon", "cads", "cfg_cache", "mahiro", "rescale_cfg", "dynamic_thresholding")
 
   def sample(p: GenerationParams, method: String, eta: String, sdxl: Boolean, seed: Long): Seq[String] =
     if !Set("euler","euler_a")(method) then VulkanProtocol.unsupported("per-step latent hooks require Euler or Euler a")
@@ -22,6 +22,9 @@ private[vulkan] object VulkanLatentGraph:
     if cads.nonEmpty && detail.nonEmpty then VulkanProtocol.unsupported("CADS with Detail Daemon")
     val guidance = new VulkanGuidance(p,total)
     if guidance.enabled && method != "euler" then VulkanProtocol.unsupported("CFG rescale and CFG cache require Euler")
+    val threshold = config("dynamic_thresholding").filter(_ => p.cfgScale > 1).map(new VulkanDynamicThreshold(_, p))
+    if threshold.nonEmpty && (method != "euler" || guidance.enabled) then
+      VulkanProtocol.unsupported("Dynamic Thresholding requires Euler without other CFG modifiers")
     val burn = config("anti_burn")
     val skip = burn.fold(0)(h => num(h,"skip_last",2,0,50).toInt)
     val count = burn.fold(1)(h => num(h,"average",3,1,50).toInt)
@@ -53,8 +56,10 @@ private[vulkan] object VulkanLatentGraph:
       val guided = if pos == "pos" && neg == "neg" then "guided" else
         lines += s"guided$n = cfg($pos, $neg, scale = ${p.cfgScale})"
         s"guided$n"
-      if guidance.enabled then guidance.step(lines,n,last,value,pos,neg)
-      else lines += s"$value = sample($last, sigmas[${n-1}:${n+1}], predict = $guided, method = \"$method\", rng = rng$eta)"
+      threshold match
+        case Some(dynamic) => dynamic.step(lines, n, last, value, pos, neg)
+        case None if guidance.enabled => guidance.step(lines,n,last,value,pos,neg)
+        case None => lines += s"$value = sample($last, sigmas[${n-1}:${n+1}], predict = $guided, method = \"$method\", rng = rng$eta)"
       vectorscope.foreach(v => value = v.append(value,n,lines))
       for (mode,style,strength,maxStep) <- mirroring if n <= total*maxStep && (mode == "Blend Average" || n%2 == 1) do
         def flip(axis: Int,input: String) = s"tensor::index_select($input, axis = $axis, indices = ${indices(if axis==0 then width else height)})"

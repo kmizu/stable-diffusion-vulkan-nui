@@ -23,11 +23,15 @@ private[vulkan] object VulkanGraph:
     val hiresPass = hook == latentHires
     val h = if hiresPass then ujson.Obj() else p.hooks(hook)
     val latentHook = VulkanLatentGraph.hooks(hook)
+    if p.hooks.get("dynamic_thresholding").exists(!_.obj.get("enabled").contains(ujson.Bool(false))) &&
+        !engine.supportsDynamicThreshold() then unsupported("This Vulkan runtime lacks Dynamic Thresholding")
     val up = Option.when(hook == "latent_upscale")(VulkanLatentUpscale.parse(p,h,schedule))
     val soft = Option.when(hook == "soft_inpainting")(new VulkanSoftInpaint(h))
     val postDiff = Option.when(hook == "postdiff")(new VulkanPostDiff(h,p,model.kind == "sdxl"))
     val unetHooks = Option.when(VulkanUnetHooks.hooks(hook)) {
       if !engine.supportsUnetHooks() then unsupported("This Vulkan runtime lacks U-Net attention and skip hooks")
+      if !engine.supportsUnetResize() && p.hooks.exists((k,v) => VulkanUnetHooks.resizeHooks(k) && !v.obj.get("enabled").contains(ujson.Bool(false))) then
+        unsupported("This Vulkan runtime lacks U-Net resizing hooks")
       VulkanUnetHooks.parse(p,model.kind=="sdxl",seed)
     }
     val unetArgs = unetHooks.fold("")(_.args)

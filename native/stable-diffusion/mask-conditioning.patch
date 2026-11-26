@@ -31,7 +31,7 @@ index 536e820..234ab1a 100644
      masked_latent = tensor::mul(base, tensor::affine(mask_latent, scale = -1, offset = 1))
  {% elif flags.has_init %}
 -    masked_pixels = tensor::lerp(image::to_f32(source, channels = {{channels}}), 0.5, mask_pixels)
-+    masked_pixels = tensor::lerp(image::to_f32(source, channels = {{channels}}), 0.5, tensor::mul(mask_pixels, {{mask_conditioning_weight}}))
++    masked_pixels = tensor::lerp(image::to_f32(source, channels = {{channels}}), 0.5, tensor::mul(mask_pixels, mask_conditioning_weight))
      masked_latent = {{from_vae}}(vae, vae_encode(vae, masked_pixels, rng = encode_rng{{vae_run_options}}))
  {% else %}
      masked_latent = tensor::zeros_like(base)

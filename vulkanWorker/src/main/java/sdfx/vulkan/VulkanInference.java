@@ -170,6 +170,7 @@ public final class VulkanInference implements AutoCloseable {
             bind("sd_dgl_result_free", null, ADDRESS);
             bind("sd_dgl_result_tensor", ADDRESS, ADDRESS, ADDRESS);
             bind("sd_dgl_error", ADDRESS);
+            bind("sd_dgl_builtin_catalog", ADDRESS);
             bind("sd_result_get_image", ADDRESS, ADDRESS, JAVA_LONG);
             bind("sd_tensor_dim", JAVA_LONG, ADDRESS, JAVA_LONG);
             bind("sd_tensor_byte_size", JAVA_LONG, ADDRESS);
@@ -643,6 +644,14 @@ public final class VulkanInference implements AutoCloseable {
             visionCtx = NULL;
             return true;
         }
+    }
+
+    public boolean supportsUnetResize() {
+        return symbols.find("sd_nui_unet_resize_supported").isPresent();
+    }
+
+    public boolean supportsDynamicThreshold() {
+        return cString(ptr("sd_dgl_builtin_catalog")).contains("| `dynthresh_scale` |");
     }
 
     public boolean supportsUnetHooks() {

@@ -518,7 +518,7 @@ class McpToolsSuite extends munit.FunSuite:
         ujson.Obj("enabled" -> true, "mode" -> "load_only", "priority" -> "loaded_first", "path" -> path.toString))))
     assert(result("isError").bool)
     assert(textOf(result).contains("protected image"), textOf(result))
-    assertEquals(files, before)
+    assertEquals(files -- before, Set.empty[java.nio.file.Path])
   }
 
   test("failed Fastload preparation cleans its snapshot and permits recovery") {

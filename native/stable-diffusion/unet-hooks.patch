@@ -37,7 +37,7 @@ diff --git a/src/model/common/block.hpp b/src/model/common/block.hpp
 +            return std::dynamic_pointer_cast<Linear>(blocks["to_out.0"])->forward(ctx,value);
 +        }
 +        const auto [tw,th] = sd::nui::tile_shape();
-+        if (!tw || x->ne[1] != pass.spatial_w * pass.spatial_h) return forward(ctx,x,x);
++        if (!tw || x->ne[1] != pass.spatial_w * pass.spatial_h) return forward(ctx,x,sd::nui::subsample_tokens(ctx->ggml_ctx,x));
 +        x = sd::nui::split_tiles(ctx->ggml_ctx,x,tw,th,false);
 +        x = forward(ctx,x,x);
 +        return sd::nui::split_tiles(ctx->ggml_ctx,x,tw,th,true);
@@ -58,12 +58,13 @@ diff --git a/src/model/common/block.hpp b/src/model/common/block.hpp
 diff --git a/src/model/diffusion/unet.hpp b/src/model/diffusion/unet.hpp
 --- a/src/model/diffusion/unet.hpp
 +++ b/src/model/diffusion/unet.hpp
-@@ -514,7 +514,11 @@
+@@ -514,7 +514,12 @@
                                           GGMLRunnerContext* ctx,
                                           ggml_tensor* x,
                                           ggml_tensor* context,
 -                                         int timesteps) {
-+                                         int timesteps, int region) {
++                                         int timesteps, int region, int depth_factor) {
++        sd::nui::active.depth_factor = depth_factor;
 +        sd::nui::active.layer_index = uint32_t(std::hash<std::string>{}(name));
 +        sd::nui::active.region = region;
 +        sd::nui::active.spatial_w = int(x->ne[0]);
@@ -71,7 +72,7 @@ diff --git a/src/model/diffusion/unet.hpp b/src/model/diffusion/unet.hpp
          if (config.version == VERSION_SVD) {
              auto block = std::dynamic_pointer_cast<SpatialVideoTransformer>(blocks[name]);
  
-@@ -542,6 +546,7 @@
+@@ -542,6 +547,7 @@
          // c_concat: [N, in_channels, h, w] or [1, in_channels, h, w]
          // y: [N, adm_in_channels] or [1, adm_in_channels]
          // return: [N, out_channels, h, w]
@@ -79,21 +80,47 @@ diff --git a/src/model/diffusion/unet.hpp b/src/model/diffusion/unet.hpp
          const SDVersion version           = config.version;
          const int model_channels          = config.model_channels;
          const int num_res_blocks          = config.num_res_blocks;
-@@ -653,7 +658,7 @@
+@@ -653,13 +659,18 @@
                  h                = resblock_forward(name, ctx, h, emb, num_video_frames);  // [N, mult*model_channels, h, w]
                  if (std::find(attention_resolutions.begin(), attention_resolutions.end(), ds) != attention_resolutions.end()) {
                      std::string name = "input_blocks." + std::to_string(input_block_idx) + ".1";
 -                    h                = attention_layer_forward(name, ctx, h, context, num_video_frames);  // [N, mult*model_channels, h, w]
-+                    h                = attention_layer_forward(name, ctx, h, context, num_video_frames, 1 << i);  // [N, mult*model_channels, h, w]
++                    h                = attention_layer_forward(name, ctx, h, context, num_video_frames, 1 << i, ds);  // [N, mult*model_channels, h, w]
                  }
                  h = apply_motion_input(input_block_idx, h);
                  if (block_processor && num_video_frames > 1)
-@@ -682,7 +687,12 @@
+                     h = block_processor->apply(*ctx, UNetBlockStage::Down, int(i), j, h, num_video_frames);
+                 sd::ggml_graph_cut::mark_graph_cut(h, "unet.input_blocks." + std::to_string(input_block_idx), "h");
+-                hs.push_back(h);
++                {
++                    const bool after = sd::nui::active.options && sd::nui::active.options->shrink_after_skip && !(i == int(len_mults)-1 && j == num_res_blocks-1);
++                    if (!after) h = sd::nui::deep_shrink(ctx->ggml_ctx,h,input_block_idx);
++                    hs.push_back(h);
++                    if (after) h = sd::nui::deep_shrink(ctx->ggml_ctx,h,input_block_idx);
++                }
+             }
+             if (tiny_unet) {
+                 input_block_idx++;
+@@ -673,7 +684,12 @@
+ 
+                 h = block->forward(ctx, h);  // [N, mult*model_channels, h/(2^(i+1)), w/(2^(i+1))]
+                 // sd::ggml_graph_cut::mark_graph_cut(h, "unet.input_blocks." + std::to_string(input_block_idx), "h");
+-                hs.push_back(h);
++                {
++                    const bool after = sd::nui::active.options && sd::nui::active.options->shrink_after_skip;
++                    if (!after) h = sd::nui::deep_shrink(ctx->ggml_ctx,h,input_block_idx);
++                    hs.push_back(h);
++                    if (after) h = sd::nui::deep_shrink(ctx->ggml_ctx,h,input_block_idx);
++                }
+             }
+         }
+         // [N, 4*model_channels, h/8, w/8]
+@@ -682,7 +698,12 @@
          if (!tiny_unet) {
              h = resblock_forward("middle_block.0", ctx, h, emb, num_video_frames);  // [N, 4*model_channels, h/8, w/8]
              if (version != VERSION_SDXL_SSD1B && version != VERSION_SDXL_VEGA) {
 -                h = attention_layer_forward("middle_block.1", ctx, h, context, num_video_frames);  // [N, 4*model_channels, h/8, w/8]
-+                h = attention_layer_forward("middle_block.1", ctx, h, context, num_video_frames, 256);  // [N, 4*model_channels, h/8, w/8]
++                h = attention_layer_forward("middle_block.1", ctx, h, context, num_video_frames, 256, ds);  // [N, 4*model_channels, h/8, w/8]
 +                if (auto mask = sd::nui::active.attention_mask) {
 +                    const auto& pass = sd::nui::active;
 +                    auto expanded = ggml_interpolate(ctx->ggml_ctx,mask,pass.width,pass.height,1,mask->ne[3],GGML_SCALE_MODE_NEAREST);
@@ -102,7 +129,29 @@ diff --git a/src/model/diffusion/unet.hpp b/src/model/diffusion/unet.hpp
                  h = resblock_forward("middle_block.2", ctx, h, emb, num_video_frames);             // [N, 4*model_channels, h/8, w/8]
              }
              h = apply_motion_mid(h);
-@@ -711,6 +721,7 @@
+@@ -700,9 +721,21 @@
+         // output_blocks
+         int output_block_idx = 0;
+         for (int i = (int)len_mults - 1; i >= 0; i--) {
++            int up_w = 0, up_h = 0;
++            if (sd::nui::shrink_enabled()) {
++                for (int k = 0; k <= num_res_blocks; ++k) {
++                    auto skip = hs.at(hs.size()-1-k);
++                    if (skip->ne[0]*skip->ne[1] > int64_t(up_w)*up_h) {
++                        up_w = int(skip->ne[0]);
++                        up_h = int(skip->ne[1]);
++                    }
++                }
++                h = sd::nui::resize_features(ctx->ggml_ctx,h,up_w,up_h,sd::nui::active.options->shrink_up_mode);
++            }
+             for (int j = 0; j < num_res_blocks + 1; j++) {
+                 auto h_skip = hs.back();
+                 hs.pop_back();
++                if (up_w) h_skip = sd::nui::resize_features(ctx->ggml_ctx,h_skip,up_w,up_h,sd::nui::active.options->shrink_up_mode);
+ 
+                 if (controls.size() > 0) {
+                     // not in place, see the middle control
+@@ -711,6 +744,7 @@
                      control_offset--;
                  }
  
@@ -110,12 +159,12 @@ diff --git a/src/model/diffusion/unet.hpp b/src/model/diffusion/unet.hpp
                  h = ggml_concat(ctx->ggml_ctx, h, h_skip, 2);
  
                  std::string name = "output_blocks." + std::to_string(output_block_idx) + ".0";
-@@ -721,7 +732,7 @@
+@@ -721,7 +755,7 @@
                  if (std::find(attention_resolutions.begin(), attention_resolutions.end(), ds) != attention_resolutions.end()) {
                      std::string name = "output_blocks." + std::to_string(output_block_idx) + ".1";
  
 -                    h = attention_layer_forward(name, ctx, h, context, num_video_frames);
-+                    h = attention_layer_forward(name, ctx, h, context, num_video_frames, 1 << (4 + int(len_mults) - 1 - i));
++                    h = attention_layer_forward(name, ctx, h, context, num_video_frames, 1 << (4 + int(len_mults) - 1 - i), ds);
  
                      up_sample_idx++;
                  }
@@ -138,21 +187,39 @@ diff --git a/src/dgl/models/diffusion_prediction.h b/src/dgl/models/diffusion_pr
          sd::Tensor<float> vace_context, audio_embedding, video_positions;
          std::vector<int> skip_layers;
          float guidance                      = 3.5f;
+@@ -51,6 +53,7 @@
+         const sd::Tensor<float>& base;
+         const sd::Tensor<float>& mask;
+         int index            = 1;
++        int unet_evaluation  = 0;
+         size_t schedule_size = 0;
+         // Native caches use the signed solver marker to identify intermediate evaluations.
+         int solver_index                            = 1;
 diff --git a/src/dgl/models/dit.cpp b/src/dgl/models/dit.cpp
 --- a/src/dgl/models/dit.cpp
 +++ b/src/dgl/models/dit.cpp
-@@ -301,6 +301,7 @@
+@@ -301,6 +301,9 @@
                                                 const DiffusionPredictionOptions& options,
                                                 const DiffusionPredictionStep& step) {
          const auto& shape       = x.shape();
 +        sd::nui::UNetPassScope unet_hooks(options.unet_hooks, int(shape[0]), int(shape[1]), uint32_t(step.index));
++        sd::nui::active.timestep = parameterization.timestep(sigma);
++        sd::nui::active.evaluation = step.unet_evaluation;
          const auto channel_axis = shape.size() == 5 ? 3 : 2;
          const auto down_factor  = get_diffusion_model_down_factor();
          const bool packed       = sd_version_is_ltxav(version()) || sd_version_is_minimax_h3(version());
 diff --git a/src/dgl/ops/predictor.cpp b/src/dgl/ops/predictor.cpp
 --- a/src/dgl/ops/predictor.cpp
 +++ b/src/dgl/ops/predictor.cpp
-@@ -203,7 +203,7 @@
+@@ -154,6 +154,7 @@
+     }
+ 
+     struct PredictionExecution::Resources {
++        int unet_evaluations = 0;
+         struct PreparedModel {
+             models::Model::ExecutionScope scope;
+ 
+@@ -203,7 +204,7 @@
              }
          }
  
@@ -161,7 +228,7 @@ diff --git a/src/dgl/ops/predictor.cpp b/src/dgl/ops/predictor.cpp
          models::DiffusionPrediction predict_batch(const ModelPredictor& leaf, const SDCondition& condition, const Tensor<float>& x, float sigma, const models::DiffusionPredictionStep& step);
      };
  
-@@ -400,7 +400,7 @@
+@@ -400,7 +401,7 @@
          return check(check, predictor);
      }
  
@@ -170,7 +237,7 @@ diff --git a/src/dgl/ops/predictor.cpp b/src/dgl/ops/predictor.cpp
          auto& engine = leaf.dit();
          prepare_predictor(leaf);
          models::CircularAxesScope circular_axes(engine, leaf.circular_x, leaf.circular_y);
-@@ -456,8 +456,11 @@
+@@ -456,8 +457,11 @@
          const auto prefix   = qwen_prefix_ids.find(&leaf);
          step.qwen_prefix_id = prefix == qwen_prefix_ids.end() ? 0 : prefix->second;
          sd::ParallelScope tensor_scope(engine.tensor_executor.get());
@@ -183,7 +250,7 @@ diff --git a/src/dgl/ops/predictor.cpp b/src/dgl/ops/predictor.cpp
          if (prediction.output.empty())
              throw std::runtime_error("diffusion prediction failed");
          return prediction;
-@@ -509,6 +512,7 @@
+@@ -509,6 +513,7 @@
                  pos->model->motion || neg->model->motion || pos->controls || neg->controls ||
                  pos->ip_adapters || neg->ip_adapters || pos->pulid || neg->pulid ||
                  pos->options.transform || neg->options.transform ||
@@ -191,7 +258,7 @@ diff --git a/src/dgl/ops/predictor.cpp b/src/dgl/ops/predictor.cpp
                  !pos->references.empty() || !neg->references.empty() ||
                  !pos->condition.c_ref_images.empty() || !neg->condition.c_ref_images.empty())
                  return;
-@@ -571,8 +575,45 @@
+@@ -571,8 +576,45 @@
              return prediction.output;
          }
  
@@ -238,7 +305,7 @@ diff --git a/src/dgl/ops/predictor.cpp b/src/dgl/ops/predictor.cpp
              if (scale != 1.f || branches.negative.get() == unconditional_)
                  batch_cfg(branches);
              const auto& pos = denoised(*branches.positive);
-@@ -580,6 +621,13 @@
+@@ -580,6 +622,13 @@
                  const auto& neg = denoised(*branches.negative);
                  const auto& img = denoised(*branches.image_only);
                  return {{}, neg + (img - neg) * branches.image_scale + (pos - img) * scale};
@@ -252,6 +319,18 @@ diff --git a/src/dgl/ops/predictor.cpp b/src/dgl/ops/predictor.cpp
              }
              if (scale == 1.f)
                  return {{}, pos};
+@@ -660,8 +709,10 @@
+         }
+     };
+ 
+-    sd::guidance::GuiderOutput PredictionExecution::evaluate(const Tensor<float>& x, float sigma, const models::DiffusionPredictionStep& step) {
++    sd::guidance::GuiderOutput PredictionExecution::evaluate(const Tensor<float>& x, float sigma, const models::DiffusionPredictionStep& incoming) {
+         auto& resources = *resources_;
++        auto step = incoming;
++        step.unet_evaluation = ++resources.unet_evaluations;
+         EvaluationState state;
+         if (!resources.options.cache || resources.options.cache->mode == SD_CACHE_DISABLED)
+             return Evaluation(*this, x, sigma, step, state).run(resources.options.need_unconditional);
 diff --git a/src/dgl/ops/predictor.h b/src/dgl/ops/predictor.h
 --- a/src/dgl/ops/predictor.h
 +++ b/src/dgl/ops/predictor.h
@@ -267,7 +346,7 @@ diff --git a/src/dgl/ops/predictor.h b/src/dgl/ops/predictor.h
 diff --git a/src/dgl/bindings/predictor.cpp b/src/dgl/bindings/predictor.cpp
 --- a/src/dgl/bindings/predictor.cpp
 +++ b/src/dgl/bindings/predictor.cpp
-@@ -30,6 +30,17 @@
+@@ -30,6 +30,28 @@
          predictor.circular_x = get_bool(args, "circular_x");
          predictor.circular_y = get_bool(args, "circular_y");
          auto& options        = predictor.options;
@@ -282,10 +361,21 @@ diff --git a/src/dgl/bindings/predictor.cpp b/src/dgl/bindings/predictor.cpp
 +        hooks.scale_depth = get_bool(args,"hypertile_scale_depth");
 +        hooks.tile_seed = uint32_t(get_int(args,"hypertile_seed"));
 +        hooks.pag_regions = int(get_int(args,"pag_regions"));
++        hooks.token_factor = float(get_number(args,"token_factor"));
++        hooks.token_factor2 = float(get_number(args,"token_factor2"));
++        hooks.token_first_depth = int(get_int(args,"token_depth"));
++        hooks.token_evaluations = int(get_int(args,"token_evaluations"));
++        hooks.shrink_block = int(get_int(args,"shrink_block"));
++        hooks.shrink_factor = float(get_number(args,"shrink_factor"));
++        hooks.shrink_t_lo = float(get_number(args,"shrink_t_lo"));
++        hooks.shrink_t_hi = float(get_number(args,"shrink_t_hi"));
++        hooks.shrink_down_mode = int(get_int(args,"shrink_down_mode"));
++        hooks.shrink_up_mode = int(get_int(args,"shrink_up_mode"));
++        hooks.shrink_after_skip = get_bool(args,"shrink_after_skip");
          for (const auto& [name, field] : {std::pair{"vace_context", &options.vace_context}, {"audio_embedding", &options.audio_embedding}, {"video_positions", &options.video_positions}}) {
              if (args.count(name)) {
                  *field = float_tensor(args, name);
-@@ -182,6 +193,8 @@
+@@ -182,6 +204,8 @@
          output.negative    = object<Predictor>(args, "negative");
          output.scale       = float(get_number(args, "scale"));
          output.image_scale = float(get_number(args, "image_scale"));
@@ -297,7 +387,7 @@ diff --git a/src/dgl/bindings/predictor.cpp b/src/dgl/bindings/predictor.cpp
 diff --git a/src/dgl/bindings/registration.cpp b/src/dgl/bindings/registration.cpp
 --- a/src/dgl/bindings/registration.cpp
 +++ b/src/dgl/bindings/registration.cpp
-@@ -588,11 +588,14 @@
+@@ -588,11 +588,17 @@
               integer("audio_length", 0, INT_MAX, 0),
               number("fps", 0.01, 100000, 24), number("video_sigma_shift", 0.001, 1000, 12), number("audio_sigma_shift", 0.001, 1000, 3),
               optional("circular_x", Kind::Boolean, false), optional("circular_y", Kind::Boolean, false),
@@ -305,6 +395,9 @@ diff --git a/src/dgl/bindings/registration.cpp b/src/dgl/bindings/registration.c
 +             number("freeu_b1",0,2,1), number("freeu_b2",0,2,1), number("freeu_s1",0,4,1), number("freeu_s2",0,4,1),
 +             integer("hypertile_size",0,65536,0), integer("hypertile_swap",1,256,1), integer("hypertile_depth",0,10,0),
 +             optional("hypertile_scale_depth", Kind::Boolean, false), integer("hypertile_seed",0,INT_MAX,0),
++             number("token_factor",1,5,1), number("token_factor2",1,5,1), integer("token_depth",1,2,1), integer("token_evaluations",0,10000,0),
++             integer("shrink_block",0,32,0), number("shrink_factor",0.1,9,1), number("shrink_t_lo",0,999,0), number("shrink_t_hi",0,999,999),
++             integer("shrink_down_mode",0,3,2), integer("shrink_up_mode",0,3,2), optional("shrink_after_skip",Kind::Boolean,true),
 +             integer("pag_regions",0,511,0), std::move(transform), optional("transform_args", Kind::Dict)},
              {Kind::Predictor}, make_predictor);
          const std::vector<Argument> guidance_branches{
@@ -317,17 +410,19 @@ diff --git a/src/dgl/bindings/registration.cpp b/src/dgl/bindings/registration.c
 diff --git a/src/version.cpp b/src/version.cpp
 --- a/src/version.cpp
 +++ b/src/version.cpp
-@@ -23,3 +23,5 @@
+@@ -23,3 +23,7 @@
  extern "C" SD_API bool sd_nui_svd_supported(void) {
      return true;
  }
 +
 +extern "C" SD_API bool sd_nui_unet_hooks_supported(void) { return true; }
++
++extern "C" SD_API bool sd_nui_unet_resize_supported(void) { return true; }
 diff --git a/src/model/common/nui_unet_hooks.cpp b/src/model/common/nui_unet_hooks.cpp
 new file mode 100644
 --- /dev/null
 +++ b/src/model/common/nui_unet_hooks.cpp
-@@ -0,0 +1,81 @@
+@@ -0,0 +1,140 @@
 +#include "model/common/nui_unet_hooks.hpp"
 +#include "ggml.h"
 +#include <algorithm>
@@ -372,6 +467,65 @@ new file mode 100644
 +                               restore ? batch : batch*nw*nh);
 +    }
 +
++    // PyTorch nearest-exact and adaptive-area interpolation, expressed as separable
++    // projections. Spatial axes are small in U-Net feature maps.
++    static ggml_tensor* project_axis(ggml_context* ctx, ggml_tensor* x, int output, bool area) {
++        const int64_t input = x->ne[0];
++        if (input == output) return x;
++        const float ratio = float(input)/output;
++        auto pos = ggml_arange(ctx,0,float(output),1);
++        auto lo = area ? ggml_floor(ctx,ggml_scale(ctx,pos,ratio)) :
++                         ggml_floor(ctx,ggml_scale_bias(ctx,pos,ratio,0.5f*ratio));
++        auto hi = area ? ggml_ceil(ctx,ggml_scale_bias(ctx,pos,ratio,ratio)) : ggml_scale_bias(ctx,lo,1.f,1.f);
++        lo = ggml_reshape_2d(ctx,lo,1,output);
++        hi = ggml_reshape_2d(ctx,hi,1,output);
++        auto loc = ggml_repeat_4d(ctx,ggml_arange(ctx,0,float(input),1),input,output,1,1);
++        auto above = ggml_step(ctx,ggml_scale_bias(ctx,ggml_sub(ctx,loc,lo),1.f,0.5f));
++        auto below = ggml_step(ctx,ggml_scale_bias(ctx,ggml_sub(ctx,loc,hi),-1.f,-0.5f));
++        auto weights = ggml_div(ctx,ggml_mul(ctx,above,below),ggml_sub(ctx,hi,lo));
++        auto flat = ggml_reshape_2d(ctx,x,input,x->ne[1]*x->ne[2]*x->ne[3]);
++        return ggml_reshape_4d(ctx,ggml_mul_mat(ctx,weights,flat),output,x->ne[1],x->ne[2],x->ne[3]);
++    }
++
++    ggml_tensor* resize_features(ggml_context* ctx, ggml_tensor* x, int w, int h, int mode) {
++        if (x->ne[0] == w && x->ne[1] == h) return x;
++        if (mode == GGML_SCALE_MODE_BILINEAR || mode == GGML_SCALE_MODE_BICUBIC)
++            return ggml_interpolate(ctx,x,w,h,x->ne[2],x->ne[3],mode);
++        x = project_axis(ctx,x,w,mode == 3);
++        x = ggml_cont(ctx,ggml_permute(ctx,x,1,0,2,3));
++        x = project_axis(ctx,x,h,mode == 3);
++        return ggml_cont(ctx,ggml_permute(ctx,x,1,0,2,3));
++    }
++
++    ggml_tensor* subsample_tokens(ggml_context* ctx, ggml_tensor* x) {
++        const auto* opt = active.options;
++        if (!opt || active.evaluation <= 0 || active.evaluation > opt->token_evaluations) return x;
++        const float factor = active.depth_factor == opt->token_first_depth ? opt->token_factor :
++                             active.depth_factor == 2*opt->token_first_depth ? opt->token_factor2 : 1.f;
++        if (factor <= 1.f) return x;
++        int w = active.spatial_w, h = active.spatial_h;
++        const int out_w = std::max(1,int(w/factor)), out_h = std::max(1,int(h/factor));
++        auto ix = ggml_floor(ctx,ggml_scale_bias(ctx,ggml_arange(ctx,0,float(out_w),1),float(w)/out_w,0.5f*w/out_w));
++        auto iy = ggml_floor(ctx,ggml_scale_bias(ctx,ggml_arange(ctx,0,float(out_h),1),float(h)/out_h,0.5f*h/out_h));
++        auto index = ggml_add(ctx,ggml_repeat_4d(ctx,ix,out_w,out_h,1,1),ggml_reshape_2d(ctx,ggml_scale(ctx,iy,float(w)),1,out_h));
++        index = ggml_reshape_2d(ctx,ggml_cast(ctx,index,GGML_TYPE_I32),out_w*out_h,1);
++        return ggml_get_rows(ctx,x,ggml_repeat_4d(ctx,index,out_w*out_h,x->ne[2],1,1));
++    }
++
++    bool shrink_enabled() {
++        const auto* opt = active.options;
++        return opt && opt->shrink_block && opt->shrink_factor != 1.f &&
++               active.timestep >= opt->shrink_t_lo && active.timestep <= opt->shrink_t_hi;
++    }
++
++    ggml_tensor* deep_shrink(ggml_context* ctx,ggml_tensor* x,int block) {
++        if (!shrink_enabled() || active.options->shrink_block != block) return x;
++        const auto& opt = *active.options;
++        const int w = std::max(1,int(std::nearbyint(x->ne[0]/double(opt.shrink_factor))));
++        const int h = std::max(1,int(std::nearbyint(x->ne[1]/double(opt.shrink_factor))));
++        return resize_features(ctx,x,w,h,opt.shrink_down_mode);
++    }
++
 +    // FreeU scales the center 2x2 fftshift window. Reconstruct just those four
 +    // real Fourier terms instead of transforming every frequency and discarding it.
 +    static ggml_tensor* fourier_filter(ggml_context* ctx, ggml_tensor* skip, float scale) {
@@ -413,7 +567,7 @@ diff --git a/src/model/common/nui_unet_hooks.hpp b/src/model/common/nui_unet_hoo
 new file mode 100644
 --- /dev/null
 +++ b/src/model/common/nui_unet_hooks.hpp
-@@ -0,0 +1,35 @@
+@@ -0,0 +1,46 @@
 +#pragma once
 +#include <cstdint>
 +#include <utility>
@@ -428,6 +582,11 @@ new file mode 100644
 +        bool scale_depth = false;
 +        int pag_regions = 0;
 +        bool sag_capture = false;
++        float token_factor = 1.f, token_factor2 = 1.f;
++        int token_first_depth = 1, token_evaluations = 0;
++        int shrink_block = 0, shrink_down_mode = 2, shrink_up_mode = 2;
++        float shrink_factor = 1.f, shrink_t_lo = 0.f, shrink_t_hi = 999.f;
++        bool shrink_after_skip = true;
 +        uint32_t tile_seed = 0;
 +    };
 +
@@ -436,6 +595,8 @@ new file mode 100644
 +        int width = 0, height = 0, region = 0, spatial_w = 0, spatial_h = 0;
 +        uint32_t step = 0, layer_index = 0;
 +        ggml_tensor* attention_mask = nullptr;
++        float timestep = 0.f;
++        int evaluation = 0, depth_factor = 1;
 +    };
 +    inline thread_local UNetPass active;
 +    struct UNetPassScope {
@@ -447,5 +608,9 @@ new file mode 100644
 +    };
 +    std::pair<int,int> tile_shape();
 +    ggml_tensor* split_tiles(ggml_context*, ggml_tensor*, int tw, int th, bool restore);
++    ggml_tensor* resize_features(ggml_context*, ggml_tensor*, int w, int h, int mode);
++    ggml_tensor* subsample_tokens(ggml_context*, ggml_tensor*);
++    bool shrink_enabled();
++    ggml_tensor* deep_shrink(ggml_context*,ggml_tensor*,int block);
 +    void apply_freeu(ggml_context*, ggml_tensor*& backbone, ggml_tensor*& skip, int stage);
 +}

@@ -4,7 +4,9 @@ import sdfx.core.model.GenerationParams
 import ujson.Value
 
 private[vulkan] object VulkanUnetHooks:
-  val hooks = Set("freeu","hypertile","pag","sag")
+  val attentionHooks = Set("freeu","hypertile","pag","sag")
+  val resizeHooks = Set("kohya_hrfix","token_downsampling")
+  val hooks = attentionHooks ++ resizeHooks
 
   final case class Settings(args: String, regions: Int, pagScale: Double, adaptive: Double, sagScale: Double):
     def guidance(cfg: Double): String =
@@ -35,6 +37,25 @@ private[vulkan] object VulkanUnetHooks:
       args ++= s",hypertile_size=${int(o,"tile_size",256,32,65536)},hypertile_swap=${int(o,"swap_size",2,1,256)}"
       args ++= s",hypertile_depth=${int(o,"max_depth",0,0,10)},hypertile_scale_depth=${o.obj.get("scale_depth").exists(_.bool)}"
       args ++= s",hypertile_seed=${(seed ^ (seed >>> 32)) & Int.MaxValue}"
+    }
+    enabled("kohya_hrfix").foreach { o =>
+      def mode(k: String): Int = o.obj.get(k).fold("bicubic")(_.str) match
+        case "nearest-exact" => 0
+        case "bilinear" => 1
+        case "area" => 3
+        case _ => 2  // The Python path also uses bicubic for bislerp.
+      args ++= s",shrink_block=${int(o,"block_number",3,1,if xl then 8 else 11)}"
+      args ++= s",shrink_factor=${num(o,"downscale_factor",2,0.1,9)}"
+      args ++= s",shrink_t_hi=${999*(1-num(o,"start_percent",0,0,1))},shrink_t_lo=${999*(1-num(o,"end_percent",0.35,0,1))}"
+      args ++= s",shrink_after_skip=${o.obj.get("downscale_after_skip").forall(_.bool)},shrink_down_mode=${mode("downscale_method")},shrink_up_mode=${mode("upscale_method")}"
+    }
+    enabled("token_downsampling").foreach { o =>
+      val evaluations = (p.steps * num(o,"disable_after",1,0,1)).toInt
+      val f = num(o,"factor",1,1,5)
+      val f2 = num(o,"factor2",1,1,5)
+      if evaluations > 0 && (f > 1 || f2 > 1) && (enabled("pag").nonEmpty || enabled("hypertile").nonEmpty) then
+        VulkanProtocol.unsupported("Token Downsampling combined with PAG or HyperTile")
+      args ++= s",token_factor=$f,token_factor2=$f2,token_depth=${if xl then 2 else 1},token_evaluations=$evaluations"
     }
     val sag = enabled("sag").fold(0.0)(o => num(o,"scale",0.5,0,30))
     enabled("pag") match
