@@ -1,6 +1,6 @@
 package sdfx.vulkan
 
-import sdfx.core.model.{LoraRef, LoraSyntax}
+import sdfx.core.model.{GenerationParams, LoraRef, LoraSyntax}
 import sdfx.core.protocol.GenerationRequest
 import java.nio.file.Path
 import scala.util.Using
@@ -11,8 +11,23 @@ private[vulkan] object VulkanComposableLora:
   private val controllerNote = """(?:\\u0023|#)[^:#\[\]]+""".r
   private def cleanPrompt(text: String): String =
     controllerNote.replaceAllIn(LoraSyntax.extract(text).prompt, "").trim
+  private def flag(config: Value, key: String): Boolean = config.obj.get(key).exists {
+    case ujson.Bool(value) => value
+    case ujson.Num(value) => value != 0
+    case ujson.Str(value) => Set("enable", "enabled", "true", "yes", "on", "1")(value.trim.toLowerCase(java.util.Locale.ROOT))
+    case _ => false
+  }
+  def clock(p: GenerationParams, config: Value, actual: Int, hires: Boolean): (Int, Int) =
+    val global = flag(config, "hires_global_step")
+    val offset = if global && hires then p.steps else 0
+    val total = if global && p.hires.enabled && !p.isImg2Img then
+      p.steps + (if p.hires.secondPassSteps == 0 then p.steps else p.hires.secondPassSteps)
+    else if !hires && p.isImg2Img then
+      p.img2img.fold(actual)(i => (p.steps * i.denoisingStrength).toInt.max(1).min(p.steps))
+    else actual
+    (offset, total)
   final case class Branch(text: String, coefficient: Double, textAdapters: Vector[(String, Double)],
-      unetAdapters: Vector[(String, Double)])
+      unetAdapters: Vector[(String, Double)], unetSchedule: Vector[Vector[(String, Double)]] = Vector.empty)
   final case class Plan(negative: Branch, positive: Vector[Branch]):
     def guidance(prefix: String): String =
       if positive.size == 1 && positive.head.coefficient == 1 then ""
@@ -43,17 +58,12 @@ private[vulkan] object VulkanComposableLora:
     (!keys.forall(unet), !keys.forall(text))
 
   def plan(prompt: String, negative: String, manual: Option[Seq[LoraRef]], discovered: Seq[LoraRef],
-      config: Value, alternatePrompt: String = ""): Plan =
+      config: Value, alternatePrompt: String = "", steps: Int = 1, clockOffset: Int = 0, clockTotal: Int = 0): Plan =
     import VulkanNeutralPrompt.{Group, Leaf, Node}
     import VulkanProtocol.{invalid, unsupported}
-    def flag(key: String): Boolean = config.obj.get(key).exists {
-      case ujson.Bool(value) => value
-      case ujson.Num(value) => value != 0
-      case ujson.Str(value) => Set("enable", "enabled", "true", "yes", "on", "1")(value.trim.toLowerCase(java.util.Locale.ROOT))
-      case _ => false
-    }
-    if flag("with_step") then unsupported("Composable LoRA step controllers")
-    if flag("plot_weights") then unsupported("Composable LoRA weight plots")
+    val useSteps = flag(config, "with_step")
+    val total = if clockTotal > 0 then clockTotal else steps
+    if flag(config, "plot_weights") then unsupported("Composable LoRA weight plots")
     val leaves = Vector.newBuilder[(String, Double)]
     def visit(node: Node, scale: Double): Unit =
       if node.kind != "AND" then unsupported("extended AND operators with Composable LoRA")
@@ -80,28 +90,44 @@ private[vulkan] object VulkanComposableLora:
       if ref.weight == 0 && ref.unet.exists(_ != 0) then
         unsupported("legacy Composable LoRA with zero text weight and nonzero U-Net weight")
     }
-    def weights(local: Seq[LoraRef], unet: Boolean): Vector[(String, Double)] =
+    def weights(local: Seq[LoraRef], unet: Boolean, controlled: Option[Vector[(LoraRef, Double)]] = None): Vector[(String, Double)] =
       def selected(ref: LoraRef): Double = if unet then ref.unet.getOrElse(ref.weight) else ref.weight
-      val values = local.iterator.map { ref =>
+      def component(ref: LoraRef): Double =
         val weight = if unet && manual.isEmpty then
           val ratio = legacy.get(ref.name).flatMap(spec => spec.unet.map(w => if spec.weight == 0 then 0 else w / spec.weight))
           ref.weight * ratio.getOrElse(1.0)
         else selected(ref)
-        ref.name -> weight
-      }.toMap
+        weight
+      val values = controlled.fold(local.iterator.map(ref => ref.name -> component(ref)).toMap) { entries =>
+        entries.foldLeft(Map.empty[String, Double]) { case (acc, (ref, multiplier)) =>
+          val value = component(ref) * multiplier
+          if math.abs(value) > math.abs(acc.getOrElse(ref.name, 0.0)) then acc.updated(ref.name, value) else acc
+        }
+      }
       val added = shared.groupMapReduce(_.name)(selected)(_ + _)
       (values.keySet ++ added.keySet).toVector.sorted.flatMap { name =>
         val weight = values.getOrElse(name, 0.0) + added.getOrElse(name, 0.0)
         if !weight.toFloat.isFinite then invalid("Combined Composable LoRA weight must be finite")
         Option.when(weight != 0)(name -> weight)
       }
-    val singleDefault = positive.size == 1 && !flag("single_no_uc")
+    val singleDefault = positive.size == 1 && !flag(config, "single_no_uc")
+    def schedule(program: Option[VulkanLoraSteps.Program]): Vector[Vector[(String, Double)]] =
+      program.fold(Vector.empty[Vector[(String, Double)]]) { stepsProgram =>
+        Vector.tabulate(steps)(i => weights(Nil, true, Some(stepsProgram.weights(i + 1 + clockOffset, total))))
+      }
+    val negativeUnet = singleDefault || flag(config, "uc_diffusion_model")
+    val negativeSchedule = schedule(Option.when(useSteps && negativeUnet && positive.size == 1)(VulkanLoraSteps.parse(prompt)))
     val uncond = Branch(cleanPrompt(negative), 1,
-      if singleDefault || flag("uc_text_model_encoder") then weights(promptTags, false) else Vector.empty,
-      if singleDefault || flag("uc_diffusion_model") then weights(promptTags, true) else Vector.empty)
+      if singleDefault || flag(config, "uc_text_model_encoder") then weights(promptTags, false) else Vector.empty,
+      negativeSchedule.headOption.getOrElse(if negativeUnet then weights(promptTags, true) else Vector.empty),
+      negativeSchedule)
     Plan(uncond, positive.map { (text, coefficient) =>
       val local = tags(text)
-      Branch(cleanPrompt(text), coefficient, weights(local, false), weights(local, true))
+      val program = Option.when(useSteps)(VulkanLoraSteps.parse(text))
+      val timeline = schedule(program)
+      Branch(cleanPrompt(program.fold(text)(_.prompt)), coefficient,
+        weights(local, false, program.map(_.weights(-1, total))),
+        timeline.headOption.getOrElse(weights(local, true)), timeline)
     })
 
   def prepare(plan: Plan, req: GenerationRequest, prefix: String, unet: String, text: String, enc: String,
@@ -110,7 +136,9 @@ private[vulkan] object VulkanComposableLora:
     val lines = Vector.newBuilder[String]
     val branches = (s"${prefix}_neg" -> plan.negative) +:
       plan.positive.zipWithIndex.map((branch, i) => s"${prefix}_branch$i" -> branch)
-    val names = branches.flatMap((_, branch) => branch.textAdapters.map(_._1) ++ branch.unetAdapters.map(_._1)).distinct
+    val names = branches.flatMap { (_, branch) =>
+      (branch.textAdapters ++ branch.unetAdapters ++ branch.unetSchedule.flatten).map(_._1)
+    }.distinct
     val adapters = names.zipWithIndex.map { (name, i) =>
       val path = VulkanConditioning.file(req.loraPaths.getOrElse(name,
         VulkanProtocol.invalid(s"Unresolved Composable LoRA adapter: $name")), "LoRA")
@@ -131,7 +159,37 @@ private[vulkan] object VulkanComposableLora:
       })
     for (name, branch) <- branches do
       val encoder = applyAdapters(text, branch.textAdapters.filter(entry => adapters(entry._1)._2))
-      val denoiser = applyAdapters(unet, branch.unetAdapters.filter(entry => adapters(entry._1)._3))
       val blank = if supportsBlank && name.endsWith("_neg") && branch.text.isEmpty then ", sdxl_blank_negative = true" else ""
-      lines += s"$name = predictor($denoiser, encode_prompt($encoder, ${quoted(branch.text)}, $enc)$concat$blank)"
+      val condition = s"${name}_cond"
+      lines += s"$condition = encode_prompt($encoder, ${quoted(branch.text)}, $enc)"
+      def predict(symbol: String, weights: Vector[(String, Double)]): String =
+        val denoiser = applyAdapters(unet, weights.filter(entry => adapters(entry._1)._3))
+        lines += s"$symbol = predictor($denoiser, $condition$concat$blank)"
+        symbol
+      val timeline = branch.unetSchedule
+      val distinct = timeline.distinct
+      val scheduleSource = if distinct.size <= 1 then
+        predict(name, timeline.headOption.getOrElse(branch.unetAdapters))
+      else
+        val variants = distinct.zipWithIndex.map { (weights, i) =>
+          weights -> predict(s"${name}_stage$i", weights)
+        }.toMap
+        val changes = timeline.zipWithIndex.collect {
+          case (weights, i) if i == 0 || timeline(i - 1) != weights => (i, variants(weights))
+        }
+        var serial = 0
+        def connect(from: Int, until: Int): String =
+          if from + 1 == until then changes(from)._2
+          else
+            val mid = (from + until) / 2
+            val before = connect(from, mid)
+            val after = connect(mid, until)
+            serial += 1
+            val symbol = s"${name}_switch$serial"
+            lines += s"$symbol = switch_predictor($before, $after, after_steps = ${changes(mid)._1})"
+            symbol
+        val selected = connect(0, changes.size)
+        lines += s"$name = $selected"
+        changes.head._2
+      if name == s"${prefix}_branch0" then lines += s"${prefix}_schedule = $scheduleSource"
     lines.result()

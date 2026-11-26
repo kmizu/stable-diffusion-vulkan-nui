@@ -144,7 +144,9 @@ The sampler computes a latent correction by re-evaluating the conditional and un
 
 Static `AND` branches use independent LoRA bindings for text encoding and U-Net prediction. The sampler combines the difference from the unconditional prediction for each weighted branch. Manual adapters are shared across positive branches. The two negative-adapter switches route the text encoder and U-Net independently, including the legacy default for a single branch. Ordinary Hires rebuilds the branch plan from the Hires prompt. Runtime adapter application keeps the branches on the same Vulkan checkpoint without merging separate copies of its weights. [Original Composable LoRA extension](https://github.com/opparco/stable-diffusion-webui-composable-lora).
 
-Step controllers, weight plots, dynamic ranks, extended Neutral Prompt operators and their combinations remain open. One-component detection currently reads SafeTensors keys. Other weight formats and detector-driven refinement combinations have separate coverage gaps.
+With step control enabled, LoRA-only bracket expressions can set inclusive start and end steps, alternate adapters, or scale a window with `#increment` and `#decrease`. Text encoding and U-Net weighting use their respective clocks. Fractions in base img2img use the legacy denoising step count. An ordinary Hires pass can restart its clock or use the existing global-step option.
+
+`#cmd` controllers, weight plots, dynamic ranks, extended Neutral Prompt operators and their combinations remain open. One-component detection currently reads SafeTensors keys. Other weight formats and detector-driven refinement combinations have separate coverage gaps.
 
 Further Python generation hooks without a corresponding verified implementation in this inventory include `aesthetic_gradients`, `compile` and `incantations`.
 

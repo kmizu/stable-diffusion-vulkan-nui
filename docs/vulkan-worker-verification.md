@@ -3,6 +3,16 @@
 
 
 
+## Windows v0.57 — Composable LoRA step controls
+
+Direct masked SDXL img2img at 768 × 768 on RTX 3090 and SD1.5 at 512 × 512 on Radeon 780M produced different edited pixels for early and late LoRA windows. A window beyond the pass matched the branch without an adapter pixel for pixel on both devices. RTX 3090 reproduced the early-window seed exactly. These cases retained all source pixels outside the mask, and the images were inspected.
+
+On RTX 3090, a separate 512 × 512 SDXL run exercised an increasing ramp and alternating an adapter with an empty slot. The runs differed inside the mask and preserved its exterior. A 576 × 576 Latent Hires pass also used a separate timed branch assignment. The short SDXL cases showed visible distortions inside the edit. An earlier 768 × 768 ramp run reached the host-memory guard while packaging was active.
+
+All 59 Vulkan worker tests and the Composable LoRA plugin test passed. The tests cover inclusive fractional endpoints, repeated adapter weights for text encoding, alternating choices, the Hires offset and the legacy img2img step denominator.
+
+The staged `SDV-NUI.exe` ran both masked jobs through MCP with the default Model Keyword configuration, a system-only PATH and `cuda=false`. RTX 3090 used DPM++ 2M and Radeon 780M used Euler. The PNGs retained the scheduled LoRA bracket and every unmasked pixel. The ZIP SHA-256 is `1e1b4bef8476c3d4f06a726efde7da9de440928fb462655f0859888c4fe1d465`. The archived launcher, desktop JAR, worker JAR and inference DLL matched the tested staging files.
+
 ## Windows v0.56 — Static Composable LoRA
 
 RTX 3090 tested masked SDXL at 768 × 768 with a U-Net-only SafeTensors adapter. Radeon 780M tested masked SD1.5 at 512 × 512 with an adapter covering both text and U-Net. Moving the same LoRA between two AND branches changed the edited region on both GPUs. Returning to the original branch reproduced the same seed pixel for pixel. All unmasked source pixels matched.

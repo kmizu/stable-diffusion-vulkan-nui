@@ -59,14 +59,18 @@ private[vulkan] object VulkanHiresGraph:
     def selected(value: String, fallback: String) = if resolved || value.nonEmpty then value else fallback
     val positivePrompt = selected(h.prompt, firstPrompt)
     val negativePrompt = selected(h.negativePrompt, p.negativePrompt)
-    val loraPlan = composable.map(VulkanComposableLora.plan(
-      positivePrompt, negativePrompt, req.manualLoras, adapters, _, firstPrompt))
+    val full = fullSteps(p)
+    require(full <= 10000,"Hires schedule exceeds 10000 steps")
+    val count = (full*h.denoisingStrength).toInt.min(full).max(1)
+    val loraPlan = composable.map { config =>
+      val (offset, total) = VulkanComposableLora.clock(p, config, count, hires = true)
+      VulkanComposableLora.plan(positivePrompt, negativePrompt, req.manualLoras, adapters, config, firstPrompt,
+        count, offset, total)
+    }
     val areaRatio = targetWidth.toDouble * targetHeight / (p.width.toDouble * p.height)
     val baseSteps = p.img2img.fold(p.steps)(i => ((p.steps * i.denoisingStrength).toInt + 1).min(p.steps))
     reference.foreach(config => lines ++= config.prepare("hr_ref", tiled))
     val agentArgs = agent.fold("")(_.args(seed, hires = true))
-    val full = fullSteps(p)
-    require(full <= 10000,"Hires schedule exceeds 10000 steps")
     val llulArgs = llul.filter(_.canApply(full)).fold("")(_.args(targetWidth, targetHeight, "llul_mask", full))
     controlWeight.foreach(_ => lines += "hr_control_hint = image::to_f32(hr_control_image)")
     val concat = if inpaint then
@@ -125,14 +129,13 @@ private[vulkan] object VulkanHiresGraph:
     val schedule = h.scheduler.getOrElse(p.scheduler)
     val name = if schedule == "Automatic" then VulkanProtocol.defaultSchedule(sampler) else schedule
     val scheduler = VulkanProtocol.schedulers.getOrElse(name,unsupported(s"hires scheduler $name"))
-    val count = (full*h.denoisingStrength).toInt.min(full).max(1)
     val cfg = h.cfgScale.getOrElse(p.cfgScale)
     val cfgTiming = if cacheArgs.nonEmpty then VulkanGraph.cacheCfgArguments(p.hooks, cfg, count) else ""
     val chgArgs = characteristic.fold("")(_.args(p.steps, cfg))
     val branchNames = if composable.nonEmpty then "hr_clora_branch0, hr_clora_neg" else "hr_pos, hr_neg"
     val cloraArgs = loraPlan.fold("")(_.guidance("hr_clora"))
     lines += s"hr_guided = cfg($branchNames, scale = $cfg$cfgTiming$chgArgs$cloraArgs)"
-    val schedulePredictor = if composable.nonEmpty then "hr_clora_branch0" else "hr_guided"
+    val schedulePredictor = if composable.nonEmpty then "hr_clora_schedule" else "hr_guided"
     lines += s"hr_full = make_sigmas($schedulePredictor, latent = hr_base, scheduler = ${q(scheduler)}, steps = $full)"
     lines += s"hr_sigmas = hr_full[${full-count}:]"
     val noise = if customNoise then "hr_noise" else "tensor::randn_like(hr_base, rng = hr_rng)"

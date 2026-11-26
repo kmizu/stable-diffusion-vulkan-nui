@@ -121,7 +121,12 @@ private[vulkan] object VulkanGraph:
       then unsupported("Composable LoRA in detector-driven refinement passes")
       p.hooks(hook)
     }
-    val loraPlan = composable.map(VulkanComposableLora.plan(prompt, p.negativePrompt, req.manualLoras, loras, _, p.hires.prompt))
+    val passSteps = p.img2img.fold(p.steps)(i => math.min(p.steps, (p.steps * i.denoisingStrength).toInt + 1))
+    val loraPlan = composable.map { config =>
+      val (offset, total) = VulkanComposableLora.clock(p, config, passSteps, hires = false)
+      VulkanComposableLora.plan(prompt, p.negativePrompt, req.manualLoras, loras, config, p.hires.prompt,
+        passSteps, offset, total)
+    }
     val signedText = hook == VulkanNegPip.id
     if signedText && !engine.supportsNegPip() then unsupported("This Vulkan runtime lacks NegPiP")
     val customText = clipIo.nonEmpty || fusionScratch.nonEmpty || signedText
@@ -330,7 +335,6 @@ private[vulkan] object VulkanGraph:
     val positiveInput = if control.nonEmpty then "controlled_pos" else "latent_pos"
     val negativeInput = if control.nonEmpty then "controlled_neg" else "latent_neg"
     val post = modifier.fold("")(VulkanLatentModifier.arguments(_,seed))
-    val passSteps = p.img2img.fold(p.steps)(i => math.min(p.steps, (p.steps * i.denoisingStrength).toInt + 1))
     val cfgTiming = if cacheGraph then VulkanGraph.cacheCfgArguments(p.hooks, p.cfgScale, passSteps) else ""
     val chgArgs = characteristic.fold("")(_.args(p.steps, p.cfgScale))
     val cloraArgs = loraPlan.fold("")(_.guidance("clora"))
@@ -450,7 +454,7 @@ private[vulkan] object VulkanGraph:
       lines += guidance
     val fullSteps = up.fold(p.steps)(_.fullSteps)
     val scheduleName = up.fold(schedule)(_.scheduler)
-    val schedulePredictor = if composable.nonEmpty then positive else "guided"
+    val schedulePredictor = if composable.nonEmpty then "clora_schedule" else "guided"
     lines += s"full = make_sigmas($schedulePredictor, latent = base, scheduler = ${quoted(VulkanProtocol.schedulers(scheduleName))}, steps = $fullSteps)"
     val sigmas = up.fold(p.img2img.fold("full")(i => s"full[${p.steps - math.min(p.steps,(p.steps*i.denoisingStrength).toInt+1)}:]"))(_ => s"full[${fullSteps-p.steps}:]")
     val softSteps = soft.fold(0)(_ => (p.steps*p.img2img.get.denoisingStrength).toInt.max(1).min(p.steps))
