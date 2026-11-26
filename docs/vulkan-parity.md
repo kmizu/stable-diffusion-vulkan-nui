@@ -160,7 +160,11 @@ The worker uses the pinned CLIP ViT-L/14 asset shared with embedding creation an
 
 Base img2img and the two Hires paths accept the supported full-range, balanced single ControlNet. The worker computes standard fixed-weight LoRA deltas for CLIP-L on Vulkan before the style projection and Adam updates. Ordinary conditioning and the U-Net apply their own LoRA adapters at runtime. SDXL retains the ordinary encoder's LoRA-conditioned CLIP-G channels and pooled vector. Built-in Hires reuses the trained encoder when the selected prompt and text LoRA bindings match. The separate Img2Img Hires Fix applies the plugin to the refinement prompt and checks that the embedding matches the first pass. Scheduled and block-weight LoRA combinations remain open.
 
-Further Python generation hooks without a corresponding verified implementation in this inventory include `compile` and `incantations`.
+### Incantations
+
+The CFG Scheduler supports the 17 legacy curves, a snapped noise interval, and the original one-evaluation lag on Euler and Euler a. It supports masked img2img, built-in Hires and the separate Img2Img Hires Fix. Ordinary Hires uses the base curve's step count and CFG, and the independent Img2Img Hires Fix builds a curve from its own settings. ADetailer and Batch Face Swap inherit the base image and run their local inpainting without the Incantations schedule.
+
+Smoothed Energy Guidance, S-CFG, Incantations PAG and Multi-Concept T2I-Zero remain open. The `compile` hook also remains open.
 
 ### Boundaries of the port
 

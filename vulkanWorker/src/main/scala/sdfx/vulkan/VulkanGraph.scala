@@ -189,9 +189,11 @@ private[vulkan] object VulkanGraph:
       else if signedText then Set(VulkanWeightGradient.id)
       else Set.empty[String]
     val permitted = Set(hook,"nsfw_checker","aesthetic_score","model_keyword","pnginfo_injection","adetailer","batch_face_swap") ++ imageHooks ++ textHooks ++
+      Option.when(hook == latentHires)(VulkanIncantations.id) ++
       Option.when(reference.nonEmpty)(VulkanReference.id) ++ Option.when(lllite.nonEmpty)(VulkanLLLite.id) ++ Option.when(hiresPass)("hires_fix_tweaks") ++ (if cacheGraph then cacheHooks ++ cacheGuidanceHooks else Set.empty[String]) ++ Option.when(modifier.nonEmpty)(VulkanLatentModifier.id) ++ (if latentHook then VulkanLatentGraph.hooks else Set.empty[String]) ++ (if unetHooks.nonEmpty then VulkanUnetHooks.hooks else Set.empty[String])
     val other = p.hooks.filterNot { (key, value) =>
       value.obj.get("enabled").contains(ujson.Bool(false)) || !VulkanFusionPrompt.applies(key,p.prompt,p.negativePrompt) ||
+        key == VulkanIncantations.id && VulkanIncantations.cfg(p.hooks).isEmpty ||
         key == VulkanUnetHooks.tiledDiffusion && !needsTiles ||
         key == VulkanLatentModifier.id && VulkanLatentModifier.config(p).isEmpty ||
         key == VulkanNegPip.id && !VulkanNegPip.applies(p,prompt,p.negativePrompt) ||
@@ -388,7 +390,8 @@ private[vulkan] object VulkanGraph:
     val positiveInput = if control.nonEmpty then "controlled_pos" else "latent_pos"
     val negativeInput = if control.nonEmpty then "controlled_neg" else "latent_neg"
     val post = modifier.fold("")(VulkanLatentModifier.arguments(_,seed))
-    val cfgTiming = if cacheGraph then VulkanGraph.cacheCfgArguments(p.hooks, p.cfgScale, passSteps) else ""
+    val cfgTiming = if cacheGraph then VulkanGraph.cacheCfgArguments(p.hooks, p.cfgScale, passSteps)
+      else VulkanIncantations.graphArguments(p, passSteps)
     val chgArgs = characteristic.fold("")(_.args(p.steps, p.cfgScale))
     val cloraArgs = loraPlan.fold("")(_.guidance("clora"))
     val guidance = unetHooks.fold(s"guided = cfg($positive, $negative, scale = ${p.cfgScale}$post$cfgTiming$chgArgs$cloraArgs)")(_.guidance(p.cfgScale,concat,positiveInput,post))

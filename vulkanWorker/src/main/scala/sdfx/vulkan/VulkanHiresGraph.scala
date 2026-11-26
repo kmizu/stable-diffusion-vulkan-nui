@@ -139,7 +139,8 @@ private[vulkan] object VulkanHiresGraph:
     val name = if schedule == "Automatic" then VulkanProtocol.defaultSchedule(sampler) else schedule
     val scheduler = VulkanProtocol.schedulers.getOrElse(name,unsupported(s"hires scheduler $name"))
     val cfg = h.cfgScale.getOrElse(p.cfgScale)
-    val cfgTiming = if cacheArgs.nonEmpty then VulkanGraph.cacheCfgArguments(p.hooks, cfg, count) else ""
+    val cfgTiming = if cacheArgs.nonEmpty then VulkanGraph.cacheCfgArguments(p.hooks, cfg, count)
+      else VulkanIncantations.graphArguments(p, count)
     val chgArgs = characteristic.fold("")(_.args(p.steps, cfg))
     val branchNames = if composable.nonEmpty then "hr_clora_branch0, hr_clora_neg" else "hr_pos, hr_neg"
     val cloraArgs = loraPlan.fold("")(_.guidance("hr_clora"))

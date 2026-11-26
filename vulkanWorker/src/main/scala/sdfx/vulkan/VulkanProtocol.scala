@@ -42,11 +42,12 @@ private[vulkan] object VulkanProtocol:
     p.validate.headOption.foreach(invalid)
     if req.outputDir.isBlank then invalid("output_dir is required")
     p.hooks.foreach { (key, config) =>
-      if !VulkanGraph.hooks(key) && !Set("nsfw_checker","aesthetic_score", "embedding_merge", "save_intermediate", "steps_animation", "gpu_temperature_guard", "conditioning_highres_fix", "face_restore", "adetailer", "batch_face_swap", "apg", "cfg_schedule", "tiling", "neveroom", "model_sampling", "model_keyword", "pnginfo_injection", "inpaint_difference", "img2img_hires_fix","hires_fix_tweaks")(key) then unsupported(s"engine hook $key")
+      if key != VulkanIncantations.id && !VulkanGraph.hooks(key) && !Set("nsfw_checker","aesthetic_score", "embedding_merge", "save_intermediate", "steps_animation", "gpu_temperature_guard", "conditioning_highres_fix", "face_restore", "adetailer", "batch_face_swap", "apg", "cfg_schedule", "tiling", "neveroom", "model_sampling", "model_keyword", "pnginfo_injection", "inpaint_difference", "img2img_hires_fix","hires_fix_tweaks")(key) then unsupported(s"engine hook $key")
       if config.objOpt.isEmpty then invalid(s"Invalid configuration for $key")
       if key == "pnginfo_injection" && config.obj.keys.exists(_ != "enabled") then invalid("Invalid PNG resource hash configuration")
       config.obj.get("enabled").foreach(value => decode(value.bool))
     }
+    VulkanIncantations.validate(p)
     if p.subseedStrength != 0 && !(p.hires.enabled && !p.isImg2Img && p.hooks.get("hires_fix_tweaks").exists(!_.obj.get("enabled").contains(ujson.Bool(false)))) then unsupported("variation strength")
     if p.eta.exists(v => !v.isFinite || v < 0) then invalid("eta must be finite and nonnegative")
     if !samplers.contains(p.samplerName) then unsupported(s"sampler ${p.samplerName}")

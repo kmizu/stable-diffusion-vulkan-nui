@@ -113,3 +113,41 @@ class VulkanWorkerSuite extends munit.FunSuite:
     assertEquals(VulkanProtocol.select(all, Some(VulkanProtocol.display(b))), b)
     intercept[EngineError](VulkanProtocol.select(all, Some("Example")))
   }
+
+  test("Incantations CFG follows the lagged source clock and its noise interval") {
+    val config = ujson.Obj("cfg_interval_enable" -> true, "cfg_interval_schedule" -> "Linear")
+    assertEquals(VulkanIncantations.schedule(config, 8, 6, 5), Vector(12f, 12f, 10.5f, 9f, 7.5f))
+    config("cfg_interval_low") = ujson.Num(79)
+    assertEquals(VulkanIncantations.schedule(config, 8, 6, 5), Vector(12f, 12f, 1f, 1f, 1f))
+    config("cfg_interval_schedule") = ujson.Str("Constant")
+    assertEquals(VulkanIncantations.schedule(config, 8, 6, 5), Vector.fill(5)(6f))
+    val longHires = ujson.Obj("cfg_interval_schedule" -> "Linear")
+    assertEquals(VulkanIncantations.schedule(longHires, 4, 6, 8), Vector(12f, 12f, 9f, 6f, 3f, 0f, -3f, -6f))
+    for value <- Seq(ujson.Num(1), ujson.Str("on")) do
+      assert(VulkanIncantations.cfg(Map("incantations" -> ujson.Obj("cfg_interval_enable" -> value))).nonEmpty)
+  }
+
+  test("Incantations CFG curves match the legacy scheduler at two interior steps") {
+    val expected = Vector(
+      ("Constant", 6.0, 6.0),
+      ("Clamp-Linear (c=4.0)", 7.5, 4.0),
+      ("Clamp-Linear (c=2.0)", 7.5, 3.0),
+      ("Clamp-Linear (c=1.0)", 7.5, 3.0),
+      ("Linear", 7.5, 3.0),
+      ("Inverse-Linear", 4.5, 9.0),
+      ("Cosine", 8.296100594, 1.757359313),
+      ("Clamp-Cosine (c=4.0)", 8.296100594, 4.0),
+      ("Clamp-Cosine (c=2.0)", 8.296100594, 2.0),
+      ("Clamp-Cosine (c=1.0)", 8.296100594, 1.757359313),
+      ("Sine", 3.703899406, 10.242640687),
+      ("Interval", 6.0, 1.0),
+      ("PCS (s=0.01)", 5.999674504, 5.997194433),
+      ("PCS (s=0.1)", 5.968846397, 5.755320533),
+      ("PCS (s=1.0)", 4.148050297, 0.878679656),
+      ("PCS (s=2.0)", 1.989330440, 0.057644159),
+      ("PCS (s=4.0)", 0.338141608, 0.000225894))
+    for (name, third, sixth) <- expected do
+      val values = VulkanIncantations.schedule(ujson.Obj("cfg_interval_schedule" -> name), 8, 6, 8)
+      assert(math.abs(values(4) - third) < 1e-6, name)
+      assert(math.abs(values(7) - sixth) < 1e-6, name)
+  }

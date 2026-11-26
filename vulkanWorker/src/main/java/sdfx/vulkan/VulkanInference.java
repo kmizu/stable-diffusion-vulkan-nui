@@ -36,6 +36,9 @@ public final class VulkanInference implements AutoCloseable {
             this(loras, controlImage, strength, vaeTiling, automaticTiling, false, false, "");
         }
         public static Conditioning empty() { return new Conditioning(List.of(), null, 1, false, true); }
+        public Conditioning withSampleArgs(String args) {
+            return new Conditioning(loras, controlImage, controlStrength, vaeTiling, automaticTiling, tileX, tileY, args);
+        }
     }
     public record ModelOptions(String weights, String placement, String vae, String tensorTypes,
                                String controlModel, List<Embedding> embeddings, String prediction, String tinyPreview) {

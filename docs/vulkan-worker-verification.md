@@ -3,6 +3,18 @@
 
 
 
+## Windows v0.66 — Incantations CFG Scheduler
+
+All 17 curves matched the legacy Python implementation at two interior steps within 0.000001. The tests also exercised interval snapping, a longer Hires schedule with signed values, numeric and text activation flags, and the first two evaluations using step zero.
+
+On Radeon 780M with SD1.5 at 512 × 512 and RTX 3090 with SDXL at 768 × 768, masked Euler img2img with Constant matched the hook-disabled image pixel for pixel. At the same seed, Interval matched an independent per-evaluation CFG sequence of `[1, 1, 6, 6, 6, 6, 6]`. The scheduled output changed the edited region and preserved every unmasked pixel.
+
+RTX 3090 ran both regular Latent Hires paths with four base steps and eight refinement steps. The Linear schedule reached negative CFG values in the second pass. Both results preserved the resized source wherever the resized mask was zero. The SDXL stress test showed severe color banding in the edited region.
+
+The separate Img2Img Hires Fix on RTX 3090 used five refinement steps and CFG 4 after an eight-step base with CFG 6. Its Constant result matched the disabled result pixel for pixel at 832 × 832. The staged Windows executable ran Interval through MCP on Radeon 780M with Euler a and RTX 3090 with Euler. Both reported `cuda=false`, recorded the schedule in the PNG, and preserved every unmasked pixel. The generated images were inspected.
+
+All 71 Vulkan worker tests and six Incantations plugin tests passed. The ZIP SHA-256 is `9f4916276c53cc36a6f06b15d3c55488623e92398b27576a3bf72eb28d35bac8`. The archived launcher, desktop JAR, worker JAR and inference DLL matched the tested staging files.
+
 ## Windows v0.65 — PyTorch checkpoint and GGUF selection
 
 The Vulkan worker loaded an SD1.5 PyTorch ZIP `.ckpt` on Radeon 780M at 512 × 512 and an unquantized F16/F32 SDXL `.gguf` on RTX 3090 at 768 × 768. Both checkpoints were made from the same weights as the original SafeTensors fixtures. Independent decoding of a CLIP-L projection matrix and a layer-norm bias matched the output of the new extract function byte for byte. The extractor rejected an incorrect tensor shape and handled cancellation before opening the checkpoint.

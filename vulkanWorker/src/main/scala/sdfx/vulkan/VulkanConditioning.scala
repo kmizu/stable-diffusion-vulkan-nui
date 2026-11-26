@@ -69,9 +69,17 @@ private[vulkan] object VulkanConditioning:
       (0 until count).map(i => schedule.at(i.toDouble / (count - 1).max(1)))
     }
 
-  private[vulkan] def sampleArgs(p: sdfx.core.model.GenerationParams): String =
+  private[vulkan] def sampleArgs(p: sdfx.core.model.GenerationParams,
+      incantationsBase: Option[(Int, Double)] = None): String =
     val args = Vector.newBuilder[String]
-    cfgSchedule(p.hooks, p.cfgScale, p.steps).foreach { values =>
+    val incantations = VulkanIncantations.cfg(p.hooks).map { config =>
+      VulkanIncantations.validateSampler(p.samplerName)
+      if p.cfgScale <= 1 then unsupported("Incantations CFG Scheduler requires CFG scale greater than 1")
+      val (steps, cfg) = incantationsBase.getOrElse((p.steps, p.cfgScale))
+      val count = if p.hires.enabled then math.max(p.steps, p.hires.secondPassSteps) else p.steps
+      VulkanIncantations.schedule(config, steps, cfg, count)
+    }
+    incantations.orElse(cfgSchedule(p.hooks, p.cfgScale, p.steps)).foreach { values =>
       args += "guidance_schedule=" + values.map(scale => s"${scale}x1").mkString("+")
     }
     activeHook(p.hooks,"apg").foreach { o =>
@@ -100,7 +108,8 @@ private[vulkan] object VulkanConditioning:
       (model, image, u.weight)
     }
 
-  def prepare(req: GenerationRequest, load: LoadModelRequest, cancelled: () => Boolean = () => false): (String, VulkanInference.Conditioning) =
+  def prepare(req: GenerationRequest, load: LoadModelRequest, cancelled: () => Boolean = () => false,
+      incantationsBase: Option[(Int, Double)] = None): (String, VulkanInference.Conditioning) =
     val p = req.params
     if p.hires.enabled && !VulkanImageInputs.separateHires(req) && req.hiresLoras.exists(_ != p.loras) then unsupported("different LoRAs for the hires pass")
     val loras = p.loras.map { l =>
@@ -119,4 +128,4 @@ private[vulkan] object VulkanConditioning:
     }
     val tiledVae = activeHook(p.hooks,"neveroom").flatMap(_.obj.get("vae_tiling")).exists(_.bool)
     (controlInput.fold("")(_._1), new VulkanInference.Conditioning(loras.asJava, controlInput.map(_._2).orNull,
-      controlInput.fold(1.0)(_._3), load.vaeTiling || tiledVae, load.vaeAuto, tile("tile_x"), tile("tile_y"),sampleArgs(p)))
+      controlInput.fold(1.0)(_._3), load.vaeTiling || tiledVae, load.vaeAuto, tile("tile_x"), tile("tile_y"),sampleArgs(p, incantationsBase)))

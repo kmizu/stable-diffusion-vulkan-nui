@@ -1,0 +1,9 @@
+--- a/src/dgl/bindings/predictor.cpp
++++ b/src/dgl/bindings/predictor.cpp
+@@ -385,4 +385,4 @@
+-                if (!(scale >= 0.f && scale <= 1000.f))
+-                    throw std::runtime_error("guidance schedule values must be between zero and 1000");
++                if (!(scale >= -1000.f && scale <= 1000.f))
++                    throw std::runtime_error("guidance schedule values must be between -1000 and 1000");
+                 output.scale_schedule.push_back(scale);
+             }

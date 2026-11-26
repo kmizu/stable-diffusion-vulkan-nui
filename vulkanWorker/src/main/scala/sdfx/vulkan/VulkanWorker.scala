@@ -89,6 +89,7 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
   private def hello = Obj("protocol" -> 1, "engine_version" -> "vulkan-sd.cpp-f296cb0", "cuda" -> false,
     "dry_run" -> false, "device" -> display(device), "vulkan_devices" -> Arr.from(adapters.map(display)),
     "features" -> Arr.from(Vector("txt2img", "aesthetic_embedding", "aesthetic_score", "lora", "embeddings", "external_vae", "controlnet", "img2img", "animatediff", "animatediff_encode", "photomaker", "inpaint", "hires_fix", "img2img_hires_fix", "temporal_lab", "vae_tools", "list_devices", "system_info", "vram_estimator", "prevent_interrupt", VulkanClipIo.id, VulkanFusionPrompt.id, VulkanWeightGradient.id) ++ VulkanTools.features ++
+      Vector(VulkanIncantations.id) ++
       (if backend.supportsUnetHooks() then VulkanUnetHooks.attentionHooks.toVector.sorted else Vector.empty) ++
       (if backend.supportsUnetResize() then VulkanUnetHooks.resizeHooks.toVector.sorted else Vector.empty) ++
       Option.when(backend.supportsTiledDiffusion())(VulkanUnetHooks.tiledDiffusion).toVector ++
@@ -422,7 +423,8 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
       name -> controlModels.resolve(path,currentModel.kind,() => job.cancelled)
     }
 
-  private def prepareConditioning(req: GenerationRequest, job: Job, resources: Option[VulkanHashes.Run] = None): VulkanInference.Conditioning =
+  private def prepareConditioning(req: GenerationRequest, job: Job, resources: Option[VulkanHashes.Run] = None,
+      incantationsBase: Option[(Int, Double)] = None): VulkanInference.Conditioning =
     val previous = loadRequest.get
     req.params.vae.filter(_.nonEmpty).foreach { name =>
       val matches = if Set("Automatic", "None")(name) then previous.vaePath.isEmpty
@@ -430,7 +432,8 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
       if !matches then invalid(s"Select VAE '$name' with set_vae before generation")
     }
     val controls = resolveControls(req,job)
-    val (control, conditioning) = VulkanConditioning.prepare(req.copy(controlnetPaths = controls), previous, () => job.cancelled)
+    val (control, conditioning) = VulkanConditioning.prepare(req.copy(controlnetPaths = controls), previous, () => job.cancelled,
+      incantationsBase)
     val names = req.embeddingPaths.map(VulkanConditioning.stem).toSet
     val extra = toolSession.embeddingPaths(currentModel).filterNot(p => names(VulkanConditioning.stem(p)))
     val embeddings = VulkanConditioning.activeEmbeddings(req.copy(embeddingPaths = req.embeddingPaths ++ extra))
@@ -656,7 +659,7 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
               negativePrompt = Option(h.negativePrompt).filter(_.nonEmpty).getOrElse(p.negativePrompt),
               hires = h.copy(enabled = false), loras = req.hiresLoras.getOrElse(planned.fold(p.loras)(_.loras)))
             val mask = inputs.flatMap(_.mask).map(VulkanImageInputs.resize(_,w,ht,0)).orNull
-            val condition = prepareConditioning(req.copy(params = pass),job,resources)
+            val condition = prepareConditioning(req.copy(params = pass),job,resources,Some(p.steps -> p.cfgScale))
             backend.generate(pass.prompt,pass.negativePrompt,w,ht,scheduleSteps,pass.cfgScale,seed,method,
               schedulers.getOrElse(schedule,unsupported(s"hires scheduler $schedule")),p.clipSkip,
               new VulkanInference.ImageOptions(source,mask,strength,null,maskConditioning(strength)),condition,progress(Some("hires")))
@@ -728,7 +731,8 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
                   refinementImage = Some(resized), cdRefinement = cdRefinement, aestheticDigest = recordAesthetic,
                   aestheticProgress = aestheticProgress).head
               case None =>
-                val conditioning2 = prepareConditioning(req.copy(params = refinementParams.copy(prompt = prompt)), job, resources)
+                val conditioning2 = prepareConditioning(req.copy(params = refinementParams.copy(prompt = prompt,
+                  samplerName = sampler)), job, resources)
                 backend.generate(prompt, negative, w, ht, refinementParams.steps, refinementParams.cfgScale,
                   seed, method, nativeSchedule, p.clipSkip,
                   new VulkanInference.ImageOptions(resized, null, strength, null), conditioning2, progress(Some("img2img_hires")))
@@ -744,6 +748,10 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
             if key == "adetailer" then cfg else sdfx.vulkan.tools.VulkanADetailer.facePass(cfg,model.path,model.hash)
           }
         }
+        lazy val faceConditioning =
+          if VulkanIncantations.cfg(p.hooks).nonEmpty then
+            activeConditioning.withSampleArgs(VulkanConditioning.sampleArgs(p.copy(hooks = p.hooks - VulkanIncantations.id)))
+          else activeConditioning
         val detailed = facePasses.foldLeft(scaled) { (canvas,config) =>
           val models = Path.of(model.path).toAbsolutePath.getParent
           sdfx.vulkan.tools.VulkanADetailer(backend,device.id(),Option(models.getParent).getOrElse(models),canvas,config,p,activePrompt,seed,
@@ -752,7 +760,7 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
             (pos,neg,w,h,steps,cfg,sampler,regionSeed,opts) => cdFollowup(w, h) match
               case None =>
                 backend.generate(pos,neg,w,h,steps,cfg,regionSeed,samplers.getOrElse(sampler,unsupported(s"ADetailer sampler $sampler")),
-                  schedulers(gen.scheduler),p.clipSkip,opts,activeConditioning,progress(Some("adetailer")))
+                  schedulers(gen.scheduler),p.clipSkip,opts,faceConditioning,progress(Some("adetailer")))
               case Some(tuner) =>
                 val params = p.copy(prompt = pos, negativePrompt = neg, width = w, height = h, steps = steps,
                   cfgScale = cfg, samplerName = sampler, hires = p.hires.copy(enabled = false),
