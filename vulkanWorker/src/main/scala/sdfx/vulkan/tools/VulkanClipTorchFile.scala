@@ -70,7 +70,7 @@ private[vulkan] object VulkanClipTorchFile:
         case single => tensor(single) -> None
     }
 
-  def write(path: Path, cond: Tensor, pooled: Option[Tensor]): Unit =
+  def write(path: Path, cond: Tensor, pooled: Option[Tensor], tokens: Vector[String]): Unit =
     val payload = new ByteArrayOutputStream()
     val pickle = new DataOutputStream(payload)
     def ascii(text: String): Unit = pickle.writeBytes(text)
@@ -110,7 +110,12 @@ private[vulkan] object VulkanClipTorchFile:
         text("pooled")
         tensor(value, "1")
         text("tokens")
-        ascii("]u")
+        ascii("]")
+        if tokens.nonEmpty then
+          ascii("(")
+          tokens.foreach(text)
+          ascii("e")
+        ascii("u")
     ascii(".")
 
     Using.resource(new ZipOutputStream(Files.newOutputStream(path))) { zip =>

@@ -1,0 +1,218 @@
+diff --git a/src/conditioning/conditioner.hpp b/src/conditioning/conditioner.hpp
+--- a/src/conditioning/conditioner.hpp
++++ b/src/conditioning/conditioner.hpp
+@@ -103,7 +103,8 @@
+ };
+ 
+ static inline sd::Tensor<float> apply_token_weights(sd::Tensor<float> hidden_states,
+-                                                    const std::vector<float>& weights) {
++                                                    const std::vector<float>& weights,
++                                                    bool normalize = true) {
+     if (hidden_states.empty()) {
+         return hidden_states;
+     }
+@@ -125,13 +126,14 @@
+ 
+     GGML_ASSERT(static_cast<size_t>(hidden_states.shape()[1]) == weights.size());
+ 
+-    float original_mean = hidden_states.mean();
++    const float original_mean = normalize ? hidden_states.mean() : 0.0f;
+     auto chunk_weights  = sd::Tensor<float>::from_vector(weights);
+     chunk_weights.reshape_({1, static_cast<int64_t>(weights.size())});
+     hidden_states *= chunk_weights;
+-    float new_mean = hidden_states.mean();
+-    if (std::isfinite(original_mean) && std::isfinite(new_mean) && new_mean != 0.0f) {
+-        hidden_states *= (original_mean / new_mean);
++    if (normalize) {
++        const float new_mean = hidden_states.mean();
++        if (std::isfinite(original_mean) && std::isfinite(new_mean) && new_mean != 0.0f)
++            hidden_states *= (original_mean / new_mean);
+     }
+ 
+     return hidden_states;
+@@ -148,6 +150,9 @@
+     const std::vector<MiniMaxH3PresentationItem>* minimax_h3_references = nullptr;
+     std::optional<std::string> system_prompt;
+     bool raw = false;
++    bool clip_ignore_emphasis = false;
++    bool clip_bypass_normalization = false;
++    bool clip_no_special_tokens = false;
+     std::shared_ptr<sd::TextualInversion> textual_inversion;
+ };
+ 
+@@ -468,7 +473,9 @@
+                                              int width,
+                                              int height,
+                                              bool zero_out_masked                  = false,
+-                                             const sd::TextualInversion* inversion = nullptr) {
++                                             const sd::TextualInversion* inversion = nullptr,
++                                             bool normalize = true,
++                                             bool no_special_tokens = false) {
+         int64_t t0 = ggml_time_ms();
+         sd::Tensor<float> hidden_states;  // [n_token, hidden_size] or [n_token, hidden_size + hidden_size2]
+         sd::Tensor<float> pooled;
+@@ -481,8 +488,21 @@
+             std::vector<float> chunk_weights(weights.begin() + chunk_idx * chunk_len,
+                                              weights.begin() + (chunk_idx + 1) * chunk_len);
+ 
+-            sd::Tensor<int32_t> input_ids({static_cast<int64_t>(chunk_tokens.size())}, chunk_tokens);
++            size_t content_tokens = chunk_len;
++            auto hidden_tokens = chunk_tokens;
++            if (no_special_tokens) {
++                const auto first = std::next(chunk_tokens.begin());
++                const auto last = std::find(first, chunk_tokens.end(), tokenizer->EOS_TOKEN_ID);
++                content_tokens = static_cast<size_t>(std::distance(first, last));
++                if (content_tokens == 0 && !sd_version_is_sdxl(version))
++                    continue;
++                std::copy(first, last, hidden_tokens.begin());
++                std::fill(hidden_tokens.begin() + content_tokens, hidden_tokens.end(), tokenizer->EOS_TOKEN_ID);
++                chunk_weights = std::vector<float>(chunk_weights.begin() + 1, chunk_weights.begin() + 1 + content_tokens);
++            }
++            sd::Tensor<int32_t> input_ids({static_cast<int64_t>(chunk_tokens.size())}, hidden_tokens);
+             sd::Tensor<int32_t> input_ids2;
++            sd::Tensor<int32_t> pooled_input_ids;
+             size_t max_token_idx = 0;
+             if (sd_version_is_sdxl(version)) {
+                 auto it = std::find(chunk_tokens.begin(), chunk_tokens.end(), tokenizer->EOS_TOKEN_ID);
+@@ -492,7 +512,13 @@
+ 
+                 max_token_idx = std::min<size_t>(std::distance(chunk_tokens.begin(), it), chunk_tokens.size() - 1);
+ 
+-                input_ids2 = sd::Tensor<int32_t>({static_cast<int64_t>(chunk_tokens.size())}, chunk_tokens);
++                pooled_input_ids = sd::Tensor<int32_t>({static_cast<int64_t>(chunk_tokens.size())}, chunk_tokens);
++                if (no_special_tokens) {
++                    std::fill(hidden_tokens.begin() + content_tokens, hidden_tokens.end(), 0);
++                    input_ids2 = sd::Tensor<int32_t>({static_cast<int64_t>(hidden_tokens.size())}, hidden_tokens);
++                } else {
++                    input_ids2 = pooled_input_ids;
++                }
+ 
+                 // for (int i = 0; i < chunk_tokens.size(); i++) {
+                 //     printf("%d ", chunk_tokens[i]);
+@@ -526,11 +552,15 @@
+                     if (chunk_hidden_states2.empty()) {
+                         return {};
+                     }
++                    if (no_special_tokens && content_tokens > 0) {
++                        chunk_hidden_states = apply_token_weights(sd::ops::slice(chunk_hidden_states, 1, 0, content_tokens), chunk_weights, normalize);
++                        chunk_hidden_states2 = apply_token_weights(sd::ops::slice(chunk_hidden_states2, 1, 0, content_tokens), chunk_weights, normalize);
++                    }
+                     chunk_hidden_states = sd::ops::concat(chunk_hidden_states, chunk_hidden_states2, 0);
+ 
+                     if (chunk_idx == 0) {
+                         pooled = text_model2->compute(n_threads,
+-                                                      input_ids2,
++                                                      pooled_input_ids,
+                                                       num_custom_embeddings,
+                                                       token_embed_custom2.data(),
+                                                       max_token_idx,
+@@ -546,7 +576,13 @@
+                 int64_t t1 = ggml_time_ms();
+                 LOG_VERBOSE("computing condition graph completed, taking %" PRId64 " ms", t1 - t0);
+ 
+-                chunk_hidden_states = apply_token_weights(std::move(chunk_hidden_states), chunk_weights);
++                if (content_tokens == 0)
++                    continue;
++                if (!no_special_tokens || !sd_version_is_sdxl(version)) {
++                    if (no_special_tokens)
++                        chunk_hidden_states = sd::ops::slice(chunk_hidden_states, 1, 0, content_tokens);
++                    chunk_hidden_states = apply_token_weights(std::move(chunk_hidden_states), chunk_weights, normalize);
++                }
+ 
+                 if (zero_out_masked) {
+                     chunk_hidden_states.fill_(0.0f);
+@@ -559,6 +595,8 @@
+             }
+         }
+ 
++        if (hidden_states.empty())
++            return {};
+         sd::Tensor<float> vec;
+         if (sd_version_is_sdxl(version)) {
+             int out_dim         = 256;
+@@ -605,13 +643,17 @@
+         }
+         std::vector<int>& tokens    = tokens_and_weights.first;
+         std::vector<float>& weights = tokens_and_weights.second;
++        if (conditioner_params.clip_ignore_emphasis)
++            std::fill(weights.begin(), weights.end(), 1.0f);
+         return get_learned_condition_common(n_threads,
+                                             tokens,
+                                             weights,
+                                             conditioner_params.clip_skip,
+                                             conditioner_params.width,
+                                             conditioner_params.height,
+-                                            conditioner_params.zero_out_masked, inversion);
++                                            conditioner_params.zero_out_masked, inversion,
++                                            !conditioner_params.clip_bypass_normalization,
++                                            conditioner_params.clip_no_special_tokens);
+     }
+ };
+ 
+diff --git a/src/conditioning/conditioning_cache.h b/src/conditioning/conditioning_cache.h
+--- a/src/conditioning/conditioning_cache.h
++++ b/src/conditioning/conditioning_cache.h
+@@ -59,7 +59,8 @@
+ 
+     static bool same_params(const ConditionerParams& a, const ConditionerParams& b) {
+         const auto fields = [](const ConditionerParams& p) {
+-            return std::tie(p.text, p.system_prompt, p.raw, p.clip_skip, p.width, p.height, p.zero_out_masked);
++            return std::tie(p.text, p.system_prompt, p.raw, p.clip_skip, p.width, p.height, p.zero_out_masked,
++                            p.clip_ignore_emphasis, p.clip_bypass_normalization, p.clip_no_special_tokens);
+         };
+         if (fields(a) != fields(b) ||
+             !same_textual_inversion(a.textual_inversion, b.textual_inversion) ||
+diff --git a/src/dgl/ops/prompt.h b/src/dgl/ops/prompt.h
+--- a/src/dgl/ops/prompt.h
++++ b/src/dgl/ops/prompt.h
+@@ -25,6 +25,9 @@
+         int height    = 512;
+         int clip_skip = -1;
+         bool raw      = false;
++        bool clip_ignore_emphasis = false;
++        bool clip_bypass_normalization = false;
++        bool clip_no_special_tokens = false;
+         std::optional<std::string> system;
+         std::optional<std::vector<PromptMedia>> media;
+         // An empty tensor means the image has no host binding and should be read from its path.
+diff --git a/src/dgl/ops/prompt.cpp b/src/dgl/ops/prompt.cpp
+--- a/src/dgl/ops/prompt.cpp
++++ b/src/dgl/ops/prompt.cpp
+@@ -98,6 +98,9 @@
+         params.height        = options.height;
+         params.clip_skip     = options.clip_skip;
+         params.raw           = options.raw;
++        params.clip_ignore_emphasis = options.clip_ignore_emphasis;
++        params.clip_bypass_normalization = options.clip_bypass_normalization;
++        params.clip_no_special_tokens = options.clip_no_special_tokens;
+         params.system_prompt = options.system;
+         if (!images.empty())
+             params.ref_images = &images;
+diff --git a/src/dgl/bindings/components.cpp b/src/dgl/bindings/components.cpp
+--- a/src/dgl/bindings/components.cpp
++++ b/src/dgl/bindings/components.cpp
+@@ -78,6 +78,9 @@
+         options.height    = int(get_int(args, "height"));
+         options.clip_skip = int(get_int(args, "clip_skip"));
+         options.raw       = get_bool(args, "raw");
++        options.clip_ignore_emphasis = get_bool(args, "clip_ignore_emphasis");
++        options.clip_bypass_normalization = get_bool(args, "clip_bypass_normalization");
++        options.clip_no_special_tokens = get_bool(args, "clip_no_special_tokens");
+         if (args.count("system"))
+             options.system = get_string(args, "system");
+         if (options.raw && (args.count("media") || args.count("image_bindings")))
+diff --git a/src/dgl/bindings/registration.cpp b/src/dgl/bindings/registration.cpp
+--- a/src/dgl/bindings/registration.cpp
++++ b/src/dgl/bindings/registration.cpp
+@@ -475,7 +475,10 @@
+             {required("encoder", Kind::TextEncoder), required("text", Kind::String),
+              integer("width", 1, 16384, 512), integer("height", 1, 16384, 512),
+              integer("clip_skip", INT32_MIN, INT32_MAX, -1), optional("system", Kind::String),
+-             optional("media", Kind::List), optional("image_bindings", Kind::Dict), optional("raw", Kind::Boolean, false)},
++             optional("media", Kind::List), optional("image_bindings", Kind::Dict), optional("raw", Kind::Boolean, false),
++             optional("clip_ignore_emphasis", Kind::Boolean, false),
++             optional("clip_bypass_normalization", Kind::Boolean, false),
++             optional("clip_no_special_tokens", Kind::Boolean, false)},
+             condition_signature(),
+             encode_prompt);
+         OutputSignature zeroed_condition{Kind::Dict};

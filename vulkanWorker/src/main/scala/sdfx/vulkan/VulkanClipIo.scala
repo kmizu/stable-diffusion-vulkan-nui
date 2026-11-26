@@ -7,13 +7,14 @@ import java.util.Locale
 import scala.jdk.CollectionConverters.*
 import scala.util.Using
 import sdfx.core.model.Csv
-import sdfx.vulkan.tools.VulkanClipTorchFile
+import sdfx.vulkan.tools.{ClipFastTokenizer, VulkanClipTorchFile}
 import ujson.Value
 
 private[vulkan] object VulkanClipIo:
   val id = "clip_io"
   private val Limit = 256L * 1024 * 1024
   private val MaxTokens = 64 * 77
+  private lazy val tokenVocabulary = ClipFastTokenizer.loadBundled()
   private def invalid(detail: String): Nothing = VulkanProtocol.invalid(s"Clip I/O: $detail")
   private def quoted(s: String): String = ujson.write(ujson.Str(s))
 
@@ -99,7 +100,7 @@ private[vulkan] object VulkanClipIo:
 
   private enum Piece:
     case File(name: String)
-    case Prompt(text: String, clipSkip: Option[Int] = None)
+    case Prompt(text: String, clipSkip: Option[Int] = None, noPadding: Boolean = false)
     case Eval(order: Int, expression: VulkanClipEval.Expression)
 
   private def quotedEnd(value: String, start: Int): (Int, Int) =
@@ -159,8 +160,7 @@ private[vulkan] object VulkanClipIo:
     }
     if prompts.isEmpty || skips.isEmpty || padding.isEmpty then invalid("?prompt lists cannot be empty")
     prompts.zipWithIndex.map { (text, index) =>
-      if padding(index.min(padding.size - 1)) then VulkanProtocol.unsupported("Clip I/O prompt encoding without padding")
-      Piece.Prompt(text, Some(skips(index.min(skips.size - 1))))
+      Piece.Prompt(text, Some(skips(index.min(skips.size - 1))), padding(index.min(padding.size - 1)))
     }
 
   private val Directive = """\?([a-zA-Z][a-zA-Z0-9]*?)(?:_(-?\d+))?\(""".r
@@ -210,7 +210,8 @@ private[vulkan] object VulkanClipIo:
       Files.deleteIfExists(scratch)
 
   final class Session private[VulkanClipIo](config: Value, width: Int, scratch: Path):
-    private val exports = Vector.newBuilder[(Path, Option[Path], Path)]
+    private case class Export(source: Path, pooled: Option[Path], tokenIds: Option[Path], destination: Path)
+    private val exports = Vector.newBuilder[Export]
     private val root = Files.createDirectories(directory).toRealPath()
     private var serial = 0
     private def flag(key: String): Boolean = config.obj.get(key).exists(_.bool)
@@ -244,9 +245,12 @@ private[vulkan] object VulkanClipIo:
       val inputMode = if !flag("input_enabled") then "off"
         else mode(if positive then "positive_mode" else "negative_mode", if positive then "simple" else "off")
       val outputName = option(if positive then "output_name" else "negative_output_name")
-      def encode(text: String, clipSkip: Option[Int] = None): String =
+      def encode(text: String, clipSkip: Option[Int] = None, clipOptions: Seq[String] = Nil): String =
+        if clipOptions.nonEmpty && !engine.supportsClipIoEncodingOptions() then
+          VulkanProtocol.unsupported("Clip I/O custom encoding with this native runtime")
         val options = clipSkip.fold(encoding)(skip => encoding.replaceFirst("clip_skip = \\d+$", s"clip_skip = $skip"))
-        s"encode_prompt($encoder, ${quoted(text)}, $options)"
+        val args = (options +: clipOptions.map(option => s"clip_$option = true")).mkString(", ")
+        s"encode_prompt($encoder, ${quoted(text)}, $args)"
       val condition = s"clip_${label}_base"
       lines += s"$condition = ${encode(if inputMode == "off" then prompt else "")}"
       if flag("output_enabled") && outputName.nonEmpty then
@@ -255,12 +259,15 @@ private[vulkan] object VulkanClipIo:
         val filename = if outputName.toLowerCase(Locale.ROOT).matches(".*\\.(csv|pt)$") then outputName else s"$outputName.$format"
         val destination = target(filename)
         if !Files.exists(destination) || flag("overwrite") then
-          if Seq("no_special_tokens","ignore_emphasis","bypass_normalization","token_strings").exists(flag) then
-            VulkanProtocol.unsupported("Clip I/O custom token or normalization export")
+          val includeTokens = flag("token_strings")
+          if includeTokens && !engine.supportsClipIoTokenStrings() then
+            VulkanProtocol.unsupported("Clip I/O token strings with this native runtime")
           val path = scratch.resolve(s"output-$label.npy")
-          val original = if inputMode == "off" then condition else
+          val outputOptions = Seq("no_special_tokens", "ignore_emphasis", "bypass_normalization").filter(flag) ++
+            Option.when(includeTokens)("return_tokens")
+          val original = if inputMode == "off" && outputOptions.isEmpty then condition else
             val variable = s"clip_${label}_original"
-            lines += s"$variable = ${encode(prompt)}"
+            lines += s"$variable = ${encode(prompt, clipOptions = outputOptions)}"
             variable
           lines += s"tensor::save(${quoted(path.toString)}, $original.crossattn)"
           val pooled = Option.when(width == 2048 && filename.toLowerCase(Locale.ROOT).endsWith(".pt")) {
@@ -270,7 +277,13 @@ private[vulkan] object VulkanClipIo:
             lines += s"tensor::save(${quoted(pooledPath.toString)}, tensor::reshape(${label}_pool,[1280,1]))"
             pooledPath
           }
-          exports += ((path, pooled, destination))
+          val tokenIds = Option.when(includeTokens) {
+            val target = scratch.resolve(s"tokens-$label.npy")
+            lines += s"""${label}_ids_f32 = tensor::cast($original.clip_ids, dtype = "f32")"""
+            lines += s"tensor::save(${quoted(target.toString)}, tensor::reshape(${label}_ids_f32,[1,tensor::numel(${label}_ids_f32)]))"
+            target
+          }
+          exports += Export(path, pooled, tokenIds, destination)
       if inputMode == "off" then lines += s"latent_$label = $condition"
       else
         val parsed = pieces(prompt, inputMode == "directive")
@@ -287,8 +300,9 @@ private[vulkan] object VulkanClipIo:
         val tensors = inputs.zipWithIndex.map { (piece, index) =>
           val name = s"clip_${label}_$index"
           piece match
-            case Piece.Prompt(text, skip) =>
-              pieceLines += s"${name}_encoded = ${encode(text, skip)}"
+            case Piece.Prompt(text, skip, noPadding) =>
+              val options = Option.when(noPadding)("no_special_tokens").toSeq
+              pieceLines += s"${name}_encoded = ${encode(text, skip, options)}"
               val encoded = s"${name}_encoded.crossattn"
               pieceLines += s"$name = tensor::reshape($encoded,[$width,tensor::shape($encoded)[1]])"
               if width == 2048 && pooled.isEmpty then
@@ -351,8 +365,16 @@ private[vulkan] object VulkanClipIo:
         lines += s"latent_$label = {crossattn = $cross$vector}"
 
     def publish(): Unit =
-      for (source, pooled, destination) <- exports.result() do
+      for Export(source, pooled, tokenIds, destination) <- exports.result() do
         val matrix = readNpy(source, width)
+        val tokens = tokenIds.fold(Vector.empty[String]) { file =>
+          val ids = readNpy(file,1).values
+          if ids.length != matrix.tokens then invalid("token string count differs from conditioning rows")
+          ids.toVector.map { id =>
+            if !id.isWhole || id < 0 || id >= tokenVocabulary.baseVocabSize then invalid("CLIP token has no vocabulary entry")
+            tokenVocabulary.inspectionPiece(id.toLong)._1
+          }
+        }
         val output = target(root.relativize(destination).toString)
         Files.createDirectories(output.getParent)
         val temporary = Files.createTempFile(output.getParent, ".sdv-clip-", ".tmp")
@@ -362,12 +384,19 @@ private[vulkan] object VulkanClipIo:
               val data = readNpy(path, 1280)
               VulkanClipTorchFile.Tensor(Vector(data.tokens,data.width), data.values)
             }
-            VulkanClipTorchFile.write(temporary, VulkanClipTorchFile.Tensor(Vector(matrix.tokens, matrix.width), matrix.values), pool)
+            VulkanClipTorchFile.write(temporary, VulkanClipTorchFile.Tensor(Vector(matrix.tokens, matrix.width), matrix.values), pool, tokens)
           else Using.resource(Files.newBufferedWriter(temporary, UTF_8)) { writer =>
             val transpose = flag("transpose")
+            def tokenCell(value: String): String = Csv.escape(if value.toDoubleOption.nonEmpty then "'" + value else value)
             val rowCount = if transpose then matrix.width else matrix.tokens
             val colCount = if transpose then matrix.tokens else matrix.width
+            if transpose && tokens.nonEmpty then
+              writer.write(tokens.map(tokenCell).mkString(","))
+              writer.newLine()
             for row <- 0 until rowCount do
+              if !transpose && tokens.nonEmpty then
+                writer.write(tokenCell(tokens(row)))
+                writer.write(",")
               for col <- 0 until colCount do
                 if col > 0 then writer.write(",")
                 val index = if transpose then col * matrix.width + row else row * matrix.width + col

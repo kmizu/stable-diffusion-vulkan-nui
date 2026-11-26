@@ -1,0 +1,142 @@
+diff --git a/src/conditioning/conditioner.hpp b/src/conditioning/conditioner.hpp
+--- a/src/conditioning/conditioner.hpp
++++ b/src/conditioning/conditioner.hpp
+@@ -34,6 +34,7 @@
+     sd::Tensor<float> c_crossattn;
+     sd::Tensor<float> c_vector;
+     sd::Tensor<float> c_concat;
++    sd::Tensor<int32_t> c_clip_ids;
+     sd::Tensor<int32_t> c_t5_ids;
+     sd::Tensor<float> c_t5_weights;
+     sd::Tensor<int32_t> c_input_ids;
+@@ -153,6 +154,7 @@
+     bool clip_ignore_emphasis = false;
+     bool clip_bypass_normalization = false;
+     bool clip_no_special_tokens = false;
++    bool clip_return_tokens = false;
+     std::shared_ptr<sd::TextualInversion> textual_inversion;
+ };
+ 
+@@ -475,8 +477,10 @@
+                                              bool zero_out_masked                  = false,
+                                              const sd::TextualInversion* inversion = nullptr,
+                                              bool normalize = true,
+-                                             bool no_special_tokens = false) {
++                                             bool no_special_tokens = false,
++                                             bool return_tokens = false) {
+         int64_t t0 = ggml_time_ms();
++        std::vector<int32_t> output_token_ids;
+         sd::Tensor<float> hidden_states;  // [n_token, hidden_size] or [n_token, hidden_size + hidden_size2]
+         sd::Tensor<float> pooled;
+ 
+@@ -492,7 +496,9 @@
+             auto hidden_tokens = chunk_tokens;
+             if (no_special_tokens) {
+                 const auto first = std::next(chunk_tokens.begin());
+-                const auto last = std::find(first, chunk_tokens.end(), tokenizer->EOS_TOKEN_ID);
++                auto last = std::prev(chunk_tokens.end());
++                while (last > first && *std::prev(last) == tokenizer->EOS_TOKEN_ID)
++                    --last;
+                 content_tokens = static_cast<size_t>(std::distance(first, last));
+                 if (content_tokens == 0 && !sd_version_is_sdxl(version))
+                     continue;
+@@ -578,6 +584,10 @@
+ 
+                 if (content_tokens == 0)
+                     continue;
++                if (return_tokens) {
++                    const auto& encoded_tokens = no_special_tokens ? hidden_tokens : chunk_tokens;
++                    output_token_ids.insert(output_token_ids.end(), encoded_tokens.begin(), encoded_tokens.begin() + content_tokens);
++                }
+                 if (!no_special_tokens || !sd_version_is_sdxl(version)) {
+                     if (no_special_tokens)
+                         chunk_hidden_states = sd::ops::slice(chunk_hidden_states, 1, 0, content_tokens);
+@@ -624,6 +634,8 @@
+         if (!hidden_states.empty()) {
+             result.c_crossattn = std::move(hidden_states);
+         }
++        if (return_tokens)
++            result.c_clip_ids = sd::Tensor<int32_t>::from_vector(std::move(output_token_ids));
+ 
+         if (!vec.empty()) {
+             result.c_vector = std::move(vec);
+@@ -653,7 +665,8 @@
+                                             conditioner_params.height,
+                                             conditioner_params.zero_out_masked, inversion,
+                                             !conditioner_params.clip_bypass_normalization,
+-                                            conditioner_params.clip_no_special_tokens);
++                                            conditioner_params.clip_no_special_tokens,
++                                            conditioner_params.clip_return_tokens);
+     }
+ };
+ 
+diff --git a/src/conditioning/conditioning_cache.h b/src/conditioning/conditioning_cache.h
+--- a/src/conditioning/conditioning_cache.h
++++ b/src/conditioning/conditioning_cache.h
+@@ -60,7 +60,8 @@
+     static bool same_params(const ConditionerParams& a, const ConditionerParams& b) {
+         const auto fields = [](const ConditionerParams& p) {
+             return std::tie(p.text, p.system_prompt, p.raw, p.clip_skip, p.width, p.height, p.zero_out_masked,
+-                            p.clip_ignore_emphasis, p.clip_bypass_normalization, p.clip_no_special_tokens);
++                            p.clip_ignore_emphasis, p.clip_bypass_normalization, p.clip_no_special_tokens,
++                            p.clip_return_tokens);
+         };
+         if (fields(a) != fields(b) ||
+             !same_textual_inversion(a.textual_inversion, b.textual_inversion) ||
+diff --git a/src/dgl/ops/prompt.h b/src/dgl/ops/prompt.h
+--- a/src/dgl/ops/prompt.h
++++ b/src/dgl/ops/prompt.h
+@@ -28,6 +28,7 @@
+         bool clip_ignore_emphasis = false;
+         bool clip_bypass_normalization = false;
+         bool clip_no_special_tokens = false;
++        bool clip_return_tokens = false;
+         std::optional<std::string> system;
+         std::optional<std::vector<PromptMedia>> media;
+         // An empty tensor means the image has no host binding and should be read from its path.
+diff --git a/src/dgl/ops/prompt.cpp b/src/dgl/ops/prompt.cpp
+--- a/src/dgl/ops/prompt.cpp
++++ b/src/dgl/ops/prompt.cpp
+@@ -101,6 +101,7 @@
+         params.clip_ignore_emphasis = options.clip_ignore_emphasis;
+         params.clip_bypass_normalization = options.clip_bypass_normalization;
+         params.clip_no_special_tokens = options.clip_no_special_tokens;
++        params.clip_return_tokens = options.clip_return_tokens;
+         params.system_prompt = options.system;
+         if (!images.empty())
+             params.ref_images = &images;
+diff --git a/src/dgl/bindings/components.cpp b/src/dgl/bindings/components.cpp
+--- a/src/dgl/bindings/components.cpp
++++ b/src/dgl/bindings/components.cpp
+@@ -81,6 +81,7 @@
+         options.clip_ignore_emphasis = get_bool(args, "clip_ignore_emphasis");
+         options.clip_bypass_normalization = get_bool(args, "clip_bypass_normalization");
+         options.clip_no_special_tokens = get_bool(args, "clip_no_special_tokens");
++        options.clip_return_tokens = get_bool(args, "clip_return_tokens");
+         if (args.count("system"))
+             options.system = get_string(args, "system");
+         if (options.raw && (args.count("media") || args.count("image_bindings")))
+diff --git a/src/dgl/bindings/registration.cpp b/src/dgl/bindings/registration.cpp
+--- a/src/dgl/bindings/registration.cpp
++++ b/src/dgl/bindings/registration.cpp
+@@ -478,7 +478,8 @@
+              optional("media", Kind::List), optional("image_bindings", Kind::Dict), optional("raw", Kind::Boolean, false),
+              optional("clip_ignore_emphasis", Kind::Boolean, false),
+              optional("clip_bypass_normalization", Kind::Boolean, false),
+-             optional("clip_no_special_tokens", Kind::Boolean, false)},
++             optional("clip_no_special_tokens", Kind::Boolean, false),
++             optional("clip_return_tokens", Kind::Boolean, false)},
+             condition_signature(),
+             encode_prompt);
+         OutputSignature zeroed_condition{Kind::Dict};
+diff --git a/src/dgl/bindings/condition.cpp b/src/dgl/bindings/condition.cpp
+--- a/src/dgl/bindings/condition.cpp
++++ b/src/dgl/bindings/condition.cpp
+@@ -198,6 +198,7 @@
+ 
+     static const ConditionField condition_fields[] = {
+         tensor_field<&SDCondition::c_crossattn>("crossattn"),
++        tensor_field<&SDCondition::c_clip_ids>("clip_ids"),
+         tensor_field<&SDCondition::c_vector>("vector"),
+         tensor_field<&SDCondition::c_concat>("concat"),
+         tensor_field<&SDCondition::c_t5_ids>("t5_ids"),
