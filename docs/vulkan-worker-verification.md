@@ -3,6 +3,10 @@
 
 
 
+## Windows v0.42
+
+The ZIP SHA-256 is `41847f4897f95d97fa9dd6fd9eb3bc2cfae74ac7724c01919d92714134b8cecc`. The packaged executable ran MultiDiffusion through the MCP `img2img` tool with 320 × 320 tiles, 64 px overlap, and Gaussian blending. SD1.5 completed at 512 × 512 on Radeon 780M, and SDXL completed at 768 × 768 on RTX 3090 from a fresh ZIP extraction. Both runs used a system-only PATH and reported `cuda=false`.
+
 ## Windows v0.41
 
 The ZIP SHA-256 is `e1facd1ce694e230076b37a1fcea8ed64bedc1197b92e507a23db757f670dc4c`. The Windows executable ran the Weight Gradient hook through the MCP `img2img` tool using the bundled Vulkan DLL and JDK 25 with a system-only PATH. The staged package completed an SD1.5 run on Radeon 780M at 512 × 512. The executable from a fresh ZIP extraction completed an SDXL run on RTX 3090 at 768 × 768. Both workers reported `cuda=false`.
