@@ -87,7 +87,7 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
 
   private def hello = Obj("protocol" -> 1, "engine_version" -> "vulkan-sd.cpp-f296cb0", "cuda" -> false,
     "dry_run" -> false, "device" -> display(device), "vulkan_devices" -> Arr.from(adapters.map(display)),
-    "features" -> Arr.from(Vector("txt2img", "aesthetic_embedding", "aesthetic_score", "lora", "embeddings", "external_vae", "controlnet", "img2img", "animatediff", "animatediff_encode", "photomaker", "inpaint", "hires_fix", "img2img_hires_fix", "temporal_lab", "vae_tools", "list_devices", "system_info", "vram_estimator", "prevent_interrupt") ++ VulkanTools.features ++
+    "features" -> Arr.from(Vector("txt2img", "aesthetic_embedding", "aesthetic_score", "lora", "embeddings", "external_vae", "controlnet", "img2img", "animatediff", "animatediff_encode", "photomaker", "inpaint", "hires_fix", "img2img_hires_fix", "temporal_lab", "vae_tools", "list_devices", "system_info", "vram_estimator", "prevent_interrupt", VulkanClipIo.id) ++ VulkanTools.features ++
       (if backend.supportsUnetHooks() then VulkanUnetHooks.attentionHooks.toVector.sorted else Vector.empty) ++
       (if backend.supportsUnetResize() then VulkanUnetHooks.resizeHooks.toVector.sorted else Vector.empty) ++
       Option.when(backend.supportsDynamicThreshold())("dynamic_thresholding") ++

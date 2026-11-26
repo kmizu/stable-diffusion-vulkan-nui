@@ -20,6 +20,10 @@ public final class TorchYoloPickle {
     private final Object mark = new Object();
     private final ByteBuffer data;
     private TorchYoloPickle(byte[] bytes) { data = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN); }
+    /** Interprets the tensor descriptors used by torch.save without constructing Python objects. */
+    public static Object tensorPayload(byte[] data) {
+        return new TorchYoloPickle(data).read();
+    }
     public static Module model(byte[] data) {
         Map<Object,Object> root = map(new TorchYoloPickle(data).read());
         Object m = root.get("ema") instanceof Module ? root.get("ema") : root.get("model");
