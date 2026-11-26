@@ -198,7 +198,7 @@ if ($VulkanOnly) {
     }
     $workerModules = if ($IncludeVulkanCustomCode) { 'ALL-MODULE-PATH' } else { 'java.base,java.desktop,java.net.http,jdk.management,jdk.unsupported' }
     Copy-Item -LiteralPath $VulkanWorkerJar -Destination (Join-Path $nativeRoot 'vulkan-worker.jar')
-    & (Join-Path $JdkHome 'bin/jlink.exe') --add-modules $workerModules --strip-debug --no-header-files --no-man-pages --output (Join-Path $nativeRoot 'jre')
+    & (Join-Path $JdkHome 'bin/jlink.exe') --module-path (Join-Path $JdkHome 'jmods') --add-modules $workerModules --strip-debug --no-header-files --no-man-pages --output (Join-Path $nativeRoot 'jre')
     if ($LASTEXITCODE -ne 0) { throw 'Failed to link the Vulkan worker runtime.' }
 }
 if ($workerDistribution) {

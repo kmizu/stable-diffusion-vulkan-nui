@@ -1,5 +1,24 @@
 # Windows Vulkan inference verification — 2026-11-26
 
+
+
+## Windows v0.38
+
+The v0.38 package includes the patched Vulkan DLL, JVM script runtime and the optional WD, character search and BLIP base models. Its ZIP SHA-256 is `e412150bfe62ce744bf0874b87cd6c27a67366f9fa7b11687b89b7514586c217`.
+
+The staged executable ran img2img on Radeon 780M with SD1.5 at 512 x 512 and SDXL at 768 x 768 using the bundled Vulkan DLL and JDK 25. The MCP worker advertised Dynamic Thresholding, Deep Shrink, Token Downsampling, SVD, Chara Searcher and NSFW Checker. A script executed on the bundled JVM and returned the expected result with a system-only PATH.
+
+## GPU comparison using the same packaged EXE
+
+SDV-NUI v0.37 ran a single img2img job on each adapter with the same input PNG, three Euler steps, Karras scheduling, and seed 12345. The host had other applications running. The measurements are single runs.
+
+| Checkpoint and size | Radeon 780M generation | RTX 3090 generation | Radeon 780M end to end | RTX 3090 end to end |
+| --- | ---: | ---: | ---: | ---: |
+| animekawa_v10, 512 x 512 | 42.77 s | 3.72 s | 60.80 s | 10.16 s |
+| animaPencilXL_v500, 768 x 768 | 75.40 s | 10.07 s | 100.26 s | 22.35 s |
+
+End-to-end times include process startup, model selection, generation and shutdown of the MCP connection.
+
 ## v0.34 Vulkan port
 
 The extracted `SDV-NUI.exe` completed real img2img jobs over MCP on the Radeon 780M with SD1.5 at 512 × 512 and SDXL at 768 × 768. Each run used the same PNG source, three Euler steps, Karras scheduling and seed 12345. End-to-end times including worker startup, checkpoint loading and output were 28 and 77 seconds. Both runs used a system-only PATH and the bundled Java and inference runtimes. The ZIP tested here had SHA-256 `ddd5b4df7d4244f623a2fc8176a77b36e111a890c1e40017ace7eb763fa1c52d`.
