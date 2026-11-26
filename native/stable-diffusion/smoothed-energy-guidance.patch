@@ -1,0 +1,175 @@
+--- a/src/dgl/bindings/predictor.cpp
++++ b/src/dgl/bindings/predictor.cpp
+@@ -111,6 +111,11 @@
+         hooks.scale_depth = get_bool(args,"hypertile_scale_depth");
+         hooks.tile_seed = uint32_t(get_int(args,"hypertile_seed"));
+         hooks.pag_regions = int(get_int(args,"pag_regions"));
++        hooks.seg_blur = get_number(args, "seg_blur");
++        hooks.seg_start = int(get_int(args, "seg_start"));
++        hooks.seg_end = int(get_int(args, "seg_end"));
++        hooks.seg_width = int(get_int(args, "seg_width"));
++        hooks.seg_height = int(get_int(args, "seg_height"));
+         hooks.token_factor = float(get_number(args,"token_factor"));
+         hooks.token_factor2 = float(get_number(args,"token_factor2"));
+         hooks.token_first_depth = int(get_int(args,"token_depth"));
+--- a/src/dgl/bindings/registration.cpp
++++ b/src/dgl/bindings/registration.cpp
+@@ -642,7 +642,10 @@
+              integer("shrink_down_mode",0,3,2), integer("shrink_up_mode",0,3,2), optional("shrink_after_skip",Kind::Boolean,true),
+              integer("diffusion_tile_width",0,512,0), integer("diffusion_tile_height",0,512,0),
+              integer("diffusion_tile_overlap",0,512,0), optional("gaussian_tile_blending", Kind::Boolean, false),
+-             integer("pag_regions",0,511,0), std::move(transform), optional("transform_args", Kind::Dict)},
++             integer("pag_regions",0,511,0),
++             number("seg_blur",-64,11,0), integer("seg_start",INT_MIN,INT_MAX,0), integer("seg_end",INT_MIN,INT_MAX,150),
++             integer("seg_width",1,INT_MAX,1), integer("seg_height",1,INT_MAX,1),
++             std::move(transform), optional("transform_args", Kind::Dict)},
+             {Kind::Predictor}, make_predictor);
+         const std::vector<Argument> guidance_branches{
+             required("positive", Kind::Predictor), required("negative", Kind::Predictor), number("scale", 0, 1000),
+--- a/src/dgl/ops/predictor.cpp
++++ b/src/dgl/ops/predictor.cpp
+@@ -568,6 +568,7 @@
+                 pos->options.reference_latent || neg->options.reference_latent ||
+                 pos->options.cdt_regions || neg->options.cdt_regions ||
+                 pos->options.unet_hooks.pag_regions != neg->options.unet_hooks.pag_regions ||
++                pos->options.unet_hooks.seg_blur != 0.0 || neg->options.unet_hooks.seg_blur != 0.0 ||
+                 !pos->references.empty() || !neg->references.empty() ||
+                 !pos->condition.c_ref_images.empty() || !neg->condition.c_ref_images.empty())
+                 return;
+--- a/src/model/common/block.hpp
++++ b/src/model/common/block.hpp
+@@ -10,6 +10,7 @@
+ #include "model/common/agent_attention.hpp"
+ #include "model/common/lllite.h"
+ #include "model/common/llul.h"
++#include "model/common/nui_seg.hpp"
+
+ class DownSampleBlock : public GGMLBlock {
+ protected:
+@@ -444,7 +445,7 @@
+             return std::dynamic_pointer_cast<Linear>(blocks["to_out.0"])->forward(ctx,value);
+         }
+         const auto [tw,th] = sd::nui::tile_shape();
+-        if (!tw || x->ne[1] != pass.spatial_w * pass.spatial_h) return forward(ctx,x,sd::nui::subsample_tokens(ctx->ggml_ctx,x));
++        if (!tw || x->ne[1] != pass.spatial_w * pass.spatial_h) return forward(ctx,x,sd::nui::subsample_tokens(ctx->ggml_ctx,x),false,true);
+         x = sd::nui::split_tiles(ctx->ggml_ctx,x,tw,th,false);
+         x = forward(ctx,x,x);
+         return sd::nui::split_tiles(ctx->ggml_ctx,x,tw,th,true);
+@@ -453,7 +454,8 @@
+     ggml_tensor* forward(GGMLRunnerContext* ctx,
+                          ggml_tensor* x,
+                          ggml_tensor* context,
+-                         bool reference_pair = false) {
++                         bool reference_pair = false,
++                         bool self = false) {
+         // x: [N, n_token, query_dim]
+         // context: [N, n_context, context_dim]
+         // return: [N, n_token, query_dim]
+@@ -473,6 +475,8 @@
+         int64_t inner_dim = d_head * n_head;
+
+         auto q = to_q->forward(ctx, sd::nui::lllite_projection(ctx, x, layer_name, "to_q"));
++        if (self)
++            q = sd::nui::smooth_energy_query(ctx, q);
+         if (xtra_dim) {
+             // LOG_VERBOSE("CrossAttention: temp set dim to 1024 for sdxs_09");
+             context->ne[0] = 1024;  // patch dim
+--- /dev/null
++++ b/src/model/common/nui_seg.hpp
+@@ -0,0 +1,77 @@
++#pragma once
++
++#include <algorithm>
++#include <cmath>
++#include <stdexcept>
++
++#include "core/ggml_runner.h"
++#include "model/common/nui_unet_hooks.hpp"
++
++namespace sd::nui {
++    inline ggml_tensor* seg_axis(GGMLRunnerContext* ctx, ggml_tensor* input,
++                                 int64_t length, const std::vector<float>& kernel) {
++        const auto radius = int64_t(kernel.size() / 2);
++        auto* weights = ggml_new_tensor_2d(ctx->ggml_ctx, GGML_TYPE_F32, length, length);
++        auto& matrix = active.seg_weights.emplace_back(length * length, 0.f);
++        for (int64_t output = 0; output < length; ++output) {
++            for (int64_t offset = -radius; offset <= radius; ++offset) {
++                const auto source = output + offset;
++                const auto reflected = source < 0 ? -source : (source >= length ? 2 * length - 2 - source : source);
++                matrix[output * length + reflected] += kernel[offset + radius];
++            }
++        }
++        ctx->bind_backend_tensor_data(weights, matrix.data());
++        return ggml_mul_mat(ctx->ggml_ctx, weights, input);
++    }
++
++    inline ggml_tensor* smooth_energy_query(GGMLRunnerContext* ctx, ggml_tensor* query) {
++        const auto* options = active.options;
++        // The source counts the first two sampling evaluations as step zero.
++        const auto step = active.step > 1 ? int(active.step - 2) : 0;
++        if (!options || options->seg_blur == 0.0 || active.region != 256 ||
++            step < options->seg_start || step > options->seg_end)
++            return query;
++
++        auto* graph = ctx->ggml_ctx;
++        const auto channels = query->ne[0];
++        const auto tokens = query->ne[1];
++        const auto batch = query->ne[2];
++        const auto rows = int64_t(std::sqrt(tokens * (double(options->seg_height) / options->seg_width)));
++        if (rows <= 0 || tokens % rows != 0)
++            throw std::runtime_error("SEG cannot lay out the middle self-attention tokens");
++        if (options->seg_blur > 10.5) {
++            auto* spatial = ggml_cont(graph, ggml_transpose(graph, query));
++            auto* mean = ggml_repeat(graph, ggml_mean(graph, spatial), spatial);
++            return ggml_cont(graph, ggml_transpose(graph, mean));
++        }
++
++        const auto cols = tokens / rows;
++        const auto sigma = std::exp2(options->seg_blur);
++        const auto span = std::min(int64_t(std::ceil(6 * sigma)), cols);
++        const auto size = span + 1 - span % 2;
++        if (size == 1)
++            return query;
++        const auto radius = size / 2;
++        if (radius >= rows || radius >= cols)
++            throw std::runtime_error("SEG Gaussian reflection padding exceeds the middle feature dimensions");
++
++        std::vector<float> kernel(size);
++        double total = 0.0;
++        for (int64_t j = -radius; j <= radius; ++j) {
++            const auto scaled = j / sigma;
++            const auto weight = std::exp(-0.5 * scaled * scaled);
++            kernel[j + radius] = float(weight);
++            total += weight;
++        }
++        for (auto& value : kernel)
++            value = float(value / total);
++
++        auto* grid = ggml_reshape_4d(graph, query, channels, cols, rows, batch);
++        auto* width_first = ggml_cont(graph, ggml_permute(graph, grid, 1, 0, 2, 3));
++        auto* horizontal = seg_axis(ctx, width_first, cols, kernel);
++        auto* height_first = ggml_cont(graph, ggml_permute(graph, horizontal, 2, 1, 0, 3));
++        auto* vertical = seg_axis(ctx, height_first, rows, kernel);
++        auto* restored = ggml_cont(graph, ggml_permute(graph, vertical, 2, 0, 1, 3));
++        return ggml_reshape_3d(graph, restored, channels, tokens, batch);
++    }
++}
+--- a/src/model/common/nui_unet_hooks.hpp
++++ b/src/model/common/nui_unet_hooks.hpp
+@@ -44,6 +44,8 @@
+         int tile_size = 0, swap_size = 1, max_depth = 0;
+         bool scale_depth = false;
+         int pag_regions = 0;
++        double seg_blur = 0.0;
++        int seg_start = 0, seg_end = 150, seg_width = 1, seg_height = 1;
+         bool sag_capture = false;
+         float token_factor = 1.f, token_factor2 = 1.f;
+         int token_first_depth = 1, token_evaluations = 0;
+@@ -87,6 +89,7 @@
+         int lllite_matched = 0, lllite_applied = 0;
+         int agent_layers = 0, agent_attention_layers = 0;
+         std::deque<std::vector<int32_t>> agent_indices;
++        std::deque<std::vector<float>> seg_weights;
+         bool deepcache_reused = false, deepcache_saved = false;
+         bool deepcache_d1 = false, deepcache_d2 = false;
+     };

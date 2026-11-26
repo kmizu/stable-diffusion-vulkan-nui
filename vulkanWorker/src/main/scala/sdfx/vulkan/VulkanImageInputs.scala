@@ -9,6 +9,9 @@ import sdfx.core.protocol.GenerationRequest
 import sdfx.vulkan.VulkanProtocol.{invalid, unsupported}
 
 private[vulkan] object VulkanImageInputs:
+  def img2imgSteps(steps: Int, strength: Double): Int =
+    math.min(steps, (steps * strength).toInt + 1)
+
   val upscalers = Map("Latent" -> "latent", "Latent (antialiased)" -> "latent_antialiased",
     "Latent (bicubic)" -> "latent_bicubic", "Latent (bicubic antialiased)" -> "latent_bicubic_antialiased",
     "Latent (nearest)" -> "latent_nearest", "Latent (nearest-exact)" -> "latent_nearest_exact",

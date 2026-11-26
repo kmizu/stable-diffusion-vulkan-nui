@@ -14,6 +14,7 @@ import scala.util.Using
 import scala.util.control.NonFatal
 import sdfx.core.imagebrowser.BrowserFiles
 import sdfx.core.infotext.{HardwareInfo, Img2ImgHiresMetadata}
+import sdfx.core.model.Img2ImgParams
 import sdfx.core.protocol.*
 import sdfx.vulkan.tools.VulkanTools
 import ujson.{Arr, Obj, Str, Value}
@@ -525,6 +526,8 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
       else gen.request.copy(params = requested.copy(hooks = effectiveHooks))
     val p = req.params
     if isGeneration(job.kind) && ((job.kind == "img2img") != p.isImg2Img) then invalid("img2img requests require an init image and the img2img operation")
+    if VulkanIncantations.seg(p.hooks).nonEmpty && !backend.supportsSeg() then
+      unsupported("This Vulkan runtime lacks Incantations SEG")
     val hires = VulkanImageInputs.hires(req)
     val separateHires = VulkanImageInputs.separateHires(req)
     val refinement = Img2ImgHiresMetadata.active(p.hooks)
@@ -560,6 +563,7 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
           (key != VulkanCdTuner.id || cdTuner.nonEmpty) &&
           (key != VulkanUnetHooks.tiledDiffusion || VulkanUnetHooks.needsTiles(config,p.width,p.height)) => key })
       .orElse(VulkanLatentModifier.config(p).map(_ => VulkanLatentModifier.id))
+      .orElse(Option.when(VulkanIncantations.segPasses(p))(VulkanIncantations.id))
       .orElse(Option.when(tweak.nonEmpty || separateHires && p.hires.upscaler.startsWith("Latent"))(VulkanGraph.latentHires))
     def cdFollowup(width: Int, height: Int): Option[VulkanCdTuner.Options] =
       graph.filter(_ == VulkanCdTuner.id).flatMap { _ =>
@@ -705,7 +709,9 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
               unsupported("U-Net hooks and custom text conditioning in the same refinement")
             val modifier = VulkanLatentModifier.config(refinementParams).map(VulkanLatentModifier.id -> _)
             val cdRefinement = cdFollowup(w, ht)
-            val refinementGraph = clip.map(value => VulkanClipIo.id -> Map(VulkanClipIo.id -> value))
+            val segRefinement = VulkanIncantations.seg(p.hooks).exists(_.canApply(
+              VulkanImageInputs.img2imgSteps(refinementParams.steps, strength)))
+            val otherRefinement = clip.map(value => VulkanClipIo.id -> Map(VulkanClipIo.id -> value))
               .orElse(textGraph.map(_ -> scheduleHooks))
               .orElse(unetHooks.keysIterator.nextOption().map(_ -> unetHooks))
               .orElse(modifier.map(entry => VulkanLatentModifier.id -> Map(entry)))
@@ -719,12 +725,18 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
                 aestheticHash.foreach(hash => config("embedding_sha256") = hash)
                 key -> Map(key -> config)
               })
+            if segRefinement && otherRefinement.nonEmpty then
+              unsupported("Incantations SEG with other sampling hooks in img2img Hires Fix")
+            val refinementGraph = otherRefinement.orElse(Option.when(segRefinement) {
+              val key = VulkanIncantations.id
+              key -> Map(key -> p.hooks(key))
+            })
               .map((key,hooks) => key -> (hooks ++ modifier))
             refinementGraph match
               case Some((hook, hooks)) =>
                 val params = refinementParams.copy(prompt = prompt, negativePrompt = negative,
                   samplerName = sampler, scheduler = actualSchedule,
-                  img2img = p.img2img.map(_.copy(mask = None, denoisingStrength = strength)),
+                  img2img = Some(p.img2img.getOrElse(Img2ImgParams("")).copy(mask = None, denoisingStrength = strength)),
                   hooks = hooks)
                 VulkanGraph.render(backend, device.id(), model, loadRequest.get, graphRequest.copy(params = params),
                   hook, prompt, params.loras, seed, actualSchedule, () => job.cancelled,

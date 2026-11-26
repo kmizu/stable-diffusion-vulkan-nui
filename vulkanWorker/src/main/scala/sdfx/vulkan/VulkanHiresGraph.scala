@@ -14,6 +14,10 @@ private[vulkan] object VulkanHiresGraph:
     if h.denoisingStrength == 0 then requested
     else math.ceil(requested/h.denoisingStrength.min(.999) - 1e-9).toInt
 
+  def refinementSteps(p: GenerationParams): Int =
+    val full = fullSteps(p)
+    (full * p.hires.denoisingStrength).toInt.min(full).max(1)
+
   /** The first pass leaves its diffusion latent in `latent`; sample again at the target resolution. */
   def refinement(req: GenerationRequest, firstPrompt: String, firstLoras: Seq[LoraRef], seed: Long,
       baseUnet: String, baseText: String, eta: String, device: String, customNoise: Boolean, tiled: String,
@@ -68,14 +72,14 @@ private[vulkan] object VulkanHiresGraph:
     val negativePrompt = selected(h.negativePrompt, p.negativePrompt)
     val full = fullSteps(p)
     require(full <= 10000,"Hires schedule exceeds 10000 steps")
-    val count = (full*h.denoisingStrength).toInt.min(full).max(1)
+    val count = refinementSteps(p)
     val loraPlan = composable.map { config =>
       val (offset, total) = VulkanComposableLora.clock(p, config, count, hires = true)
       VulkanComposableLora.plan(positivePrompt, negativePrompt, req.manualLoras, adapters, config, firstPrompt,
         count, offset, total)
     }
     val areaRatio = targetWidth.toDouble * targetHeight / (p.width.toDouble * p.height)
-    val baseSteps = p.img2img.fold(p.steps)(i => ((p.steps * i.denoisingStrength).toInt + 1).min(p.steps))
+    val baseSteps = p.img2img.fold(p.steps)(i => VulkanImageInputs.img2imgSteps(p.steps, i.denoisingStrength))
     reference.foreach(config => lines ++= config.prepare("hr_ref", tiled))
     val agentArgs = agent.fold("")(_.args(seed, hires = true))
     val llulArgs = llul.filter(_.canApply(full)).fold("")(_.args(targetWidth, targetHeight, "llul_mask", full))
@@ -85,13 +89,15 @@ private[vulkan] object VulkanHiresGraph:
       ", concat = hr_inpaint_condition"
     else ""
     val aa = h.upscaler.contains("antialiased")
-    val randomAlgorithm = if llul.nonEmpty || characteristic.nonEmpty || composable.nonEmpty || aesthetic.nonEmpty then "cuda" else "cpu"
+    val seg = VulkanIncantations.segArguments(p.hooks, p.width, p.height, count)
+    val segPasses = seg.nonEmpty || VulkanIncantations.segPasses(p)
+    val randomAlgorithm = if llul.nonEmpty || characteristic.nonEmpty || composable.nonEmpty || aesthetic.nonEmpty || segPasses then "cuda" else "cpu"
     lines += s"""hr_rng = make_rng("$randomAlgorithm", seed = $seed)"""
     if h.upscaler.startsWith("Latent") then
       lines += s"hr_base = tensor::interpolate(latent, size = [${width/8},${height/8}], mode = ${q(method)}, antialias = $aa)"
     else
       val saturation = cdTuner.fold("")(_.decoderArgs)
-      val floatPixels = characteristic.nonEmpty || aesthetic.nonEmpty
+      val floatPixels = characteristic.nonEmpty || aesthetic.nonEmpty || segPasses
       val dtype = if floatPixels then ", dtype = \"f32\"" else ""
       lines += s"hr_pixels = vae_decode(vae, unet_to_vae_latents(vae, latent)$tiled$saturation$dtype)"
       val pixelModel = req.upscalerPaths.get(h.upscaler)
@@ -125,14 +131,15 @@ private[vulkan] object VulkanHiresGraph:
       val ref = reference.fold("")(_.args("hr_ref", positive = name == "pos"))
       val encoded = aesthetic.fold(s"encode_prompt($text, ${q(prompt)}, $encoding)")(
         _.encode(s"hr_${name}_condition", text, prompt, encoding, name == "neg", adapters, lines))
+      val segArgs = if name == "neg" then seg else ""
       val blank = if name != "neg" || aesthetic.fold(prompt.nonEmpty)(_ => prompt.trim.nonEmpty) then ""
         else if lllite.nonEmpty then ", lllite_blank_negative = true"
         else if llul.nonEmpty then ", llul_blank_negative = true"
-        else if characteristic.nonEmpty || aesthetic.nonEmpty then ", sdxl_blank_negative = true"
+        else if characteristic.nonEmpty || aesthetic.nonEmpty || segPasses then ", sdxl_blank_negative = true"
         else ""
       val condition = controlWeight.fold(encoded)(weight =>
         s"controlnet::apply($encoded, control_model, hr_control_hint, strength = $weight)")
-      lines += s"hr_$name = predictor($unet, $condition$concat$cdt$cacheArgs$ref$agentArgs$llliteArgs$llulArgs$blank)"
+      lines += s"hr_$name = predictor($unet, $condition$concat$cdt$cacheArgs$ref$agentArgs$llliteArgs$llulArgs$blank$segArgs)"
     val sampler = h.samplerName.getOrElse(p.samplerName)
     val nativeMethod = VulkanProtocol.samplers.getOrElse(sampler,unsupported(s"hires sampler $sampler"))
     val schedule = h.scheduler.getOrElse(p.scheduler)

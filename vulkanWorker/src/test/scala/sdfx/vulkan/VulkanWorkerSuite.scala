@@ -114,6 +114,36 @@ class VulkanWorkerSuite extends munit.FunSuite:
     intercept[EngineError](VulkanProtocol.select(all, Some("Example")))
   }
 
+  test("Incantations SEG supplies only a negative predictor option and preserves the source window") {
+    val config = ujson.Obj("seg_active" -> "yes", "seg_blur_sigma" -> 2.5,
+      "seg_start_step" -> 4, "seg_end_step" -> 8)
+    val hooks = Map("incantations" -> config)
+    assertEquals(VulkanIncantations.segArguments(hooks, 768, 512, 6),
+      ", seg_blur = 2.5, seg_start = 4, seg_end = 8, seg_width = 768, seg_height = 512")
+    assertEquals(VulkanIncantations.segArguments(hooks, 768, 512, 5), "")
+    config("seg_blur_sigma") = 0
+    assertEquals(VulkanIncantations.segArguments(hooks, 768, 512, 6), "")
+    config("seg_blur_sigma") = 11
+    config("enabled") = false
+    assertEquals(VulkanIncantations.segArguments(hooks, 768, 512, 6), "")
+  }
+
+  test("Incantations SEG stays on the negative Hires branch with the base aspect") {
+    import sdfx.core.model.HiresParams
+    val p = GenerationParams(width = 768, height = 512, samplerName = "Euler",
+      hires = HiresParams(enabled = true, resizeX = 896, resizeY = 640, upscaler = "Latent"),
+      hooks = Map("incantations" -> ujson.Obj("seg_active" -> true)))
+    val graph = VulkanHiresGraph.refinement(GenerationRequest(p, "outputs"), "test", Nil, 3,
+      "unet", "text", "", "Vulkan0", customNoise = false, tiled = "")
+    assert(graph.exists(line => line.startsWith("hr_neg =") &&
+      line.contains("seg_blur = 11.0, seg_start = 0, seg_end = 150, seg_width = 768, seg_height = 512")))
+    assert(!graph.exists(line => line.startsWith("hr_pos =") && line.contains("seg_blur")))
+    val incompatibleHires = p.copy(hires = p.hires.copy(enabled = false),
+      hooks = p.hooks.updated("img2img_hires_fix", ujson.Obj("sampler" -> "Heun", "denoise" -> 0.5)))
+    val error = intercept[EngineError](VulkanIncantations.validate(incompatibleHires))
+    assert(error.message.contains("SEG with sampler Heun"))
+  }
+
   test("Incantations CFG follows the lagged source clock and its noise interval") {
     val config = ujson.Obj("cfg_interval_enable" -> true, "cfg_interval_schedule" -> "Linear")
     assertEquals(VulkanIncantations.schedule(config, 8, 6, 5), Vector(12f, 12f, 10.5f, 9f, 7.5f))

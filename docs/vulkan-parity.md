@@ -164,7 +164,9 @@ Base img2img and the two Hires paths accept the supported full-range, balanced s
 
 The CFG Scheduler supports the 17 legacy curves, a snapped noise interval, and the original one-evaluation lag on Euler and Euler a. It supports masked img2img, built-in Hires and the separate Img2Img Hires Fix. Ordinary Hires uses the base curve's step count and CFG, and the independent Img2Img Hires Fix builds a curve from its own settings. ADetailer and Batch Face Swap inherit the base image and run their local inpainting without the Incantations schedule.
 
-Smoothed Energy Guidance, S-CFG, Incantations PAG and Multi-Concept T2I-Zero remain open. The `compile` hook also remains open.
+Smoothed Energy Guidance (SEG) supports Euler and Euler a on the SD 1.x, SD 2.x and SDXL U-Nets. It smooths the unconditional Query projection in middle-block self-attention with the legacy reflected Gaussian or spatial mean. Its inclusive step range follows the legacy lag. A zero blur or a window outside all sampling evaluations leaves generation on the usual path. The regular Hires pass reuses the base aspect ratio. The separate Img2Img Hires Fix uses its own dimensions, strength and step count.
+
+S-CFG, Incantations PAG and Multi-Concept T2I-Zero remain open. The `compile` hook also remains open.
 
 ### Boundaries of the port
 

@@ -3,6 +3,16 @@
 
 
 
+## Windows v0.67 — Incantations Smoothed Energy Guidance
+
+A native numerical check compared the middle-attention Query graph on two rectangular batches with an independent two-dimensional reflection convolution and a spatial mean. With blur exponents 0.5, 2.5 and 11, the maximum absolute error was `1.19e-7`. The same check confirmed that an out-of-window evaluation and a non-middle attention region returned the original Query.
+
+The Java 25 worker ran masked SD1.5 at 512 × 512 on Radeon 780M with Euler a and masked SDXL at 768 × 768 on RTX 3090 with Euler. An unreachable SEG window reproduced every baseline pixel. Active finite Gaussian and spatial mean settings changed the edit, and repeating the finite setting reproduced every pixel. Both GPUs retained all unmasked source RGB values.
+
+RTX 3090 also completed regular Latent Hires and the separate Img2Img Hires Fix at 832 × 832 with SEG and the Linear CFG Scheduler combined. The independent refinement after a text-only base ran four evaluations at its own denoise setting after six base evaluations. The images were inspected. Zero mask blur left a visible boundary in the masked edits, and the short independent refinement showed strong color saturation.
+
+The staged `SDV-NUI.exe` ran both models through MCP with a system-only PATH, reported `cuda=false`, wrote the SEG fields into the PNG and preserved every unmasked pixel. All 73 Vulkan worker tests and six Incantations plugin tests passed. The Windows ZIP SHA-256 is `f6e33f7ff23eddd2f3e8d6339e84e235958c9490b67ba67aba3dd0e7d77cb121`. The archived launcher, desktop JAR, worker JAR and inference DLL matched the tested files byte for byte.
+
 ## Windows v0.66 — Incantations CFG Scheduler
 
 All 17 curves matched the legacy Python implementation at two interior steps within 0.000001. The tests also exercised interval snapping, a longer Hires schedule with signed values, numeric and text activation flags, and the first two evaluations using step zero.
