@@ -1,0 +1,280 @@
+--- /dev/null
++++ b/src/core/lora_layer_trace.h
+@@ -0,0 +1,53 @@
++#ifndef SD_LORA_LAYER_TRACE_H
++#define SD_LORA_LAYER_TRACE_H
++
++#include <cstddef>
++#include <unordered_map>
++#include <vector>
++
++#include "ggml.h"
++
++namespace sd {
++    // A predictor can submit several graphs. Count layer outputs only in
++    // successfully submitted graphs that actually use the LoRA operation.
++    class LoraLayerTrace {
++        inline static thread_local LoraLayerTrace* current_ = nullptr;
++        LoraLayerTrace* previous_;
++        std::unordered_map<const ggml_tensor*, std::vector<size_t>> outputs_;
++
++    public:
++        static constexpr size_t untracked = static_cast<size_t>(-1);
++        std::vector<size_t> counts;
++
++        LoraLayerTrace() : previous_(current_) { current_ = this; }
++        ~LoraLayerTrace() { current_ = previous_; }
++        LoraLayerTrace(const LoraLayerTrace&) = delete;
++        LoraLayerTrace& operator=(const LoraLayerTrace&) = delete;
++
++        static LoraLayerTrace* current() { return current_; }
++        void begin_graph() { outputs_.clear(); }
++
++        void mark(const ggml_tensor* output, const std::vector<size_t>& slots) {
++            if (!slots.empty())
++                outputs_[output].insert(outputs_[output].end(), slots.begin(), slots.end());
++        }
++
++        void commit(ggml_cgraph* graph) {
++            if (outputs_.empty())
++                return;
++            for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
++                const auto found = outputs_.find(ggml_graph_node(graph, i));
++                if (found == outputs_.end())
++                    continue;
++                for (size_t slot : found->second) {
++                    if (slot >= counts.size())
++                        counts.resize(slot + 1, 0);
++                    ++counts[slot];
++                }
++            }
++            outputs_.clear();
++        }
++    };
++}
++
++#endif
+--- a/src/core/ggml_runner.cpp
++++ b/src/core/ggml_runner.cpp
+@@ -6,6 +6,7 @@
+ #include "core/ggml_extend_backend.h"
+ #include "core/ggml_runner.h"
+ #include "core/ggml_tensor_utils.h"
++#include "core/lora_layer_trace.h"
+
+ using namespace sd;
+
+@@ -300,6 +301,9 @@
+     } graph_guard{*this, success};
+
+     try {
++        auto* lora_trace = LoraLayerTrace::current();
++        if (lora_trace != nullptr)
++            lora_trace->begin_graph();
+         ggml_cgraph* graph = nullptr;
+         if (!prepare_compute_graph(get_graph, &graph)) {
+             return std::nullopt;
+@@ -321,6 +325,8 @@
+         device_memory_error_ = std::move(result.device_memory_error);
+         success              = result.status == GGML_STATUS_SUCCESS;
+         if (success) {
++            if (lora_trace != nullptr)
++                lora_trace->commit(graph);
+             return std::move(result.output);
+         }
+     } catch (const std::bad_alloc&) {
+--- a/src/dgl/models/lora.cpp
++++ b/src/dgl/models/lora.cpp
+@@ -125,6 +125,8 @@
+             if (!matches)
+                 throw std::runtime_error("LoRA '" + spec.path + "' has no matching model weights");
+             model->multiplier = spec.multiplier;
++            if (module == SDBackendModule::DIFFUSION)
++                model->trace_slot = models.size();
+             spec.prepared     = model;
+             models.push_back(std::move(model));
+         }
+--- a/src/model/adapter/lora.hpp
++++ b/src/model/adapter/lora.hpp
+@@ -7,6 +7,7 @@
+ #include "core/ggml_extend_backend.h"
+ #include "core/ggml_runner.h"
+ #include "core/ggml_tensor_utils.h"
++#include "core/lora_layer_trace.h"
+ #include "core/util.h"
+ #include "json.hpp"
+ #include "model.h"
+@@ -19,6 +20,7 @@
+
+ struct LoraModel : public GGMLRunner {
+     std::string lora_id;
++    size_t trace_slot = sd::LoraLayerTrace::untracked;
+     float multiplier     = 1.0f;
+     float metadata_alpha = -1.f;
+     std::unordered_map<std::string, ggml_tensor*> lora_tensors;
+@@ -1146,6 +1148,21 @@
+ protected:
+     std::vector<std::shared_ptr<LoraModel>> lora_models;
+
++    struct LayerTrace {
++        sd::LoraLayerTrace* trace = sd::LoraLayerTrace::current();
++        std::vector<size_t> slots;
++        void include(const LoraModel& model) {
++            if (trace != nullptr && model.trace_slot != sd::LoraLayerTrace::untracked &&
++                std::find(slots.begin(), slots.end(), model.trace_slot) == slots.end())
++                slots.push_back(model.trace_slot);
++        }
++        ggml_tensor* finish(ggml_tensor* output) {
++            if (trace != nullptr)
++                trace->mark(output, slots);
++            return output;
++        }
++    };
++
+ public:
+     explicit MultiLoraAdapter(const std::vector<std::shared_ptr<LoraModel>>& lora_models)
+         : lora_models(lora_models) {
+@@ -1154,7 +1171,7 @@
+     ggml_tensor* patch_weight(GGMLRunnerContext* runner_ctx,
+                               ggml_tensor* weight,
+                               const std::string& weight_name,
+-                              bool with_lora_and_lokr) {
++                              bool with_lora_and_lokr, LayerTrace& layer) {
+         auto ctx = runner_ctx->ggml_ctx;
+         for (auto& lora_model : lora_models) {
+             ggml_tensor* diff = lora_model->get_weight_diff(weight_name, runner_ctx, weight, with_lora_and_lokr);
+@@ -1166,6 +1183,7 @@
+                 weight = ggml_ext_cast_f32(runner_ctx, weight);
+             }
+             weight = ggml_add(ctx, weight, diff);
++            layer.include(*lora_model);
+         }
+         return weight;
+     }
+@@ -1173,7 +1191,8 @@
+     ggml_tensor* patch_weight(GGMLRunnerContext* runner_ctx,
+                               ggml_tensor* weight,
+                               const std::string& weight_name) override {
+-        return patch_weight(runner_ctx, weight, weight_name, true);
++        LayerTrace layer;
++        return layer.finish(patch_weight(runner_ctx, weight, weight_name, true, layer));
+     }
+
+     ggml_tensor* forward_with_lora(GGMLRunnerContext* runner_ctx,
+@@ -1183,9 +1202,10 @@
+                                    const std::string& prefix,
+                                    WeightAdapter::ForwardParams forward_params) override {
+         auto ctx = runner_ctx->ggml_ctx;
+-        w        = patch_weight(runner_ctx, w, prefix + "weight", false);
++        LayerTrace layer;
++        w = patch_weight(runner_ctx, w, prefix + "weight", false, layer);
+         if (b) {
+-            b = patch_weight(runner_ctx, b, prefix + "bias", false);
++            b = patch_weight(runner_ctx, b, prefix + "bias", false, layer);
+         }
+         ggml_tensor* out;
+         if (forward_params.op_type == ForwardParams::op_type_t::OP_LINEAR) {
+@@ -1212,8 +1232,9 @@
+                 continue;
+             }
+             out = ggml_add_inplace(ctx, out, out_diff);
+-        }
+-        return out;
++            layer.include(*lora_model);
++        }
++        return layer.finish(out);
+     }
+
+     ggml_tensor* add_lora_to_output(GGMLRunnerContext* runner_ctx,
+@@ -1223,6 +1244,7 @@
+                                     const std::string& prefix,
+                                     WeightAdapter::ForwardParams forward_params) override {
+         auto ctx = runner_ctx->ggml_ctx;
++        LayerTrace layer;
+         // Packed INT4 stores half the logical input width. Adapter shape checks
+         // and reshapes need the logical weight dimensions, without decoding it.
+         ggml_tensor logical_weight = *w;
+@@ -1244,14 +1266,16 @@
+                                                         forward_params.linear.force_prec_f32,
+                                                         forward_params.linear.scale);
+                 output                = ggml_add_inplace(ctx, output, out_diff);
++                layer.include(*lora_model);
+             }
+
+             ggml_tensor* out_diff = lora_model->get_out_diff(runner_ctx, x, w, forward_params, prefix + "weight");
+             if (out_diff != nullptr) {
+                 output = ggml_add_inplace(ctx, output, out_diff);
+-            }
+-        }
+-        return output;
++                layer.include(*lora_model);
++            }
++        }
++        return layer.finish(output);
+     }
+
+     size_t get_extra_graph_size() override {
+--- a/src/dgl/ops/predictor.cpp
++++ b/src/dgl/ops/predictor.cpp
+@@ -2,6 +2,7 @@
+
+ #include <algorithm>
+
++#include "core/lora_layer_trace.h"
+ #include "dgl/models/animatediff.h"
+ #include "dgl/models/circular_axes.h"
+ #include "dgl/models/control.h"
+@@ -417,9 +418,16 @@
+         return check(check, predictor);
+     }
+
+-    static void record_lora_prediction(const ModelPredictor& leaf, int step) {
+-        if (!leaf.lora_trace.empty())
+-            LOG_INFO("SDV_LORA_PREDICTION %d %s", step, leaf.lora_trace.c_str());
++    static void record_lora_prediction(const ModelPredictor& leaf, int step, const sd::LoraLayerTrace& trace) {
++        if (leaf.lora_trace.empty())
++            return;
++        std::string counts;
++        for (size_t count : trace.counts) {
++            if (!counts.empty())
++                counts += ',';
++            counts += std::to_string(count);
++        }
++        LOG_INFO("SDV_LORA_PREDICTION %d %s %s", step, leaf.lora_trace.c_str(), counts.empty() ? "-" : counts.c_str());
+     }
+
+     models::DiffusionPrediction PredictionExecution::Resources::predict_model(const ModelPredictor& leaf, const Tensor<float>& x, float sigma, models::DiffusionPredictionStep step, EvaluationState& state, bool sag_mask) {
+@@ -488,11 +496,15 @@
+             options.unet_hooks.tgate_branch = reinterpret_cast<uintptr_t>(&leaf);
+         if (sag_mask) step.cache = nullptr;
+         models::Model::LoraWeightsScope lora_weights(engine, leaf.runtime_lora_weights);
++        std::optional<sd::LoraLayerTrace> lora_trace;
++        if (!leaf.lora_trace.empty())
++            lora_trace.emplace();
+         auto prediction = engine.predict_diffusion(x, leaf.resolved_parameterization(), sigma, leaf.condition, leaf.references,
+                                                    options, step);
+         if (prediction.output.empty())
+             throw std::runtime_error("diffusion prediction failed");
+-        record_lora_prediction(leaf, step.index);
++        if (lora_trace)
++            record_lora_prediction(leaf, step.index, *lora_trace);
+         return prediction;
+     }
+
+@@ -602,9 +614,14 @@
+                 packed = resources.batched_conditions.emplace(key, std::move(condition)).first;
+                 LOG_VERBOSE("batching compatible positive and negative UNet branches");
+             }
++            std::optional<sd::LoraLayerTrace> lora_trace;
++            if (!pos->lora_trace.empty() || !neg->lora_trace.empty())
++                lora_trace.emplace();
+             auto prediction = resources.predict_batch(*pos, packed->second, x_, sigma_, step_);
+-            record_lora_prediction(*pos, step_.index);
+-            record_lora_prediction(*neg, step_.index);
++            if (lora_trace) {
++                record_lora_prediction(*pos, step_.index, *lora_trace);
++                record_lora_prediction(*neg, step_.index, *lora_trace);
++            }
+             auto parts      = sd::ops::chunk(prediction.output, 2, 3);
+             results_.emplace(&positive, Result{{std::move(parts[0]), prediction.skip_scale, prediction.output_scale}});
+             results_.emplace(&negative, Result{{std::move(parts[1]), prediction.skip_scale, prediction.output_scale}});

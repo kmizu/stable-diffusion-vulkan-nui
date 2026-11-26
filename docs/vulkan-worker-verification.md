@@ -3,6 +3,14 @@
 
 
 
+## Windows v0.60 — Composable LoRA layer counts
+
+The staged `SDV-NUI.exe` ran masked img2img through MCP with `cuda=false` on RTX 3090 with SDXL and Radeon 780M with SD1.5. Active LoRA evaluations counted 788 layers and 192 layers respectively, matching independent counts of the adapters' U-Net tensor groups. Branches with zero weight reported zero layer evaluations. PNGs and plots were inspected, and the generated images matched the v0.59 runs pixel for pixel.
+
+A 512 × 512 SDXL Heun run on RTX 3090 counted 1,576 layer evaluations for a branch when the solver evaluated it twice in one step. A synthetic SD1.5 adapter with both weight and bias deltas for a single GroupNorm layer counted one application per branch and preserved the same image pixels before and after the counting fix. All 65 Vulkan worker tests and the Composable LoRA plugin test passed.
+
+The ZIP SHA-256 is `8c881f5323f781248a74ee7a0690f006585cb0c5326df2ca134e511d31b0e774`. The archived launcher, desktop JAR, worker JAR and inference DLL matched the tested staging files.
+
 ## Windows v0.59 — Numeric Composable LoRA commands
 
 The staged `SDV-NUI.exe` ran masked img2img over MCP at 768 × 768 with SDXL on RTX 3090 and at 512 × 512 with SD1.5 on Radeon 780M. Both reported `cuda=false`. A numeric `#cmd` selected weight 0.45 for the first two steps and 0.225 for the last three. Both traces reported zero for the other branches. The native log showed one runtime U-Net adapter initialization per run. Every pixel outside each mask matched the source.

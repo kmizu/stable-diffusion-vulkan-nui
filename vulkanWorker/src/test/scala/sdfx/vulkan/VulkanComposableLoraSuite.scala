@@ -147,8 +147,9 @@ class VulkanComposableLoraSuite extends munit.FunSuite:
       val run = new VulkanLoraTrace.Run(ujson.Obj())
       val prompt = "雪の森 \"fox\""
       def record(pass: String, step: Int, weight: Double): Unit =
-        val label = VulkanLoraTrace.label(pass, "branch0", prompt, false, Seq("fur" -> weight))
-        run.record(s"$step $label")
+        val label = VulkanLoraTrace.label(pass, "branch0", prompt, false, Seq("fur" -> weight), Seq("fur"))
+        val layers = if weight == 0 then 0 else 17
+        run.record(s"$step $label $layers")
       record("base", 1, .25)
       record("base", 1, .75)
       record("base", 2, 0)
@@ -171,6 +172,7 @@ class VulkanComposableLoraSuite extends munit.FunSuite:
       assertEquals(rows.head("min_weight").num, .25)
       assertEquals(rows.head("max_weight").num, .75)
       assertEquals(rows.head("model_evaluations").num, 2.0)
+      assertEquals(rows.map(_("layer_evaluations").num), Vector(34.0, 0.0, 17.0, 17.0))
       assertEquals(rows.head("prompt").str, prompt)
     }
   }

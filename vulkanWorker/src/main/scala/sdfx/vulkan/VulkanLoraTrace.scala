@@ -13,39 +13,57 @@ import ujson.Obj
 
 private[vulkan] object VulkanLoraTrace:
   def label(pass: String, branch: String, prompt: String, negative: Boolean,
-      weights: Seq[(String, Double)]): String =
+      weights: Seq[(String, Double)], bindings: Seq[String]): String =
     val payload = Obj("pass_name" -> pass, "branch" -> branch, "prompt" -> prompt,
-      "is_negative" -> negative, "weights" -> Obj.from(weights.map((name, value) => name -> ujson.Num(value))))
+      "is_negative" -> negative, "weights" -> Obj.from(weights.map((name, value) => name -> ujson.Num(value))),
+      "bindings" -> ujson.Arr.from(bindings.map(ujson.Str(_))))
     Base64.getUrlEncoder.withoutPadding().encodeToString(payload.render().getBytes(UTF_8))
 
   private case class Series(image: Int, pass: String, branch: String, prompt: String, negative: Boolean, lora: String)
-  private case class Prediction(pass: String, branch: String, prompt: String, negative: Boolean, weights: Vector[(String, Double)])
-  private case class Samples(sum: Double, minimum: Double, maximum: Double, count: Int):
-    def add(value: Double, times: Int): Samples =
-      Samples(sum + value * times, minimum.min(value), maximum.max(value), count + times)
+  private case class Prediction(pass: String, branch: String, prompt: String, negative: Boolean,
+      weights: Vector[(String, Double)], bindings: Vector[String])
+  private case class Evaluations(models: Int, layers: Option[Vector[Long]]):
+    def add(other: Evaluations): Evaluations =
+      Evaluations(models + other.models, layers.zip(other.layers).map((a, b) => a.zip(b).map(_ + _)))
+  private case class Samples(sum: Double, minimum: Double, maximum: Double, count: Int, layers: Option[Long]):
+    def add(value: Double, times: Int, extraLayers: Option[Long]): Samples =
+      Samples(sum + value * times, minimum.min(value), maximum.max(value), count + times,
+        layers.zip(extraLayers).map(_ + _))
     def mean: Double = sum / count
 
   final class Run(config: ujson.Value):
     private val labels = mutable.HashMap.empty[String, Prediction]
-    private val events = mutable.LinkedHashMap.empty[(Int, Prediction, Int), Int]
+    private val events = mutable.LinkedHashMap.empty[(Int, Prediction, Int), Evaluations]
     var imageIndex: Int = 0
     def record(message: String): Unit =
-      val Array(step, encoded) = message.split(" ", 2): @unchecked
+      val parts = message.split(" ", 3)
+      val encoded = parts(1)
       val prediction = labels.getOrElseUpdate(encoded, {
         val value = ujson.read(new String(Base64.getUrlDecoder.decode(encoded), UTF_8))
         Prediction(value("pass_name").str, value("branch").str, value("prompt").str,
-          value("is_negative").bool, value("weights").obj.iterator.map((name, weight) => name -> weight.num).toVector)
+          value("is_negative").bool, value("weights").obj.iterator.map((name, weight) => name -> weight.num).toVector,
+          value("bindings").arr.iterator.map(_.str).toVector)
       })
-      val key = (imageIndex, prediction, step.toInt)
-      events.update(key, events.getOrElse(key, 0) + 1)
+      val layers = parts.lift(2).map { raw =>
+        val counts = if raw == "-" then Vector.empty else raw.split(',').iterator.map(_.toLong).toVector
+        require(counts.size <= prediction.bindings.size, "Unexpected LoRA layer count")
+        counts.padTo(prediction.bindings.size, 0L)
+      }
+      val key = (imageIndex, prediction, parts(0).toInt)
+      val current = Evaluations(1, layers)
+      events.updateWith(key)(prior => Some(prior.fold(current)(_.add(current))))
 
     private def summarize(): Vector[((Series, Int), Samples)] =
       val stats = mutable.LinkedHashMap.empty[(Series, Int), Samples]
-      for ((image, prediction, step), times) <- events do
+      for ((image, prediction, step), evaluated) <- events do
+        val byAdapter = evaluated.layers.map(counts => prediction.bindings.zip(counts).toMap)
+        val times = evaluated.models
         for (name, weight) <- prediction.weights do
           val series = Series(image, prediction.pass, prediction.branch, prediction.prompt, prediction.negative, name)
           val key = (series, step)
-          stats.updateWith(key)(prior => Some(prior.fold(Samples(weight * times, weight, weight, times))(_.add(weight, times))))
+          val layers = byAdapter.map(_.getOrElse(name, 0L))
+          stats.updateWith(key)(prior =>
+            Some(prior.fold(Samples(weight * times, weight, weight, times, layers))(_.add(weight, times, layers))))
       stats.toVector
 
     private def writeTrace(trace: Path, stats: Vector[((Series, Int), Samples)]): Unit =
@@ -54,9 +72,11 @@ private[vulkan] object VulkanLoraTrace:
         for (((s, step), v), index) <- stats.iterator.zipWithIndex do
           if index > 0 then writer.write(",")
           writer.write("\n")
-          writer.write(Obj("pass_name" -> s.pass, "image_index" -> s.image, "branch" -> s.branch, "step" -> step,
+          val row = Obj("pass_name" -> s.pass, "image_index" -> s.image, "branch" -> s.branch, "step" -> step,
             "prompt" -> s.prompt, "is_negative" -> s.negative, "lora" -> s.lora, "mean_weight" -> v.mean,
-            "min_weight" -> v.minimum, "max_weight" -> v.maximum, "model_evaluations" -> v.count).render())
+            "min_weight" -> v.minimum, "max_weight" -> v.maximum, "model_evaluations" -> v.count)
+          v.layers.foreach(layers => row("layer_evaluations") = ujson.Num(layers.toDouble))
+          writer.write(row.render())
         writer.write("\n]}\n")
       }
 

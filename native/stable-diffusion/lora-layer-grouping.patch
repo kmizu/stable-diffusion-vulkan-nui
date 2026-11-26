@@ -1,0 +1,169 @@
+--- a/src/core/lora_layer_trace.h
++++ b/src/core/lora_layer_trace.h
+@@ -1,6 +1,7 @@
+ #ifndef SD_LORA_LAYER_TRACE_H
+ #define SD_LORA_LAYER_TRACE_H
+
++#include <algorithm>
+ #include <cstddef>
+ #include <unordered_map>
+ #include <vector>
+@@ -13,7 +14,13 @@
+     class LoraLayerTrace {
+         inline static thread_local LoraLayerTrace* current_ = nullptr;
+         LoraLayerTrace* previous_;
++        std::vector<size_t>* layer_slots_ = nullptr;
+         std::unordered_map<const ggml_tensor*, std::vector<size_t>> outputs_;
++
++        void record_output(const ggml_tensor* output, const std::vector<size_t>& slots) {
++            auto& counts = outputs_[output];
++            counts.insert(counts.end(), slots.begin(), slots.end());
++        }
+
+     public:
+         static constexpr size_t untracked = static_cast<size_t>(-1);
+@@ -28,9 +35,42 @@
+         void begin_graph() { outputs_.clear(); }
+
+         void mark(const ggml_tensor* output, const std::vector<size_t>& slots) {
+-            if (!slots.empty())
+-                outputs_[output].insert(outputs_[output].end(), slots.begin(), slots.end());
++            if (slots.empty())
++                return;
++            if (layer_slots_ == nullptr) {
++                record_output(output, slots);
++                return;
++            }
++            for (size_t slot : slots)
++                if (std::find(layer_slots_->begin(), layer_slots_->end(), slot) == layer_slots_->end())
++                    layer_slots_->push_back(slot);
+         }
++
++        class Layer {
++            LoraLayerTrace* trace_ = current();
++            std::vector<size_t>* previous_ = nullptr;
++            std::vector<size_t> slots_;
++
++        public:
++            Layer() {
++                if (trace_ != nullptr) {
++                    previous_ = trace_->layer_slots_;
++                    trace_->layer_slots_ = &slots_;
++                }
++            }
++            ~Layer() {
++                if (trace_ != nullptr)
++                    trace_->layer_slots_ = previous_;
++            }
++            Layer(const Layer&) = delete;
++            Layer& operator=(const Layer&) = delete;
++
++            ggml_tensor* finish(ggml_tensor* output) {
++                if (trace_ != nullptr && !slots_.empty())
++                    trace_->record_output(output, slots_);
++                return output;
++            }
++        };
+
+         void commit(ggml_cgraph* graph) {
+             if (outputs_.empty())
+--- a/src/model/common/ggml_block.hpp
++++ b/src/model/common/ggml_block.hpp
+@@ -16,6 +16,7 @@
+ #include "core/ggml_extend.h"
+ #include "core/ggml_extend_backend.h"
+ #include "core/ggml_runner.h"
++#include "core/lora_layer_trace.h"
+ #include "model.h"
+ #include "nui_unet_hooks.hpp"
+
+@@ -242,6 +243,7 @@
+     }
+
+     ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
++        sd::LoraLayerTrace::Layer lora_layer;
+         const bool force_prec_f32 = ggml_ext_force_prec_f32(ctx, this->force_prec_f32, precision_flags);
+         ggml_tensor* w            = params["weight"];
+         const float scale         = ctx->linear_scale > 0.f ? ctx->linear_scale : this->scale;
+@@ -283,7 +285,7 @@
+                 forward_params.linear.scale          = scale;
+                 out                                  = ctx->weight_adapter->add_lora_to_output(ctx, lora_input, w, out, prefix, forward_params);
+             }
+-            return out;
++            return lora_layer.finish(out);
+         }
+         if (has_weight_scale) {
+             out = ggml_ext_linear(ctx, x, w, nullptr, force_prec_f32, scale);
+@@ -301,7 +303,7 @@
+             if (b != nullptr) {
+                 out = ggml_add_inplace(ctx->ggml_ctx, out, b);
+             }
+-            return out;
++            return lora_layer.finish(out);
+         }
+         if (ctx->weight_adapter) {
+             WeightAdapter::ForwardParams forward_params;
+@@ -312,7 +314,7 @@
+         } else {
+             out = ggml_ext_linear(ctx, x, w, linear_bias, force_prec_f32, scale);
+         }
+-        return out;
++        return lora_layer.finish(out);
+     }
+ };
+
+@@ -737,6 +739,7 @@
+           force_prec_f32(force_prec_f32) {}
+
+     ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
++        sd::LoraLayerTrace::Layer lora_layer;
+         ggml_tensor* w = params["weight"];
+         ggml_tensor* b = nullptr;
+         if (ctx->weight_adapter) {
+@@ -751,11 +754,11 @@
+                 b = ctx->weight_adapter->patch_weight(ctx, b, prefix + "bias");
+             }
+         }
+-        return ggml_ext_conv_3d(ctx, x, w, b, in_channels,
++        return lora_layer.finish(ggml_ext_conv_3d(ctx, x, w, b, in_channels,
+                                 std::get<2>(stride), std::get<1>(stride), std::get<0>(stride),
+                                 std::get<2>(padding), std::get<1>(padding), std::get<0>(padding),
+                                 std::get<2>(dilation), std::get<1>(dilation), std::get<0>(dilation),
+-                                force_prec_f32, ctx->conv3d_direct_enabled);
++                                force_prec_f32, ctx->conv3d_direct_enabled));
+     }
+ };
+
+@@ -790,6 +793,7 @@
+           bias(bias) {}
+
+     ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
++        sd::LoraLayerTrace::Layer lora_layer;
+         ggml_tensor* w = nullptr;
+         ggml_tensor* b = nullptr;
+
+@@ -805,7 +809,7 @@
+                 }
+             }
+         }
+-        return ggml_ext_layer_norm(ctx, x, w, b, eps);
++        return lora_layer.finish(ggml_ext_layer_norm(ctx, x, w, b, eps));
+     }
+ };
+
+@@ -838,6 +842,7 @@
+           affine(affine) {}
+
+     ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x, float weight_factor = 1.f, float bias_factor = 1.f) {
++        sd::LoraLayerTrace::Layer lora_layer;
+         ggml_tensor* w = nullptr;
+         ggml_tensor* b = nullptr;
+         if (affine) {
+@@ -852,6 +857,6 @@
+                 b = ctx->weight_adapter->patch_weight(ctx, b, prefix + "bias");
+             }
+         }
+-        return ggml_ext_group_norm(ctx, x, w, b, num_groups, eps);
++        return lora_layer.finish(ggml_ext_group_norm(ctx, x, w, b, num_groups, eps));
+     }
+ };

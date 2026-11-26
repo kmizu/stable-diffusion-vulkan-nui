@@ -200,8 +200,9 @@ private[vulkan] object VulkanComposableLora:
           scheduledNames.map(effective.getOrElse(_, 0.0)).mkString(", runtime_lora_weights = [", ", ", "]")
         }
         val trace = tracePass.filter(_ => tracedNames.nonEmpty).fold("") { pass =>
+          val bindings = if sharedDenoiser.nonEmpty then scheduledNames else active.map(_._1)
           val label = VulkanLoraTrace.label(pass, name, branch.text, name.endsWith("_neg"),
-            tracedNames.map(adapter => adapter -> effective.getOrElse(adapter, 0.0).toFloat.toDouble))
+            tracedNames.map(adapter => adapter -> effective.getOrElse(adapter, 0.0).toFloat.toDouble), bindings)
           s", lora_trace = ${quoted(label)}"
         }
         lines += s"$symbol = predictor($denoiser, $condition$concat$blank$trace$runtime)"
