@@ -61,14 +61,17 @@ private[vulkan] object VulkanConditioning:
   private def activeHook(hooks: Map[String,ujson.Value], key: String): Option[ujson.Value] =
     hooks.get(key).filterNot(_.obj.get("enabled").contains(ujson.Bool(false)))
 
-  private[vulkan] def sampleArgs(p: sdfx.core.model.GenerationParams): String =
-    val args = Vector.newBuilder[String]
-    activeHook(p.hooks,"cfg_schedule").filter(_ => p.cfgScale > 1.0).foreach { o =>
+  def cfgSchedule(hooks: Map[String, ujson.Value], cfg: Double, count: Int): Option[IndexedSeq[Float]] =
+    activeHook(hooks, "cfg_schedule").filter(_ => cfg > 1.0).map { o =>
       def num(k: String, default: Double) = o.obj.get(k).fold(default)(_.num)
       val schedule = sdfx.vulkan.tools.CfgSchedule(num("start_cfg",7),num("end_cfg",3),
         o.obj.get("curve").fold("linear")(_.str),num("start",0),num("end",1),num("active_start",0))
-      val count = p.steps
-      val values = (0 until count).map(i => schedule.at(i.toDouble / (count-1).max(1)))
+      (0 until count).map(i => schedule.at(i.toDouble / (count - 1).max(1)))
+    }
+
+  private[vulkan] def sampleArgs(p: sdfx.core.model.GenerationParams): String =
+    val args = Vector.newBuilder[String]
+    cfgSchedule(p.hooks, p.cfgScale, p.steps).foreach { values =>
       args += "guidance_schedule=" + values.map(scale => s"${scale}x1").mkString("+")
     }
     activeHook(p.hooks,"apg").foreach { o =>

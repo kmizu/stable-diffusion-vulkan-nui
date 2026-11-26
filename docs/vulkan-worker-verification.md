@@ -3,6 +3,14 @@
 
 
 
+## Windows v0.48 — T-GATE
+
+The ZIP SHA-256 is `08ba3928b5eac5310df4184030f312089b6df2006d719e370f2165801eb99064`. The staged `SDV-NUI.exe` ran masked SDXL img2img through MCP on RTX 3090 with a system-only PATH. It saved and reused 70 cross-attention outputs, recorded the gate step in the PNG, and preserved every unmasked pixel. The ZIP contains the tested worker JAR and native DLL byte for byte.
+
+Radeon 780M tested SD1.5 at 512 × 512 and reused 16 outputs. RTX 3090 tested SDXL at 768 × 768 with Euler, Heun and CFG 1, plus 832 × 832 Latent Hires with scheduled CFG. The nine-channel SDXL Inpaint checkpoint also reused 70 outputs and preserved all unmasked pixels. Radeon 780M verified separate img2img Hires Fix and masked Canny ControlNet. A same-seed job with an intervening change to the prompt and seed reproduced the original gated image. All 37 worker tests passed.
+
+In a warmed RTX 3090 comparison with 14 effective Euler evaluations at 768 × 768, three alternating runs per setting had a median worker time of 9.41 s with the gate beyond the schedule and 10.09 s with gate step 4. Median native sampling times were 4.94 s and 5.11 s. Same-device cache saves queue their copies before synchronizing. The batched and synchronous copies produced identical RGB in the Radeon 780M ControlNet check.
+
 ## Windows v0.47 — CD Tuner
 
 The ZIP SHA-256 is `d02e740ed57c5a6ac197b1edaf44df24306433c64584c96b7511484bd81dac23`. The staged `SDV-NUI.exe` processed `<cdt:d1=3;col1=1>`, additional AlwaysOn values and a 768 × 768 mask through MCP on RTX 3090 with a system-only PATH. The PNG stored the effective `CDT` fields, and every unmasked source pixel matched. The ten-step output retained the fox and meadow. A three-step check with stronger settings produced color artifacts in the edited region. The ZIP contains the tested Java worker and native DLL byte for byte.

@@ -6,7 +6,6 @@ private[vulkan] object VulkanCdTuner:
   val id = "cd_tuner"
   private val promptTags = """<(?:cdt|cdtc):[^>]+>""".r
   def cleanPrompt(prompt: String): String = promptTags.replaceAllIn(prompt, "")
-  val families = Set("sd15", "sdxl", "SD 2.x", "SD 1.x Inpaint", "SD 2.x Inpaint", "SDXL Inpaint")
   private val sdColors = Vector(Vector(-1.0, 1.0 / 3, 2.0 / 3), Vector(1.0, 1.0, 0.0),
     Vector(0.0, -1.0, -1.0), Vector(1.0, 0.0, 1.0))
   private val xlColors = Vector(Vector(0.0, 0.0, 1.0), Vector(1.0, 0.0, 0.0),

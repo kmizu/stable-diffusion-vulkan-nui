@@ -96,7 +96,13 @@ RTX 3090 ran SDXL Latent Hires at 832 × 832 with separate Hires detail and stop
 
 Color Map evaluates the positive and negative branches separately. The worker computes each branch's own magnitude after previous region edits. The legacy backend measures both branches together. SD2.x and arbitrary combinations with other sampling hooks still need end-to-end coverage.
 
-Further Python generation hooks without a corresponding verified implementation in this inventory include `aesthetic_gradients`, `agent_attention`, `characteristic_guidance`, `compile`, `composable_lora`, `controllllite`, `deepcache`, `incantations`, `llul`, `reference`, `tgate`.
+### T-GATE
+
+The U-Net saves each cross-attention output at the gate step and reuses it on later steps, skipping its normalization and projections. The Vulkan buffer stays in the sampler session. Compatible batched CFG stores the mean of its two outputs. Separate predictions and intermediate solver evaluations have their own entries. Each Hires or img2img refinement pass starts with an empty cache. The cross-attention gate follows the [T-GATE method](https://arxiv.org/abs/2404.02747).
+
+SD1.5 on Radeon 780M saved and reused 16 outputs. SDXL on RTX 3090 saved and reused 70. The same-seed masked runs changed the edited region and retained every pixel outside it. A subsequent replay stayed exact after switching the seed and prompt. RTX 3090 also ran CFG 1, a combined scheduled CFG and Latent Hires pass, and Heun with distinct entries for the intermediate evaluations. Radeon 780M ran separate img2img Hires Fix. The combined Fast Mode preset still needs its DeepCache and CFG-Cache paths integrated with T-GATE.
+
+Further Python generation hooks without a corresponding verified implementation in this inventory include `aesthetic_gradients`, `agent_attention`, `characteristic_guidance`, `compile`, `composable_lora`, `controllllite`, `deepcache`, `incantations`, `llul`, `reference`.
 
 ### Boundaries of the port
 

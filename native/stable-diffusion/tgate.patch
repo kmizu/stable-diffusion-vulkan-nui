@@ -1,0 +1,159 @@
+--- a/src/core/runner_cache.cpp
++++ b/src/core/runner_cache.cpp
+@@ -129,7 +129,21 @@
+             }
+             GGML_ASSERT(ggml_is_contiguous(output.second));
+-            ggml_status status;
+-            auto entry = CachedTensor::copy(backend_, output.first, output.second, status);
++            const auto* tensor = output.second;
++            const auto default_type = ggml_backend_get_default_buffer_type(backend_);
++            const bool same_device = !tensor->view_src && tensor->buffer &&
++                                     ggml_backend_buffer_get_type(tensor->buffer) == default_type &&
++                                     !ggml_backend_buffer_is_host(tensor->buffer);
++            ggml_status status = GGML_STATUS_ALLOC_FAILED;
++            std::unique_ptr<CachedTensor> entry;
++            if (same_device) {
++                entry = CachedTensor::allocate(backend_, output.first, output.second);
++                if (entry)
++                    ggml_backend_tensor_copy_async(backend_, backend_, tensor, entry->tensor);
++            } else {
++                entry = CachedTensor::copy(backend_, output.first, output.second, status);
++            }
+             if (entry == nullptr) {
++                // Earlier captures may still be reading graph-owned tensors.
++                ggml_backend_synchronize(backend_);
+                 return status;
+             }
+--- a/src/dgl/bindings/predictor.cpp
++++ b/src/dgl/bindings/predictor.cpp
+@@ -66,4 +66,5 @@
+         options.cdt_map_sign = int(get_int(args, "cdt_map_sign"));
+         auto& hooks = options.unet_hooks;
++        hooks.tgate_step = int(get_int(args, "tgate_step"));
+         hooks.cdt_detail = float(get_number(args, "cdt_detail"));
+         hooks.cdt_detail2 = float(get_number(args, "cdt_detail2"));
+--- a/src/dgl/bindings/registration.cpp
++++ b/src/dgl/bindings/registration.cpp
+@@ -600,4 +600,5 @@
+              number("fps", 0.01, 100000, 24), number("video_sigma_shift", 0.001, 1000, 12), number("audio_sigma_shift", 0.001, 1000, 3),
+              optional("circular_x", Kind::Boolean, false), optional("circular_y", Kind::Boolean, false),
++             integer("tgate_step", 0, 1000, 0),
+              number("cdt_detail", -10000, 10000, 0), number("cdt_detail2", -10000, 10000, 0),
+              number("cdt_contrast", -10000, 10000, 0), number("cdt_stop", -10000, 10000, 0),
+--- a/src/dgl/models/dit.cpp
++++ b/src/dgl/models/dit.cpp
+@@ -343,4 +343,9 @@
+         sd::nui::active.timestep = parameterization.timestep(sigma);
+         sd::nui::active.evaluation = step.unet_evaluation;
++        const int gate = options.unet_hooks.tgate_step;
++        if (gate > 0 && step.schedule_size > size_t(gate + 1) && sd_version_is_unet(version())) {
++            sd::nui::active.tgate_step = gate;
++            sd::nui::active.tgate_substep = step.solver_index < 0;
++        }
+         const auto channel_axis = shape.size() == 5 ? 3 : 2;
+         const auto down_factor  = get_diffusion_model_down_factor();
+@@ -481,4 +486,9 @@
+             throw std::runtime_error("diffusion compute failed");
+         }
++        const auto& attention = sd::nui::active;
++        if (attention.tgate_step && (step.index == gate || step.index == gate + 1)) {
++            LOG_INFO("T-GATE step %d, cross-attention saved %d, reused %d",
++                     step.index, attention.tgate_captures, attention.tgate_reuses);
++        }
+         if (result.shape() != shape) {
+             throw std::runtime_error("diffusion output shape " + sd::tensor_shape_to_string(result.shape()) +
+--- a/src/dgl/ops/predictor.cpp
++++ b/src/dgl/ops/predictor.cpp
+@@ -460,4 +460,6 @@
+         auto options = leaf.options;
+         options.unet_hooks.sag_capture = sag_mask;
++        if (options.unet_hooks.tgate_step > 0)
++            options.unet_hooks.tgate_branch = reinterpret_cast<uintptr_t>(&leaf);
+         if (sag_mask) step.cache = nullptr;
+         auto prediction = engine.predict_diffusion(x, leaf.resolved_parameterization(), sigma, leaf.condition, leaf.references,
+@@ -473,6 +475,11 @@
+         models::CircularAxesScope circular_axes(model, leaf.circular_x, leaf.circular_y);
+         sd::ParallelScope tensor_scope(model.tensor_executor.get());
++        auto options = leaf.options;
++        if (options.unet_hooks.tgate_step > 0) {
++            options.unet_hooks.tgate_branch = reinterpret_cast<uintptr_t>(&leaf);
++            options.unet_hooks.tgate_pair = true;
++        }
+         auto prediction = model.predict_diffusion(sd::ops::concat(x, x, 3), leaf.resolved_parameterization(), sigma, condition, {},
+-                                                  leaf.options, step);
++                                                  options, step);
+         if (prediction.output.empty())
+             throw std::runtime_error("batched diffusion prediction failed");
+--- a/src/model/common/block.hpp
++++ b/src/model/common/block.hpp
+@@ -507,8 +507,39 @@
+         x      = attn1->self_attention(ctx, x);  // self-attention
+         x      = ggml_add(ctx->ggml_ctx, x, r);
+-        r      = x;
+-        x      = norm2->forward(ctx, x);
+-        x      = attn2->forward(ctx, x, context);  // cross-attention
+-        x      = ggml_add(ctx->ggml_ctx, x, r);
++        r = x;
++        auto& pass = sd::nui::active;
++        auto* graph = ctx->ggml_ctx;
++        const bool tgate = pass.tgate_step > 0 && int(pass.step) >= pass.tgate_step;
++        ggml_tensor* cached = nullptr;
++        std::string key;
++        const bool pair = tgate && pass.options->tgate_pair && x->ne[2] == 2;
++        if (tgate) {
++            key = "tgate." + std::to_string(pass.options->tgate_branch) +
++                  (pair ? ".pair." : ".single.") + (pass.tgate_substep ? "sub." : "main.") +
++                  std::to_string(reinterpret_cast<uintptr_t>(this));
++            if (int(pass.step) > pass.tgate_step) {
++                cached = ctx->load_cache_tensor(key);
++                if (cached && (cached->ne[0] != x->ne[0] || cached->ne[1] != x->ne[1] ||
++                               cached->ne[2] != (pair ? 1 : x->ne[2])))
++                    cached = nullptr;
++            }
++        }
++        if (cached) {
++            x = cached;
++            ++pass.tgate_reuses;
++        } else {
++            x = attn2->forward(ctx, norm2->forward(ctx, x), context);
++            if (tgate) {
++                auto* stored = x;
++                if (pair) {
++                    auto* positive = ggml_view_3d(graph, x, x->ne[0], x->ne[1], 1, x->nb[1], x->nb[2], 0);
++                    auto* negative = ggml_view_3d(graph, x, x->ne[0], x->ne[1], 1, x->nb[1], x->nb[2], x->nb[2]);
++                    stored = ggml_scale(graph, ggml_add(graph, positive, negative), 0.5f);
++                }
++                ctx->persist_cache_tensor(key, stored);
++                ++pass.tgate_captures;
++            }
++        }
++        x = cached ? ggml_add(graph, r, x) : ggml_add(graph, x, r);
+         r      = x;
+         x      = norm3->forward(ctx, x);
+--- a/src/model/common/nui_unet_hooks.hpp
++++ b/src/model/common/nui_unet_hooks.hpp
+@@ -19,4 +19,7 @@
+         bool shrink_after_skip = true;
+         uint32_t tile_seed = 0;
++        int tgate_step = 0;
++        uintptr_t tgate_branch = 0;
++        bool tgate_pair = false;
+         float cdt_detail = 0.f, cdt_detail2 = 0.f, cdt_contrast = 0.f, cdt_stop = 0.f;
+     };
+@@ -29,4 +32,7 @@
+         float timestep = 0.f;
+         int evaluation = 0, depth_factor = 1;
++        int tgate_step = 0;
++        bool tgate_substep = false;
++        int tgate_captures = 0, tgate_reuses = 0;
+     };
+     inline thread_local UNetPass active;
+--- a/src/model/diffusion/unet.hpp
++++ b/src/model/diffusion/unet.hpp
+@@ -872,5 +872,5 @@
+         }
+
+-        auto runner_ctx            = get_context();
++        auto runner_ctx            = get_context(sd::nui::active.tgate_step > 0 ? gf : nullptr);
+         runner_ctx.ip_context      = ip_context;
+         runner_ctx.ip_scale        = ip_scale;
