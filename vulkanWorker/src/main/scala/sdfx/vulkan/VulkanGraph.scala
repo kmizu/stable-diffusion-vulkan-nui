@@ -26,6 +26,11 @@ private[vulkan] object VulkanGraph:
   private def quoted(s: String): String = ujson.write(ujson.Str(s))
   private def path(s: String): String = quoted(VulkanConditioning.file(s, "DGL model"))
 
+  /** Matches the pinned SD1.x, SD2.x and SDXL VAE's latent_shape alignment. */
+  def nativeSize(width: Int, height: Int): (Int, Int) =
+    def align(side: Int): Int = math.max(64, ((side.toLong + 32) / 64 * 64).toInt)
+    (align(width), align(height))
+
   def render(engine: VulkanInference, device: String, model: LoadedModel, settings: LoadModelRequest,
       req: GenerationRequest, hook: String, prompt: String, loras: Seq[LoraRef], seed: Long, schedule: String,
       cancelled: () => Boolean, tweak: Option[VulkanHiresTweaks.Pass] = None,
@@ -197,8 +202,15 @@ private[vulkan] object VulkanGraph:
     lazy val adapter = path(h("model").str)
     val inputs = scala.collection.mutable.LinkedHashMap.empty[String,BufferedImage]
     sonar.flatMap(_.image).foreach(im=>inputs("sonar_ref")=im)
-    val size = s"width = ${p.width}, height = ${p.height}"
+    val baseSize = (p.width, p.height)
+    val (width, height) = if up.isEmpty && postDiff.isEmpty then nativeSize(p.width, p.height) else baseSize
+    val hiresSize = p.hires.targetSize(p.width, p.height)
+    val (hiresWidth, hiresHeight) = nativeSize(hiresSize._1, hiresSize._2)
+    val size = s"width = $width, height = $height"
     val enc = s"$size, clip_skip = ${p.clipSkip}"
+    def onCanvas(image: BufferedImage): BufferedImage =
+      if (image.getWidth, image.getHeight) == (width, height) then image
+      else VulkanImageInputs.resize(image, width, height, 0)
     val textSchedule = if signedText then Some(VulkanNegPip.prepare(p,prompt,text,enc,lines))
       else fusionScratch.map { scratch =>
         val width = if family.startsWith("sdxl") then 2048 else if family.startsWith("sd2") then 1024 else 768
@@ -337,9 +349,9 @@ private[vulkan] object VulkanGraph:
             VulkanImageInputs.Inputs(image, None, image, None, None)
           }
         }
-        inputs("init") = init.init
+        inputs("init") = onCanvas(init.init)
         init.mask.foreach { mask =>
-          inputs("paint_mask") = mask
+          inputs("paint_mask") = onCanvas(mask)
           overlay = Some(init)
         }
         val posterior = if inverse then ", posterior = \"mode\"" else ""
@@ -347,7 +359,7 @@ private[vulkan] object VulkanGraph:
         lines += s"base = tensor::broadcast_to(encoded, $shape)"
     if overlay.nonEmpty then
       lines += "mask = tensor::threshold(image::to_f32(tensor::grayscale(paint_mask, axis = 0)), threshold = 0.5)"
-    else if inpaint then lines += s"mask = tensor::full([${p.width},${p.height},1,1], 1)"
+    else if inpaint then lines += s"mask = tensor::full([$width,$height,1,1], 1)"
     if overlay.nonEmpty || inpaint then
       lines += "latent_mask = tensor::max_pool2d(mask, kernel = [8,8], stride = [8,8])"
     if inpaint then
@@ -368,29 +380,27 @@ private[vulkan] object VulkanGraph:
         val file = VulkanConditioning.file(config.image, "reference image")
         if config.weight > 0 then
           val image = VulkanImageInputs.read(file)
-          inputs("ref_image") = VulkanImageInputs.resize(image, p.width, p.height, 1)
+          inputs("ref_image") = VulkanImageInputs.resize(image, width, height, 1)
           if hiresPass then
-            val (width, height) = p.hires.targetSize(p.width, p.height)
-            inputs("hr_ref_image") = VulkanImageInputs.resize(image, width, height, 1)
+            inputs("hr_ref_image") = VulkanImageInputs.resize(image, hiresWidth, hiresHeight, 1)
           lines ++= config.prepare("ref", tiled)
       }
       lllite.foreach { (config, _) =>
         val source = config.image.map(VulkanImageInputs.read)
           .orElse(inputs.get("init"))
           .getOrElse(VulkanImageInputs.read(config.source(p.img2img.map(_.initImage))))
-        inputs("lllite_image") = VulkanImageInputs.resize(source, p.width, p.height, 1)
+        inputs("lllite_image") = VulkanImageInputs.resize(source, width, height, 1)
         if hiresPass && config.image.nonEmpty then
-          val (width, height) = p.hires.targetSize(p.width, p.height)
-          inputs("hr_lllite_image") = VulkanImageInputs.resize(source, width, height, 1)
+          inputs("hr_lllite_image") = VulkanImageInputs.resize(source, hiresWidth, hiresHeight, 1)
         lines += "lllite_hint = image::to_f32(lllite_image, channels = 3)"
       }
       cdTuner.foreach(tuner => lines ++= tuner.prepareMap("cdt_map"))
       fooocus.foreach { assets =>
         if overlay.isEmpty then invalid("Fooocus Inpaint did not produce a prepared mask")
-        lines ++= assets.prepareInput(p.width, p.height, encodeRng, tiled)
+        lines ++= assets.prepareInput(width, height, encodeRng, tiled)
       }
       control.foreach { (modelPath, image, weight) =>
-        inputs("control_image") = image
+        inputs("control_image") = onCanvas(image)
         lines += s"control_model = controlnet::load(${quoted(modelPath)}, $common)"
         lines += "control_hint = image::to_f32(control_image)"
         lines += s"controlled_pos = controlnet::apply(latent_pos, control_model, control_hint, strength = $weight)"
@@ -420,13 +430,13 @@ private[vulkan] object VulkanGraph:
     val softSteps = soft.fold(0)(_ => (p.steps*p.img2img.get.denoisingStrength).toInt.max(1).min(p.steps))
     lines += s"sigmas = ${if inverse then "full" else if soft.nonEmpty then s"full[${p.steps-softSteps}:]" else sigmas}"
     val baseNoise = tweak.filter(_ => p.subseedStrength>0).flatMap { pass =>
-      pass.copy(seed = seed,subseed = pass.baseSubseed,strength = p.subseedStrength,width = 0,height = 0).noise(engine,p.width/8,p.height/8)
+      pass.copy(seed = seed,subseed = pass.baseSubseed,strength = p.subseedStrength,width = 0,height = 0).noise(engine,width/8,height/8)
     }
     if inverse then lines ++= VulkanInverse.start(h,p,prompt,text,enc)
     else if baseNoise.nonEmpty then lines += "start = add_noise(guided, base, base_noise, sigma = sigmas[0])"
     else lines += "start = add_noise(guided, base, tensor::randn_like(base, rng = rng), sigma = sigmas[0])"
     val eta = p.eta.fold("")(e => s", eta = $e")
-    if soft.nonEmpty then lines ++= soft.get.sample(softSteps,p.width,p.height,VulkanProtocol.samplers(p.samplerName),eta,seed,tiled)
+    if soft.nonEmpty then lines ++= soft.get.sample(softSteps,width,height,VulkanProtocol.samplers(p.samplerName),eta,seed,tiled)
     else if postDiff.nonEmpty then lines ++= postDiff.get.sample
     else if sonar.nonEmpty then lines ++= sonar.get.sample(inputs.contains("sonar_ref"),tiled)
     else if hook == "neutral_prompt" then lines ++= VulkanNeutralPrompt.sample(p,prompt,h,text,enc)
@@ -435,14 +445,10 @@ private[vulkan] object VulkanGraph:
       val mask = if inpaint then ", base = base, denoise_mask = denoise_mask"
         else if overlay.nonEmpty then ", base = base, denoise_mask = latent_mask" else ""
       lines += s"latent = sample(start, sigmas, predict = guided, method = ${quoted(VulkanProtocol.samplers(p.samplerName))}, rng = rng$eta$mask)"
-    val noise = tweak.flatMap { pass =>
-      val (w,h) = p.hires.targetSize(p.width,p.height)
-      pass.noise(engine,w/8,h/8)
-    }
+    val noise = tweak.flatMap(_.noise(engine, hiresWidth/8, hiresHeight/8))
     if hiresPass then
       val controlWeight = control.flatMap { _ =>
-        val (width, height) = p.hires.targetSize(p.width, p.height)
-        VulkanConditioning.control(req.copy(params = p.copy(width = width, height = height)), cancelled).map {
+        VulkanConditioning.control(req.copy(params = p.copy(width = hiresWidth, height = hiresHeight)), cancelled).map {
           case (_, image, weight) =>
             inputs("hr_control_image") = image
             weight
@@ -463,5 +469,8 @@ private[vulkan] object VulkanGraph:
     if cancelled() then throw new java.util.concurrent.CancellationException()
     if isVideo then engine.dglFrames(source, inputs.asJava, "output").asScala.toVector
     else
-      val image = engine.dglImage(source, inputs.asJava, "output", noises.asJava)
+      val decoded = engine.dglImage(source, inputs.asJava, "output", noises.asJava)
+      val (outputWidth, outputHeight) = if hiresPass then hiresSize else baseSize
+      val canvasChanged = if hiresPass then (hiresWidth, hiresHeight) != hiresSize else (width, height) != baseSize
+      val image = if canvasChanged then VulkanImageInputs.resize(decoded, outputWidth, outputHeight, 0) else decoded
       Seq(soft.fold(overlay.fold(image)(_.finish(image)))(_.composite(overlay.get,image,cancelled)))

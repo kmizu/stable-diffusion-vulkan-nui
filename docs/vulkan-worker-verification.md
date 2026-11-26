@@ -3,6 +3,14 @@
 
 
 
+## Windows v0.54 — Graph image dimensions
+
+Vulkan graph img2img now prepares the input image, generation mask and conditioning images at the model's internal canvas size. The worker restores the requested dimensions before compositing with the original mask. Latent Hires uses an internally aligned target as well.
+
+Direct LLuL tests on RTX 3090 with SDXL returned 800 × 776 for plain and masked img2img and 864 × 808 for Latent Hires. Radeon 780M with SD1.5 returned 544 × 520 and 608 × 552 respectively. Both masked runs retained every source RGB channel outside the mask. The images were inspected, and all 49 Vulkan worker tests passed.
+
+The staged `SDV-NUI.exe` repeated both masked jobs through MCP on a system-only PATH with `cuda=false`. The ZIP SHA-256 is `af52a082c688e19e9bceea5d83b8fe47e7000651c4da531a110eab6f0077ca3b`. The archived launcher, desktop JAR, worker JAR and inference DLL matched the verified staged files byte for byte.
+
 ## Windows v0.53 — LLuL
 
 The staged `SDV-NUI.exe` ran the LLuL output-layer hook through MCP `img2img` on Radeon 780M with SD1.5 at 512 × 512 and on RTX 3090 with SDXL at 768 × 768. Both runs used weight 0.15 and a system-only PATH, reported `cuda=false`, recorded LLuL settings in the PNG and preserved every RGB channel outside the img2img mask.

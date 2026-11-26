@@ -42,6 +42,18 @@ class VulkanWorkerSuite extends munit.FunSuite:
     assertEquals((h.width(), h.height(), h.upscaler()), (1024, 768, "latent_nearest_exact"))
   }
 
+  test("graph Hires uses the aligned latent canvas for sampling and inpainting") {
+    import sdfx.core.model.{HiresParams, Img2ImgParams}
+    val p = GenerationParams(width = 800, height = 776, samplerName = "Euler", scheduler = "Karras",
+      hires = HiresParams(enabled = true, resizeX = 864, resizeY = 808, upscaler = "Latent"),
+      img2img = Some(Img2ImgParams("source", Some("mask"))))
+    assertEquals(VulkanGraph.nativeSize(p.width, p.height), (832, 768))
+    val graph = VulkanHiresGraph.refinement(GenerationRequest(p, "outputs"), "test", Nil, 3,
+      "unet", "text", "", "Vulkan0", customNoise = false, tiled = "", inpaint = true)
+    for prefix <- Seq("hr_base", "hr_inpaint_condition", "hr_mask") do
+      assert(graph.exists(line => line.startsWith(prefix + " =") && line.contains("size = [112,104]")), prefix)
+  }
+
   test("latent upscale keeps the requested number of denoiser steps at fractional strength") {
     import sdfx.core.model.Img2ImgParams
     val p = GenerationParams(steps = 17, img2img = Some(Img2ImgParams("source", denoisingStrength = 0.3)))

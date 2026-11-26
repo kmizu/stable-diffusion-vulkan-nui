@@ -24,7 +24,8 @@ private[vulkan] object VulkanHiresGraph:
     import VulkanProtocol.{invalid,unsupported}
     val p = req.params
     val h = p.hires
-    val (width,height) = h.targetSize(p.width,p.height)
+    val (targetWidth, targetHeight) = h.targetSize(p.width, p.height)
+    val (width, height) = VulkanGraph.nativeSize(targetWidth, targetHeight)
     val method = h.upscaler match
       case "Latent" | "Latent (antialiased)" => "bilinear"
       case "Latent (bicubic)" | "Latent (bicubic antialiased)" => "bicubic"
@@ -54,13 +55,13 @@ private[vulkan] object VulkanHiresGraph:
     val encoding = s"width = $width, height = $height, clip_skip = ${p.clipSkip}"
     val resolved = p.hooks.get("hires_fix_tweaks").exists(_.obj.get("prompts_resolved").exists(_.bool))
     def selected(value: String, fallback: String) = if resolved || value.nonEmpty then value else fallback
-    val areaRatio = width.toDouble * height / (p.width.toDouble * p.height)
+    val areaRatio = targetWidth.toDouble * targetHeight / (p.width.toDouble * p.height)
     val baseSteps = p.img2img.fold(p.steps)(i => ((p.steps * i.denoisingStrength).toInt + 1).min(p.steps))
     reference.foreach(config => lines ++= config.prepare("hr_ref", tiled))
     val agentArgs = agent.fold("")(_.args(seed, hires = true))
     val full = fullSteps(p)
     require(full <= 10000,"Hires schedule exceeds 10000 steps")
-    val llulArgs = llul.filter(_.canApply(full)).fold("")(_.args(width, height, "llul_mask", full))
+    val llulArgs = llul.filter(_.canApply(full)).fold("")(_.args(targetWidth, targetHeight, "llul_mask", full))
     controlWeight.foreach(_ => lines += "hr_control_hint = image::to_f32(hr_control_image)")
     val concat = if inpaint then
       lines += s"hr_inpaint_condition = tensor::interpolate(inpaint_condition, size = [${width/8},${height/8}])"
