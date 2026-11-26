@@ -162,6 +162,13 @@ private[vulkan] object VulkanGraph:
     val incantations = hook == VulkanIncantations.id && VulkanIncantations.attentionPasses(p)
     val segArgs = if incantations then VulkanIncantations.segArguments(p.hooks, p.width, p.height, passSteps) else ""
     val scfgArgs = if incantations then VulkanIncantations.scfgArguments(p.hooks, p.width, p.height, passSteps) else ""
+    val t2i = incantations && VulkanIncantations.t2i0(p.hooks).exists(t => t.strength != 0 || t.alpha > 0)
+    def t2iArgs(branch: String): String =
+      if t2i then
+        val peer = if branch == "neg" then "latent_pos" else "latent_neg"
+        s", t2i0_peer = $peer, t2i0_empty = latent_empty" +
+          VulkanIncantations.t2iArguments(p.hooks, passSteps, p.width, p.height, "latent_pos", branch, retain = p.hires.enabled)
+      else ""
     val incantationsPag = incantations && VulkanIncantations.pag(p.hooks).exists(_.canApply(passSteps))
     val patchedInputs = customText || unetGraph || modifier.nonEmpty || fooocus.nonEmpty || cdTuner.nonEmpty || cacheGraph || patchedAttention || characteristic.nonEmpty || composable.nonEmpty || aesthetic.nonEmpty || incantations
     val supportsControl = unetGraph || cdTuner.nonEmpty || tgate.nonEmpty || patchedAttention || aesthetic.nonEmpty || incantations || modifier.nonEmpty && !customText
@@ -285,9 +292,12 @@ private[vulkan] object VulkanGraph:
     val (hiresWidth, hiresHeight) = nativeSize(hiresSize._1, hiresSize._2)
     val size = s"width = $width, height = $height"
     val enc = s"$size, clip_skip = ${p.clipSkip}"
+    if t2i then lines += s"""latent_empty = encode_prompt($text, "", $enc)"""
     def condition(label: String, caption: String, negative: Boolean): Unit =
       aestheticConditioning match
-        case None => lines += s"$label = encode_prompt($text, ${quoted(caption)}, $enc)"
+        case None =>
+          val tokenIds = if t2i then ", clip_a1111_chunks = true" else ""
+          lines += s"$label = encode_prompt($text, ${quoted(caption)}, $enc$tokenIds)"
         case Some(conditioning) => conditioning.encode(label, text, caption, enc, negative, sharedLoras, lines)
     def onCanvas(image: BufferedImage): BufferedImage =
       if (image.getWidth, image.getHeight) == (width, height) then image
@@ -507,17 +517,17 @@ private[vulkan] object VulkanGraph:
           val negRef = reference.fold("")(_.args("ref", positive = false))
           val llliteArgs = lllite.fold("")((config, path) => config.args(path, "lllite_hint"))
           val llulArgs = llul.filter(_.canApply(p.steps)).fold("")(_.args(p.width, p.height, "llul_mask", p.steps))
-          lines += s"pos = predictor(unet, $positiveInput$concat$unetArgs$fooocusArgs${cdArgs(false)}$posRef$llliteArgs$llulArgs$scfgArgs)"
+          lines += s"pos = predictor(unet, $positiveInput$concat$unetArgs$fooocusArgs${cdArgs(false)}$posRef$llliteArgs$llulArgs$scfgArgs${t2iArgs("pos")})"
           val blank = if aesthetic.fold(p.negativePrompt.nonEmpty)(_ => p.negativePrompt.trim.nonEmpty) then ""
             else if lllite.nonEmpty then ", lllite_blank_negative = true"
             else if llul.nonEmpty then ", llul_blank_negative = true"
             else if characteristic.nonEmpty then ", sdxl_blank_negative = true"
             else if aesthetic.nonEmpty || incantations then ", sdxl_blank_negative = true"
             else ""
-          lines += s"neg = predictor(unet, $negativeInput$concat$unetArgs$fooocusArgs${cdArgs(true)}$negRef$llliteArgs$llulArgs$blank$segArgs)"
+          lines += s"neg = predictor(unet, $negativeInput$concat$unetArgs$fooocusArgs${cdArgs(true)}$negRef$llliteArgs$llulArgs$blank$segArgs${t2iArgs("neg")})"
       lines += guidance
       if incantationsPag then
-        lines ++= VulkanIncantations.pagGraph(p.hooks, passSteps, unet, positiveInput, concat, positive, target, "guided")
+        lines ++= VulkanIncantations.pagGraph(p.hooks, passSteps, unet, positiveInput, concat, positive, target, "guided", t2iArgs("perturbed"))
     val fullSteps = up.fold(p.steps)(_.fullSteps)
     val scheduleName = up.fold(schedule)(_.scheduler)
     val schedulePredictor = if composable.nonEmpty then "clora_schedule" else "guided"

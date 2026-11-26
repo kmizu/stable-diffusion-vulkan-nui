@@ -50,6 +50,66 @@ private[vulkan] object VulkanIncantations:
   final case class Pag(scale: Float, start: Int, end: Int, sanf: Boolean) extends StepWindow
   final case class Scfg(scale: Float, start: Int, end: Int, r: Int, min: Float, max: Float, clamp: Float) extends StepWindow
 
+  final case class T2iZero(start: Int, end: Int, tokens: Vector[Int], radius: Int,
+      threshold: Double, strength: Double, alpha: Double, ema: Double) extends StepWindow:
+    def suppresses(index: Int): Boolean = alpha > 0 && index >= start && (end <= 0 || index <= end)
+
+  def t2i0(hooks: Map[String, Value]): Option[T2iZero] =
+    configured(hooks).filter(flag(_, "t2i0_active")).map { config =>
+      val raw = config.obj.get("t2i0_tokens").filterNot(_ == ujson.Null).fold("")(_.str)
+      val tokens = if raw.isEmpty then Vector.empty else raw.split(",", -1).toVector.map(token =>
+        token.trim.toIntOption.getOrElse(VulkanProtocol.invalid("T2I-Zero Tokens must be comma separated integers")))
+      val radius = step(config, "t2i0_window_size", 2)
+      if radius < 0 then VulkanProtocol.invalid("T2I-Zero window size must be nonnegative")
+      val settings = Seq(number(config, "t2i0_correction_threshold", .5), number(config, "t2i0_correction_strength", 0),
+        number(config, "t2i0_ctnms_alpha", .1), number(config, "t2i0_ema_factor", 0))
+      if settings.exists(value => !value.toFloat.isFinite) then VulkanProtocol.invalid("T2I-Zero settings must fit in float32")
+      T2iZero(step(config, "t2i0_step_start", 1), step(config, "t2i0_step_end", 25), tokens, radius,
+        settings(0), settings(1), settings(2), settings(3))
+    }
+
+  private def pagAt(settings: Option[Pag], index: Int): Boolean =
+    settings.exists { config =>
+      val step = math.max(0, index - 1)
+      step >= config.start && step <= config.end
+    }
+
+  def t2iClock(hooks: Map[String, Value], count: Int, offset: Int, perturbed: Boolean): Vector[Int] =
+    val settings = pag(hooks)
+    var next = offset
+    Vector.tabulate(count) { index =>
+      val result = next + (if perturbed then 1 else 0)
+      next += (if pagAt(settings, index) then 2 else 1)
+      result
+    }
+
+  def t2iOffset(hooks: Map[String, Value], count: Int): Int =
+    val settings = pag(hooks)
+    count + (0 until count).count(pagAt(settings, _))
+
+  private def t2iAt(hooks: Map[String, Value], count: Int, offset: Int): Boolean = t2i0(hooks).exists { config =>
+    config.strength != 0 && config.canApply(count) || t2iClock(hooks, count, offset, perturbed = false)
+      .zipWithIndex.exists { (index, evaluation) =>
+        config.suppresses(index) || pagAt(pag(hooks), evaluation) && config.suppresses(index + 1)
+      }
+  }
+
+  def t2iArguments(hooks: Map[String, Value], count: Int, width: Int, height: Int,
+      clip: String, branch: String, previous: Int = 0, retain: Boolean = false): String = t2i0(hooks).fold("") { config =>
+    val clock = t2iClock(hooks, count, t2iOffset(hooks, previous), perturbed = branch == "perturbed")
+    val strength = if branch == "pos" && config.canApply(count) then config.strength else 0.0
+    val first = clock.find(config.suppresses)
+    if strength == 0 && first.isEmpty then ""
+    else
+      val previousActive = t2iClock(hooks, previous, 0, perturbed = false).exists(config.suppresses)
+      val reset = if previousActive then -1 else first.getOrElse(-1)
+      val tokens = if config.tokens.isEmpty then "" else s", t2i0_tokens = ${config.tokens.mkString("[", ",", "]")}"
+      val history = if config.ema <= 0 then ""
+        else if retain then clock.findLast(config.suppresses).fold("")(last => s", t2i0_save = $last")
+        else if previousActive && branch != "perturbed" then s", t2i0_previous = $branch" else ""
+      s""", t2i0_prompt = $clip, t2i0_start = ${config.start}, t2i0_end = ${config.end}, t2i0_radius = ${config.radius}, t2i0_threshold = ${config.threshold}, t2i0_strength = $strength, t2i0_alpha = ${config.alpha}, t2i0_ema = ${config.ema}, t2i0_width = $width, t2i0_height = $height, t2i0_clock = ${clock.mkString("[", ",", "]")}, t2i0_reset = $reset, t2i0_branch = "$branch"$tokens$history"""
+  }
+
   def seg(hooks: Map[String, Value]): Option[Seg] =
     configured(hooks).filter(flag(_, "seg_active")).flatMap { config =>
       val blur = number(config, "seg_blur_sigma", 11)
@@ -77,12 +137,14 @@ private[vulkan] object VulkanIncantations:
         r, value("scfg_rate_min", 0.8), value("scfg_rate_max", 3), value("scfg_rate_clamp", 0)))
     }
 
-  def attentionAt(hooks: Map[String, Value], count: Int): Boolean =
-    seg(hooks).exists(_.canApply(count)) || pag(hooks).exists(_.canApply(count)) || scfg(hooks).exists(_.canApply(count))
+  def attentionAt(hooks: Map[String, Value], count: Int, offset: Int = 0): Boolean =
+    seg(hooks).exists(_.canApply(count)) || pag(hooks).exists(_.canApply(count)) || scfg(hooks).exists(_.canApply(count)) ||
+      t2iAt(hooks, count, offset)
 
   def attentionPasses(p: GenerationParams): Boolean =
     val base = p.img2img.fold(p.steps)(i => VulkanImageInputs.img2imgSteps(p.steps, i.denoisingStrength))
-    attentionAt(p.hooks, base) || (p.hires.enabled && attentionAt(p.hooks, VulkanHiresGraph.refinementSteps(p)))
+    val high = if p.hires.enabled then VulkanHiresGraph.refinementSteps(p) else 0
+    attentionAt(p.hooks, base) || p.hires.enabled && attentionAt(p.hooks, high, t2iOffset(p.hooks, base))
 
   def segArguments(hooks: Map[String, Value], width: Int, height: Int, count: Int): String =
     seg(hooks).filter(_.canApply(count)).fold("") { config =>
@@ -95,15 +157,22 @@ private[vulkan] object VulkanIncantations:
     }
 
   def pagGraph(hooks: Map[String, Value], count: Int, unet: String, condition: String, args: String,
-      positive: String, base: String, output: String): Vector[String] =
+      positive: String, base: String, output: String, t2iArgs: String = ""): Vector[String] =
     pag(hooks).filter(_.canApply(count)).fold(Vector(s"$output = $base")) { config =>
       val branch = s"${output}_perturbed"
-      Vector(s"$branch = predictor($unet, $condition$args, pag_regions = 512)",
+      Vector(s"$branch = predictor($unet, $condition$args, pag_regions = 512$t2iArgs)",
         s"$output = incantations_pag($base, $positive, $branch, scale = ${config.scale}, start_step = ${config.start}, end_step = ${config.end}, sanf = ${config.sanf})")
     }
 
   def validate(p: GenerationParams): Unit = configured(p.hooks).foreach { config =>
-    if flag(config, "t2i0_active") then VulkanProtocol.unsupported("Incantations Multi-Concept T2I-Zero")
+    t2i0(p.hooks).filter(t => t.strength != 0 || t.alpha > 0).foreach { t =>
+      validateSampler(p.samplerName, "T2I-Zero")
+      if p.hires.enabled then p.hires.samplerName.foreach(validateSampler(_, "T2I-Zero"))
+      Img2ImgHiresMetadata.active(p.hooks).filter(_("denoise").num > 0).map(_("sampler").str)
+        .filterNot(_ == "Use same sampler").foreach(validateSampler(_, "T2I-Zero"))
+      if t.alpha > 0 && t.ema > 0 && pag(p.hooks).nonEmpty then
+        VulkanProtocol.unsupported("T2I-Zero CTNMS EMA with Incantations PAG")
+    }
     val attention = Option.when(seg(p.hooks).nonEmpty)("SEG").orElse(Option.when(pag(p.hooks).nonEmpty)("PAG"))
       .orElse(Option.when(scfg(p.hooks).nonEmpty)("S-CFG"))
     attention.foreach { feature =>

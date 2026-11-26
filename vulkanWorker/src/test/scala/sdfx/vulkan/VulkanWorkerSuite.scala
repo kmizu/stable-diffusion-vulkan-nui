@@ -144,6 +144,20 @@ class VulkanWorkerSuite extends munit.FunSuite:
     assert(error.message.contains("SEG with sampler Heun"))
   }
 
+  test("T2I-Zero counts the PAG evaluations in the CTNMS module clock") {
+    val hooks = Map("incantations" -> ujson.Obj("t2i0_active" -> true, "t2i0_tokens" -> "5, -1, 2",
+      "pag_active" -> true, "pag_scale" -> 1, "pag_start_step" -> 0, "pag_end_step" -> 1))
+    assertEquals(VulkanIncantations.t2i0(hooks).get.tokens, Vector(5, -1, 2))
+    assertEquals(VulkanIncantations.t2iClock(hooks, 5, 0, perturbed = false), Vector(0, 2, 4, 6, 7))
+    assertEquals(VulkanIncantations.t2iClock(hooks, 2, 8, perturbed = true), Vector(9, 11))
+    val ema = Map("incantations" -> ujson.Obj("t2i0_active" -> true, "t2i0_ema_factor" -> .6,
+      "t2i0_step_start" -> 0, "t2i0_step_end" -> 0, "t2i0_correction_strength" -> .35))
+    val pos = VulkanIncantations.t2iArguments(ema, 3, 512, 512, "latent_pos", "pos", retain = true)
+    assert(pos.contains("t2i0_strength = 0.35") && pos.contains("t2i0_save = 2"))
+    val neg = VulkanIncantations.t2iArguments(ema, 2, 512, 512, "latent_pos", "neg", previous = 3)
+    assert(neg.contains("t2i0_strength = 0.0") && neg.contains("t2i0_previous = neg"))
+  }
+
   test("Incantations S-CFG serializes the selected resolutions and guidance controls") {
     val hooks = Map("incantations" -> ujson.Obj("scfg_active" -> true, "scfg_scale" -> 1.25,
       "scfg_r" -> 3, "scfg_start_step" -> 1, "scfg_end_step" -> 4, "scfg_rate_clamp" -> 3))

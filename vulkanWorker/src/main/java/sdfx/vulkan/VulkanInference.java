@@ -791,6 +791,10 @@ public final class VulkanInference implements AutoCloseable {
         return cString(ptr("sd_dgl_builtin_catalog")).contains("`scfg_scale?");
     }
 
+    public boolean supportsT2iZero() {
+        return cString(ptr("sd_dgl_builtin_catalog")).contains("`t2i0_prompt?");
+    }
+
     public boolean supportsCharacteristic() {
         return cString(ptr("sd_dgl_builtin_catalog")).contains("`characteristic?");
     }

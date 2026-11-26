@@ -1,0 +1,523 @@
+--- a/src/conditioning/conditioner.hpp
++++ b/src/conditioning/conditioner.hpp
+@@ -36,4 +36,5 @@
+     sd::Tensor<float> c_concat;
+     sd::Tensor<int32_t> c_clip_ids;
++    sd::Tensor<int32_t> c_clip_count;
+     sd::Tensor<int32_t> c_t5_ids;
+     sd::Tensor<float> c_t5_weights;
+@@ -156,4 +157,5 @@
+     bool clip_no_special_tokens = false;
+     bool clip_return_tokens = false;
++    bool clip_a1111_chunks = false;
+     std::shared_ptr<sd::TextualInversion> textual_inversion;
+ };
+@@ -397,5 +399,6 @@
+                                                              bool allow_overflow_expand            = true,
+                                                              const sd::PromptInput* input          = nullptr,
+-                                                             const sd::TextualInversion* inversion = nullptr) {
++                                                             const sd::TextualInversion* inversion = nullptr,
++                                                             int32_t* a1111_count = nullptr) {
+         sd::PromptInputTemplate prompt_template(input);
+         if (input)
+@@ -419,4 +422,16 @@
+         std::vector<int> tokens;
+         std::vector<float> weights;
++        std::vector<int> comma;
++        if (a1111_count)
++            tokenizer->encode(",", comma);
++        size_t chunk_begin = 0;
++        int last_comma = -1;
++        auto finish_chunk = [&] {
++            const auto padding = 75 - (tokens.size() - chunk_begin);
++            tokens.insert(tokens.end(), padding, tokenizer->EOS_TOKEN_ID);
++            weights.insert(weights.end(), padding, 1.f);
++            chunk_begin = tokens.size();
++            last_comma = -1;
++        };
+         for (const auto& item : parsed_attention) {
+             const std::string& curr_text = item.first;
+@@ -424,4 +439,8 @@
+
+             if (curr_text == "BREAK" && curr_weight == -1.0f) {
++                if (a1111_count) {
++                    finish_chunk();
++                    continue;
++                }
+                 // Pad token array up to chunk size at this point.
+                 // TODO: This is a hardcoded chunk_len, like in stable-diffusion.cpp, make it a parameter for the future?
+@@ -455,8 +474,32 @@
+                 return {};
+             }
+-            tokens.insert(tokens.end(), curr_tokens.begin(), curr_tokens.end());
+-            weights.insert(weights.end(), curr_tokens.size(), curr_weight);
+-        }
+-
++            if (a1111_count) {
++                for (int token : curr_tokens) {
++                    const int current = int(tokens.size() - chunk_begin);
++                    if (comma.size() == 1 && token == comma.front()) {
++                        last_comma = current;
++                    } else if (current == 75 && last_comma >= 0 && current - last_comma <= 20) {
++                        const auto cut = chunk_begin + last_comma + 1;
++                        std::vector<int> moved_tokens(tokens.begin() + cut, tokens.end());
++                        std::vector<float> moved_weights(weights.begin() + cut, weights.end());
++                        tokens.resize(cut);
++                        weights.resize(cut);
++                        finish_chunk();
++                        tokens.insert(tokens.end(), moved_tokens.begin(), moved_tokens.end());
++                        weights.insert(weights.end(), moved_weights.begin(), moved_weights.end());
++                    }
++                    if (tokens.size() - chunk_begin == 75)
++                        finish_chunk();
++                    tokens.push_back(token);
++                    weights.push_back(curr_weight);
++                }
++            } else {
++                tokens.insert(tokens.end(), curr_tokens.begin(), curr_tokens.end());
++                weights.insert(weights.end(), curr_tokens.size(), curr_weight);
++            }
++        }
++
++        if (a1111_count)
++            *a1111_count = int32_t(tokens.size());
+         tokenizer->pad_tokens(tokens, &weights, nullptr, min_length, max_length, allow_overflow_expand);
+
+@@ -649,6 +692,8 @@
+         if (inversion)
+             conditioner_params.textual_inversion->load(text_model->model.hidden_size, text_model2 ? text_model2->model.hidden_size : 0);
++        int32_t a1111_count = 0;
+         auto tokens_and_weights = tokenize(conditioner_params.text, text_model->model.n_token, text_model->model.n_token, true,
+-                                           inversion ? conditioner_params.prompt_input : nullptr, inversion);
++                                           inversion ? conditioner_params.prompt_input : nullptr, inversion,
++                                           conditioner_params.clip_a1111_chunks ? &a1111_count : nullptr);
+         if (tokens_and_weights.first.empty()) {
+             return {};
+@@ -658,5 +703,5 @@
+         if (conditioner_params.clip_ignore_emphasis)
+             std::fill(weights.begin(), weights.end(), 1.0f);
+-        return get_learned_condition_common(n_threads,
++        auto result = get_learned_condition_common(n_threads,
+                                             tokens,
+                                             weights,
+@@ -668,4 +713,7 @@
+                                             conditioner_params.clip_no_special_tokens,
+                                             conditioner_params.clip_return_tokens);
++        if (conditioner_params.clip_a1111_chunks)
++            result.c_clip_count = sd::Tensor<int32_t>::from_vector({a1111_count});
++        return result;
+     }
+ };
+--- a/src/conditioning/conditioning_cache.h
++++ b/src/conditioning/conditioning_cache.h
+@@ -62,5 +62,5 @@
+             return std::tie(p.text, p.system_prompt, p.raw, p.clip_skip, p.width, p.height, p.zero_out_masked,
+                             p.clip_ignore_emphasis, p.clip_bypass_normalization, p.clip_no_special_tokens,
+-                            p.clip_return_tokens);
++                            p.clip_return_tokens, p.clip_a1111_chunks);
+         };
+         if (fields(a) != fields(b) ||
+--- a/src/dgl/bindings/components.cpp
++++ b/src/dgl/bindings/components.cpp
+@@ -83,4 +83,5 @@
+         options.clip_no_special_tokens = get_bool(args, "clip_no_special_tokens");
+         options.clip_return_tokens = get_bool(args, "clip_return_tokens");
++        options.clip_a1111_chunks = get_bool(args, "clip_a1111_chunks");
+         options.clip_negpip = get_bool(args, "clip_negpip");
+         if (args.count("system"))
+--- a/src/dgl/bindings/condition.cpp
++++ b/src/dgl/bindings/condition.cpp
+@@ -200,4 +200,5 @@
+         tensor_field<&SDCondition::c_crossattn>("crossattn"),
+         tensor_field<&SDCondition::c_clip_ids>("clip_ids"),
++        tensor_field<&SDCondition::c_clip_count>("clip_count"),
+         tensor_field<&SDCondition::c_vector>("vector"),
+         tensor_field<&SDCondition::c_concat>("concat"),
+--- a/src/dgl/bindings/predictor.cpp
++++ b/src/dgl/bindings/predictor.cpp
+@@ -1,3 +1,5 @@
+ #include "dgl/bindings/predictor.h"
++#include "dgl/ops/nui_t2i0_cbs.h"
++#include "model/common/nui_t2i0_state.h"
+
+ #include <algorithm>
+@@ -323,4 +325,65 @@
+         }
+         output.condition = read_condition(condition, args);
++        if (args.count("t2i0_peer") && args.count("t2i0_empty")) {
++            const auto peer = read_condition(args.at("t2i0_peer").fields);
++            const auto empty = read_condition(args.at("t2i0_empty").fields);
++            auto& context = output.condition.c_crossattn;
++            if (context.empty() || peer.c_crossattn.empty() || empty.c_crossattn.empty() ||
++                empty.c_crossattn.shape()[1] != 77)
++                throw std::runtime_error("T2I-Zero needs matching CLIP condition chunks");
++            while (context.shape()[1] < peer.c_crossattn.shape()[1])
++                context = sd::ops::concat(context, empty.c_crossattn, 1);
++        }
++        if (args.count("t2i0_prompt")) {
++            const auto prompt = read_condition(args.at("t2i0_prompt").fields);
++            if (prompt.c_clip_count.empty() || !sd_version_is_unet(engine.version()))
++                throw std::runtime_error("T2I-Zero requires a U-Net and a CLIP tokenized prompt");
++            auto t2i = std::make_shared<sd::nui::T2iZero>();
++            t2i->start = int(get_int(args, "t2i0_start"));
++            t2i->end = int(get_int(args, "t2i0_end"));
++            t2i->reset = int(get_int(args, "t2i0_reset"));
++            t2i->save = int(get_int(args, "t2i0_save"));
++            t2i->width = int(get_int(args, "t2i0_width"));
++            t2i->height = int(get_int(args, "t2i0_height"));
++            t2i->alpha = float(get_number(args, "t2i0_alpha"));
++            t2i->ema = float(get_number(args, "t2i0_ema"));
++            t2i->branch = get_string(args, "t2i0_branch");
++            t2i->token_count = prompt.c_clip_count.data()[0];
++            if (t2i->save >= 0)
++                t2i->history = std::make_shared<sd::nui::T2iZeroHistory>();
++            if (args.count("t2i0_previous")) {
++                const auto preceding = object<Predictor>(args, "t2i0_previous");
++                const auto* previous = std::get_if<ModelPredictor>(&preceding->node);
++                if (previous && previous->options.t2i0)
++                    t2i->history = previous->options.t2i0->history;
++            }
++            std::vector<int64_t> corrections;
++            if (args.count("t2i0_tokens"))
++                for (const auto& entry : args.at("t2i0_tokens").items) {
++                    const auto index = entry.scalar.get<int64_t>();
++                    if (index >= 0 && index < t2i->token_count) {
++                        t2i->selected.push_back(int32_t(index + 1));
++                        corrections.push_back(index + 2);
++                    }
++                }
++            if (t2i->selected.empty())
++                for (int i = 1; i < t2i->token_count; ++i)
++                    t2i->selected.push_back(i);
++            if (args.count("t2i0_clock"))
++                for (const auto& entry : args.at("t2i0_clock").items)
++                    t2i->clock.push_back(int32_t(entry.scalar.get<int64_t>()));
++            const auto strength = float(get_number(args, "t2i0_strength"));
++            if (strength != 0.f) {
++                const auto& context = output.condition.c_crossattn;
++                if (context.dim() != 2 && !(context.dim() == 3 && context.shape()[2] == 1))
++                    throw std::runtime_error("T2I-Zero CBS requires a single prompt conditioning matrix");
++                if (corrections.empty())
++                    for (int64_t row = 1; row < std::min<int64_t>(78, context.shape()[1]); ++row)
++                        corrections.push_back(row);
++                output.options.t2i0_corrected_context = sd::nui::correct_conditioning_by_similarity(
++                    context, corrections, 77, get_int(args, "t2i0_radius"), get_number(args, "t2i0_threshold"), strength);
++            }
++            output.options.t2i0 = std::move(t2i);
++        }
+         auto& c          = output.condition;
+         if (((output.options.lllite && get_bool(args, "lllite_blank_negative")) ||
+--- a/src/dgl/bindings/registration.cpp
++++ b/src/dgl/bindings/registration.cpp
+@@ -481,4 +481,5 @@
+              optional("clip_no_special_tokens", Kind::Boolean, false),
+              optional("clip_return_tokens", Kind::Boolean, false),
++             optional("clip_a1111_chunks", Kind::Boolean, false),
+              optional("clip_negpip", Kind::Boolean, false)},
+             condition_signature(),
+@@ -652,4 +653,15 @@
+              number("scfg_clamp",-std::numeric_limits<float>::max(),std::numeric_limits<float>::max(),0),
+              integer("scfg_width",1,INT_MAX,1), integer("scfg_height",1,INT_MAX,1),
++             optional("t2i0_prompt", Kind::Dict), optional_list("t2i0_tokens", Kind::Integer),
++             optional("t2i0_peer", Kind::Dict), optional("t2i0_empty", Kind::Dict),
++             optional("t2i0_previous", Kind::Predictor), integer("t2i0_save",-1,INT_MAX,-1),
++             optional_list("t2i0_clock", Kind::Integer), choice("t2i0_branch", {"pos", "neg", "perturbed"}, "pos"),
++             integer("t2i0_start",INT_MIN,INT_MAX,1), integer("t2i0_end",INT_MIN,INT_MAX,25),
++             integer("t2i0_reset",-1,INT_MAX,-1), integer("t2i0_radius",0,INT_MAX,2),
++             integer("t2i0_width",1,INT_MAX,1), integer("t2i0_height",1,INT_MAX,1),
++             number("t2i0_threshold",-std::numeric_limits<float>::max(),std::numeric_limits<float>::max(),0.5),
++             number("t2i0_strength",-std::numeric_limits<float>::max(),std::numeric_limits<float>::max(),0),
++             number("t2i0_alpha",-std::numeric_limits<float>::max(),std::numeric_limits<float>::max(),0),
++             number("t2i0_ema",-std::numeric_limits<float>::max(),std::numeric_limits<float>::max(),0),
+              std::move(transform), optional("transform_args", Kind::Dict)},
+             {Kind::Predictor}, make_predictor);
+--- a/src/dgl/models/diffusion_prediction.h
++++ b/src/dgl/models/diffusion_prediction.h
+@@ -42,4 +42,6 @@
+         sd::nui::UNetOptions unet_hooks;
+         std::shared_ptr<const sd::nui::ScfgConfig> scfg;
++        std::shared_ptr<const sd::nui::T2iZero> t2i0;
++        sd::Tensor<float> t2i0_corrected_context;
+         std::shared_ptr<const sd::Tensor<float>> reference_latent, reference_noise;
+         std::shared_ptr<const sd::nui::LLLiteBinding> lllite;
+--- a/src/dgl/models/dit.cpp
++++ b/src/dgl/models/dit.cpp
+@@ -342,4 +342,6 @@
+         const auto& shape       = x.shape();
+         sd::nui::UNetPassScope unet_hooks(options.unet_hooks, int(shape[0]), int(shape[1]), uint32_t(step.index));
++        if (options.t2i0 && options.t2i0->suppresses(options.t2i0->index(step.index)))
++            sd::nui::active.t2i0 = options.t2i0.get();
+         std::optional<sd::nui::ScfgCapture> scfg;
+         if (options.scfg && options.scfg->active(step.index)) {
+@@ -429,5 +431,8 @@
+         params.x                       = &input;
+         params.timesteps               = &timesteps;
+-        params.context                 = present(condition.c_crossattn);
++        const int t2i0_step = std::max(0, step.index - 2);
++        const bool use_cbs = !options.t2i0_corrected_context.empty() &&
++                             t2i0_step >= options.t2i0->start && t2i0_step <= options.t2i0->end;
++        params.context                 = present(use_cbs ? options.t2i0_corrected_context : condition.c_crossattn);
+         params.y                       = present(condition.c_vector);
+         params.c_concat                = present(condition.c_concat);
+@@ -442,5 +447,5 @@
+                 const sd::nui::UNetOptions neutral;
+                 std::optional<sd::nui::UNetPassScope> control_scope;
+-                if (options.reference_latent || options.unet_hooks.agent_timeline || options.lllite || options.llul || scfg)
++                if (options.reference_latent || options.unet_hooks.agent_timeline || options.lllite || options.llul || scfg || options.t2i0)
+                     control_scope.emplace(neutral, int(shape[0]), int(shape[1]), uint32_t(step.index));
+                 unet_controls = step.compute_controls(input, timesteps, condition);
+--- /dev/null
++++ b/src/dgl/ops/nui_t2i0_cbs.h
+@@ -0,0 +1,47 @@
++#pragma once
++
++#include <algorithm>
++#include <cmath>
++#include <cstdint>
++#include <vector>
++
++#include "core/tensor.hpp"
++
++namespace sd::nui {
++    inline Tensor<float> correct_conditioning_by_similarity(
++            const Tensor<float>& input, const std::vector<int64_t>& rows, int64_t token_count,
++            int64_t radius, double threshold, float strength) {
++        const int64_t width = input.shape().at(0), count = input.shape().at(1);
++        const auto high = std::min(token_count + 1, count);
++        const auto percentile = std::clamp(1.0 - std::pow(2.718281, -10 * threshold), 1e-16, 1.0 / (1.0 + 1e-10));
++        const float rank = float(percentile) * float(input.numel() - 1);
++        const auto low_rank = int64_t(std::floor(rank)), high_rank = int64_t(std::ceil(rank));
++        Tensor<float> output(input.shape());
++        std::copy_n(input.data(), input.numel(), output.data());
++        std::vector<float> products(input.numel()), sorted(input.numel());
++        for (const auto row : rows) {
++            if (row < 0 || row >= count)
++                continue;
++            const auto* anchor = input.data() + row * width;
++            for (int64_t i = 0; i < input.numel(); ++i)
++                products[i] = anchor[i % width] * input.data()[i];
++            sorted = products;
++            std::nth_element(sorted.begin(), sorted.begin() + low_rank, sorted.end());
++            const float low = sorted[low_rank];
++            if (high_rank != low_rank)
++                std::nth_element(sorted.begin() + low_rank + 1, sorted.begin() + high_rank, sorted.end());
++            const float cutoff = low + (sorted[high_rank] - low) * (rank - float(low_rank));
++            const float maximum = std::max(0.f, *std::max_element(products.begin(), products.end()));
++            for (int64_t col = 0; col < width; ++col) {
++                float total = 0.f;
++                for (int64_t neighbor = std::max<int64_t>(1, row - radius); neighbor < std::min(high, row + radius + 1); ++neighbor) {
++                    const auto i = neighbor * width + col;
++                    const auto keep = (products[i] > cutoff ? products[i] : 0.f) / (maximum > cutoff ? maximum : 0.f);
++                    total += keep * input.data()[i];
++                }
++                output.data()[row * width + col] = (1.f - strength) * anchor[col] + strength * total;
++            }
++        }
++        return output;
++    }
++}
+--- a/src/dgl/ops/predictor.cpp
++++ b/src/dgl/ops/predictor.cpp
+@@ -577,4 +577,5 @@
+                 pos->options.unet_hooks.seg_blur != 0.0 || neg->options.unet_hooks.seg_blur != 0.0 ||
+                 pos->options.scfg || neg->options.scfg ||
++                pos->options.t2i0 || neg->options.t2i0 ||
+                 !pos->references.empty() || !neg->references.empty() ||
+                 !pos->condition.c_ref_images.empty() || !neg->condition.c_ref_images.empty())
+@@ -851,6 +852,11 @@
+                 return {{}, modify_latent(branches,scale,neg + (pos - neg)*scale + correction)};
+             }
+-            if (scale == 1.f && evaluate(*branches.positive).prediction.scfg_maps.empty())
++            if (scale == 1.f && evaluate(*branches.positive).prediction.scfg_maps.empty()) {
++                const auto* leaf = std::get_if<ModelPredictor>(&active_branch(*branches.negative).node);
++                if (leaf && leaf->options.t2i0 && leaf->options.t2i0->ema > 0 &&
++                    leaf->options.t2i0->suppresses(leaf->options.t2i0->index(step_.index)))
++                    denoised(*branches.negative);
+                 return {{}, pos};
++            }
+             const auto& neg = denoised(*branches.negative);
+             return {{}, modify_latent(branches,scale,neg + cfg_residual(branches, pos, neg, scale))};
+--- a/src/dgl/ops/prompt.cpp
++++ b/src/dgl/ops/prompt.cpp
+@@ -182,4 +182,5 @@
+         params.clip_no_special_tokens = options.clip_no_special_tokens;
+         params.clip_return_tokens = options.clip_return_tokens;
++        params.clip_a1111_chunks = options.clip_a1111_chunks;
+         params.system_prompt = options.system;
+         if (!images.empty())
+--- a/src/dgl/ops/prompt.h
++++ b/src/dgl/ops/prompt.h
+@@ -30,4 +30,5 @@
+         bool clip_no_special_tokens = false;
+         bool clip_return_tokens = false;
++        bool clip_a1111_chunks = false;
+         bool clip_negpip = false;
+         std::optional<std::string> system;
+--- a/src/model/common/block.hpp
++++ b/src/model/common/block.hpp
+@@ -15,4 +15,5 @@
+ #include "model/common/nui_seg.hpp"
+ #include "model/common/nui_scfg.hpp"
++#include "model/common/nui_t2i0_ctnms.hpp"
+
+ class DownSampleBlock : public GGMLBlock {
+@@ -515,5 +516,5 @@
+
+         x = to_out_0->forward(ctx, x);  // [N, n_token, query_dim]
+-        return x;
++        return enable_ip ? sd::nui::t2i0_attention(ctx, x, v, layer_name) : x;
+     }
+ };
+--- /dev/null
++++ b/src/model/common/nui_t2i0_ctnms.hpp
+@@ -0,0 +1,77 @@
++#pragma once
++
++#include "model/common/nui_seg.hpp"
++#include "model/common/nui_t2i0_state.h"
++
++namespace sd::nui {
++    inline ggml_tensor* ctnms_suppressed(GGMLRunnerContext* ctx, ggml_tensor* output,
++                                         ggml_tensor* values, ggml_tensor* selected,
++                                         int64_t rows, int64_t cols) {
++        auto* graph = ctx->ggml_ctx;
++        const auto tokens = output->ne[1];
++        const auto count = selected->ne[0];
++        if (rows < 2 || cols < 2 || tokens != rows * cols)
++            throw std::runtime_error("T2I-Zero CTNMS needs a spatial attention grid of at least 2 by 2");
++        auto* scores = ggml_mul_mat(graph, values, output);
++        auto* transposed = ggml_cont(graph, ggml_transpose(graph, scores));
++        auto* picked = ggml_get_rows(graph, transposed, selected);
++        auto* planar = ggml_reshape_3d(graph, picked, cols, rows, count);
++        const float edge = std::exp(-0.5f);
++        const float center = 1.f / (1.f + 2.f * edge);
++        const std::vector<float> kernel{edge * center, center, edge * center};
++        auto* blurred_x = seg_axis(ctx, planar, cols, kernel);
++        auto* vertical = ggml_cont(graph, ggml_transpose(graph, blurred_x));
++        auto* blurred_y = seg_axis(ctx, vertical, rows, kernel);
++        auto* smoothed = ggml_cont(graph, ggml_transpose(graph, blurred_y));
++        auto* by_token = ggml_cont(graph, ggml_transpose(graph, ggml_reshape_2d(graph, smoothed, tokens, count)));
++        // The source uses the winning candidate's ordinal to index the full Value matrix.
++        auto* winner = ggml_argmax(graph, by_token);
++        auto* winners = ggml_get_rows(graph, values, winner);
++        return ggml_mul(graph, output, winners);
++    }
++
++    inline ggml_tensor* t2i0_attention(GGMLRunnerContext* ctx, ggml_tensor* output,
++                                      ggml_tensor* values, const std::string& layer) {
++        const auto* config = active.t2i0;
++        if (!config || values->ne[1] % 77 != 0)
++            return output;
++        const auto sequence = output->ne[1];
++        const auto factor = int64_t(std::sqrt((int64_t(config->width) * config->height) / sequence));
++        if (factor == 0)
++            return output;
++        const auto rows = config->height / factor, cols = config->width / factor;
++        if (rows * cols != sequence)
++            return output;
++        if (config->selected.empty())
++            throw std::runtime_error("T2I-Zero CTNMS needs at least two prompt tokens");
++        if (output->ne[2] != 1 || values->ne[2] != 1 || output->ne[0] != values->ne[0] ||
++            *std::max_element(config->selected.begin(), config->selected.end()) >= values->ne[1])
++            throw std::runtime_error("T2I-Zero CTNMS prompt selection does not match the attention values");
++        auto* graph = ctx->ggml_ctx;
++        auto* ids = ggml_new_tensor_1d(graph, GGML_TYPE_I32, config->selected.size());
++        ctx->bind_backend_tensor_data(ids, config->selected.data());
++        auto* suppressed = ctnms_suppressed(ctx, output, values, ids, rows, cols);
++        if (config->ema > 0.f) {
++            const auto index = config->index(int(active.step));
++            const auto key = "t2i0." + config->branch + "." + layer;
++            auto* prior = index == config->reset ? nullptr : ctx->load_cache_tensor(key);
++            if (!prior && config->history && index != config->reset) {
++                const auto snapshot = config->history->snapshots.find(key);
++                if (snapshot != config->history->snapshots.end()) {
++                    prior = sd::make_ggml_tensor(graph, snapshot->second, false);
++                    ctx->bind_backend_tensor_data(prior, snapshot->second.data());
++                }
++            }
++            if (prior && !ggml_are_same_shape(prior, suppressed))
++                throw std::runtime_error("T2I-Zero CTNMS EMA cannot continue at a different latent size");
++            const auto factor = config->ema / float(1 + index);
++            suppressed = ggml_add(graph, ggml_scale(graph, prior ? prior : output, factor),
++                                  ggml_scale(graph, suppressed, 1.f - factor));
++            ctx->persist_cache_tensor(key, suppressed);
++            if (config->history && index == config->save)
++                active.t2i0_save_keys.push_back(key);
++        }
++        return ggml_add(graph, ggml_scale(graph, output, 1.f - config->alpha),
++                        ggml_scale(graph, suppressed, config->alpha));
++    }
++}
+--- /dev/null
++++ b/src/model/common/nui_t2i0_state.h
+@@ -0,0 +1,11 @@
++#pragma once
++
++#include <map>
++#include <string>
++#include "core/tensor.hpp"
++
++namespace sd::nui {
++    struct T2iZeroHistory {
++        std::map<std::string, Tensor<float>> snapshots;
++    };
++}
+--- a/src/model/common/nui_unet_hooks.hpp
++++ b/src/model/common/nui_unet_hooks.hpp
+@@ -6,4 +6,5 @@
+ #include <memory>
+ #include <random>
++#include <string>
+ #include <vector>
+ struct ggml_tensor;
+@@ -15,4 +16,20 @@
+     struct LlulGraphData;
+     struct ScfgCapture;
++    struct T2iZeroHistory;
++    struct T2iZero {
++        int start = 1, end = 25, reset = -1, save = -1, width = 1, height = 1, token_count = 0;
++        float alpha = 0.f, ema = 0.f;
++        std::string branch;
++        std::vector<int32_t> selected;
++        std::vector<int32_t> clock;
++        std::shared_ptr<T2iZeroHistory> history;
++
++        int index(int evaluation) const {
++            return evaluation > 0 && size_t(evaluation) <= clock.size() ? clock[evaluation - 1] : -1;
++        }
++        bool suppresses(int step) const {
++            return alpha > 0.f && step >= 0 && step >= start && (end <= 0 || step <= end);
++        }
++    };
+
+     struct ScfgConfig {
+@@ -102,4 +119,6 @@
+         std::deque<std::vector<float>> seg_weights;
+         ScfgCapture* scfg = nullptr;
++        const T2iZero* t2i0 = nullptr;
++        std::vector<std::string> t2i0_save_keys;
+         bool deepcache_reused = false, deepcache_saved = false;
+         bool deepcache_d1 = false, deepcache_d2 = false;
+--- a/src/model/diffusion/unet.hpp
++++ b/src/model/diffusion/unet.hpp
+@@ -1009,4 +1009,19 @@
+         };
+
+-        return restore_trailing_singleton_dims(GGMLRunner::compute(get_graph, n_threads, false), x.dim());
++        auto result = GGMLRunner::compute(get_graph, n_threads, false);
++        // A successful compute has committed the current evaluation's runner cache.
++        const auto* t2i = sd::nui::active.t2i0;
++        if (result && t2i && t2i->history && !sd::nui::active.t2i0_save_keys.empty()) {
++            for (const auto& key : sd::nui::active.t2i0_save_keys) {
++                auto* cached = get_cache_tensor_by_name(key);
++                if (!cached)
++                    throw std::runtime_error("T2I-Zero CTNMS EMA snapshot is missing");
++                auto tensor = sd::make_sd_tensor_from_ggml<float>(cached);
++                if (tensor.empty())
++                    throw std::runtime_error("T2I-Zero CTNMS EMA snapshot is empty");
++                t2i->history->snapshots.insert_or_assign(key, std::move(tensor));
++            }
++            LOG_INFO("T2I-Zero CTNMS retained %zu EMA layers for Hires", t2i->history->snapshots.size());
++        }
++        return restore_trailing_singleton_dims(std::move(result), x.dim());
+     }

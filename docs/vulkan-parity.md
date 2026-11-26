@@ -170,7 +170,9 @@ Incantations PAG has additive guidance and Saliency-Adaptive Noise Fusion (SANF)
 
 S-CFG reads head-averaged self- and cross-attention from the conditional branch, aggregates the selected resolutions, and applies the legacy spatial rate to the CFG residual. It supports the legacy window, resolution count, minimum, maximum and clamp on Euler and Euler a, including both Hires paths and combinations with SEG, PAG, SANF and the CFG Scheduler. Large self-attention maps are computed in query-row blocks with all keys participating in each softmax. The cost still grows with the number of spatial tokens and propagation iterations.
 
-Multi-Concept T2I-Zero and the `compile` hook remain open.
+Multi-Concept T2I-Zero supports conditional-only Correction by Similarities and cross-attention CTNMS on Euler and Euler a. It follows A1111's 75-token chunking, including comma backtracking and `BREAK`, and pads the positive and negative conditions to matching lengths. Regular Hires keeps the base token selection, CTNMS clock and EMA history. The separate Img2Img Hires Fix starts a new T2I-Zero state. CTNMS counts the extra PAG evaluation when EMA is off. The combination of CTNMS EMA and Incantations PAG remains open.
+
+The `compile` hook remains open.
 
 ### Boundaries of the port
 

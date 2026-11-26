@@ -3,6 +3,16 @@
 
 
 
+## Windows v0.70 — Multi-Concept T2I-Zero
+
+The native CBS fixture matched an independent percentile and token-window calculation. CTNMS matched the independent Gaussian score and Value gather within `4.9e-9`. All 76 Vulkan worker tests and six Incantations plugin tests passed, including the CTNMS clock through a PAG interval and base-to-Hires predictor arguments.
+
+On Radeon 780M, masked SD1.5 runs at 512 × 512 kept every unmasked source pixel. CBS and CTNMS changed the edit separately, an unreachable window matched all pixels of ordinary generation, and CTNMS EMA reproduced the same-seed edit exactly on a second request. T2I-Zero retained 16 EMA layers per CFG branch into regular Hires at the same size. Changing the target size triggered the EMA shape mismatch.
+
+SDXL ran the comma-backtracking fixture with high explicit token indices and an empty negative prompt at 512 × 512. The short repeated-color prompt produced strong saturation and banding. CBS and CTNMS with PAG completed both regular Latent Hires and independent Img2Img Hires Fix at 576 × 576 on SD1.5 and 448 × 448 on SDXL. The initial 576 × 576 SDXL attempt reached the host RAM guard. The images were inspected.
+
+The staged `SDV-NUI.exe` ran CBS and CTNMS together over MCP on Radeon 780M with both SD1.5 and SDXL. Both jobs reported `cuda=false` with a system-only PATH, wrote the settings into the PNG, and preserved every unmasked pixel. The short combined SD1.5 run lost subject detail inside the mask. The Windows ZIP SHA-256 is `fbd35bc5c03996b277dcf7e3e2e1ec5833a82369f203b347ffb3cd98e2befbc6`. Its launcher, desktop JAR, Vulkan worker JAR and inference DLL matched the tested staging files byte for byte.
+
 ## Windows v0.69 — Incantations S-CFG
 
 An independent two-dimensional reference matched the native projected attention maps within `2.02e-7` and the final spatial residual within `1.4e-7`. The fixture compared full attention propagation with query-row blocking across three blocks, including a shorter last block. All 75 Vulkan worker tests and six Incantations plugin tests passed.
