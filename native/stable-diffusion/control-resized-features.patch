@@ -1,0 +1,24 @@
+diff --git a/src/model/diffusion/unet.hpp b/src/model/diffusion/unet.hpp
+--- a/src/model/diffusion/unet.hpp
++++ b/src/model/diffusion/unet.hpp
+@@ -714,7 +714,9 @@
+         if (controls.size() > 0) {
+             // not in place, it segfaults the Vulkan backend with SDXL ControlNets (seen on RADV)
+             auto cs = ggml_ext_scale(ctx, controls[controls.size() - 1], control_strength, false);
+-            h       = ggml_add(ctx->ggml_ctx, h, cs);  // middle control
++            if (sd::nui::shrink_enabled() && (cs->ne[0] != h->ne[0] || cs->ne[1] != h->ne[1]))
++                cs = sd::nui::resize_features(ctx->ggml_ctx,cs,int(h->ne[0]),int(h->ne[1]),sd::nui::active.options->shrink_down_mode);
++            h = ggml_add(ctx->ggml_ctx, h, cs);  // middle control
+         }
+         int control_offset = static_cast<int>(controls.size() - 2);
+
+@@ -740,6 +742,8 @@
+                 if (controls.size() > 0) {
+                     // not in place, see the middle control
+                     auto cs = ggml_ext_scale(ctx, controls[control_offset], control_strength, false);
+-                    h_skip  = ggml_add(ctx->ggml_ctx, h_skip, cs);  // control net condition
++                    if (sd::nui::shrink_enabled() && (cs->ne[0] != h_skip->ne[0] || cs->ne[1] != h_skip->ne[1]))
++                        cs = sd::nui::resize_features(ctx->ggml_ctx,cs,int(h_skip->ne[0]),int(h_skip->ne[1]),sd::nui::active.options->shrink_up_mode);
++                    h_skip = ggml_add(ctx->ggml_ctx, h_skip, cs);  // control net condition
+                     control_offset--;
+                 }

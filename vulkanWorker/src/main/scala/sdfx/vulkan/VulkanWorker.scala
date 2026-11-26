@@ -592,14 +592,15 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
             val textGraph = scheduleHooks.keysIterator.find(key => VulkanFusionPrompt.applies(key,prompt,negative))
             if clip.nonEmpty && textGraph.nonEmpty then unsupported("Clip I/O and prompt scheduling in the same refinement")
             val unetHooks = p.hooks.filter { (key, value) =>
-              VulkanUnetHooks.hooks(key) && !value.obj.get("enabled").contains(ujson.Bool(false))
+              VulkanUnetHooks.hooks(key) && !value.obj.get("enabled").contains(ujson.Bool(false)) &&
+                (key != VulkanUnetHooks.tiledDiffusion || VulkanUnetHooks.needsTiles(value,w,ht))
             }
-            val tiled = unetHooks.get(VulkanUnetHooks.tiledDiffusion).exists(VulkanUnetHooks.needsTiles(_,w,ht))
-            if tiled && (clip.nonEmpty || textGraph.nonEmpty) then unsupported("MultiDiffusion and custom text conditioning in the same refinement")
+            if unetHooks.nonEmpty && (clip.nonEmpty || textGraph.nonEmpty) then
+              unsupported("U-Net hooks and custom text conditioning in the same refinement")
             val modifier = VulkanLatentModifier.config(refinementParams).map(VulkanLatentModifier.id -> _)
             val refinementGraph = clip.map(value => VulkanClipIo.id -> Map(VulkanClipIo.id -> value))
               .orElse(textGraph.map(_ -> scheduleHooks))
-              .orElse(Option.when(tiled)(VulkanUnetHooks.tiledDiffusion -> unetHooks))
+              .orElse(unetHooks.keysIterator.nextOption().map(_ -> unetHooks))
               .orElse(modifier.map(entry => VulkanLatentModifier.id -> Map(entry)))
               .map((key,hooks) => key -> (hooks ++ modifier))
             refinementGraph match

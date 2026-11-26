@@ -43,14 +43,15 @@ private[vulkan] object VulkanGraph:
     def check(): Unit = if cancelled() then throw new java.util.concurrent.CancellationException()
     val p = req.params
     val customText = clipIo.nonEmpty || fusionScratch.nonEmpty
+    val unetGraph = VulkanUnetHooks.hooks(hook)
     val tileConfig = p.hooks.get(VulkanUnetHooks.tiledDiffusion).filterNot(_.obj.get("enabled").contains(ujson.Bool(false)))
     val needsTiles = tileConfig.exists(VulkanUnetHooks.needsTiles(_,p.width,p.height))
-    val tiledDiffusion = VulkanUnetHooks.hooks(hook) && needsTiles
-    val modifier = Option.when(customText || VulkanUnetHooks.hooks(hook) || hook == VulkanLatentModifier.id)(
+    val tiledDiffusion = unetGraph && needsTiles
+    val modifier = Option.when(customText || unetGraph || hook == VulkanLatentModifier.id)(
       VulkanLatentModifier.config(p)).flatten
     if modifier.nonEmpty && !engine.supportsLatentModifier() then unsupported("This Vulkan runtime lacks Latent Modifier")
-    val patchedInputs = customText || tiledDiffusion || modifier.nonEmpty
-    val supportsControl = tiledDiffusion || modifier.nonEmpty && !customText
+    val patchedInputs = customText || unetGraph || modifier.nonEmpty
+    val supportsControl = unetGraph || modifier.nonEmpty && !customText
     val hiresPass = hook == latentHires
     val h = if hiresPass then ujson.Obj() else p.hooks(hook)
     val latentHook = VulkanLatentGraph.hooks(hook)
@@ -59,13 +60,13 @@ private[vulkan] object VulkanGraph:
     val up = Option.when(hook == "latent_upscale")(VulkanLatentUpscale.parse(p,h,schedule))
     val soft = Option.when(hook == "soft_inpainting")(new VulkanSoftInpaint(h))
     val postDiff = Option.when(hook == "postdiff")(new VulkanPostDiff(h,p,model.kind == "sdxl"))
-    val unetHooks = Option.when(VulkanUnetHooks.hooks(hook)) {
+    val unetHooks = Option.when(unetGraph) {
       if !engine.supportsUnetHooks() then unsupported("This Vulkan runtime lacks U-Net attention and skip hooks")
       if tiledDiffusion && !engine.supportsTiledDiffusion() then unsupported("This Vulkan runtime lacks MultiDiffusion")
       if !engine.supportsUnetResize() && p.hooks.exists((k,v) => VulkanUnetHooks.resizeHooks(k) && !v.obj.get("enabled").contains(ujson.Bool(false))) then
         unsupported("This Vulkan runtime lacks U-Net resizing hooks")
       val params = if tiledDiffusion then p else p.copy(hooks = p.hooks - VulkanUnetHooks.tiledDiffusion)
-      VulkanUnetHooks.parse(params,model.kind=="sdxl",seed)
+      VulkanUnetHooks.parse(params,Set("sdxl","SDXL Inpaint")(model.kind),seed)
     }
     val unetArgs = unetHooks.fold("")(_.args)
     val sonar = Option.when(hook=="sonar")(new VulkanSonar(h,p,seed))
@@ -88,10 +89,10 @@ private[vulkan] object VulkanGraph:
     if hook == "photomaker" && (model.kind != "sdxl" || p.isImg2Img) then unsupported("PhotoMaker outside SDXL txt2img")
     if fusionScratch.nonEmpty && !Set("sd15", "sdxl", "SD 2.x", "SD 1.x Inpaint", "SD 2.x Inpaint", "SDXL Inpaint")(model.kind) then
       unsupported("Prompt Fusion with this checkpoint family")
-    val sd2 = fusionScratch.nonEmpty || tiledDiffusion || modifier.nonEmpty
+    val sd2 = fusionScratch.nonEmpty || unetGraph || modifier.nonEmpty
     val inpaint = patchedInputs && (Set("SD 1.x Inpaint", "SDXL Inpaint")(model.kind) ||
       sd2 && model.kind == "SD 2.x Inpaint")
-    if (tiledDiffusion || modifier.nonEmpty) && !Set("sd15", "sdxl", "SD 2.x", "SD 1.x Inpaint", "SD 2.x Inpaint", "SDXL Inpaint")(model.kind) then
+    if (unetGraph || modifier.nonEmpty) && !Set("sd15", "sdxl", "SD 2.x", "SD 1.x Inpaint", "SD 2.x Inpaint", "SDXL Inpaint")(model.kind) then
       unsupported(s"$hook with this checkpoint family")
     val family = model.kind match
       case "SDXL Inpaint" if inpaint => "sdxl_inpaint"
