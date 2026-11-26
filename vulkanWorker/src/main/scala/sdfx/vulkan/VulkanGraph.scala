@@ -65,17 +65,25 @@ private[vulkan] object VulkanGraph:
     val placement = if options.placement().isEmpty then "" else s", params_backend = ${quoted(options.placement())}"
     val common = s"backend = ${quoted(device)}$placement, wtype = ${quoted(options.weights())}, family = ${quoted(family)}"
     val lines = Vector.newBuilder[String]
+    val textSetup = Vector.newBuilder[String]
     lines += s"unet0 = load_unet(${path(model.path)}, $common)"
-    lines += s"text0 = load_text_encoder(${path(model.path)}, $common)"
+    val loadText = s"text0 = load_text_encoder(${path(model.path)}, $common)"
+    lines += loadText
+    textSetup += loadText
     val scale = if family == "sdxl" && model.vaePath.isEmpty then ", conv_scale = 0.03125" else ""
     lines += s"vae = load_vae(${path(model.vaePath.getOrElse(model.path))}, $common$scale)"
     for (l,i) <- loras.zipWithIndex do
       if l.unet.exists(_ != l.weight) || l.lbw.nonEmpty || l.dyn.nonEmpty || l.start.nonEmpty || l.stop.nonEmpty then unsupported("scheduled LoRA in a motion/identity graph")
-      lines += s"lora$i = load_lora(${path(req.loraPaths.getOrElse(l.name, invalid(s"Unresolved LoRA ${l.name}")))})"
+      val loadLora = s"lora$i = load_lora(${path(req.loraPaths.getOrElse(l.name, invalid(s"Unresolved LoRA ${l.name}")))})"
+      lines += loadLora
+      textSetup += loadLora
       lines += s"unet${i+1} = apply_lora(unet$i, lora$i, weight = ${l.weight})"
-      lines += s"text${i+1} = apply_lora(text$i, lora$i, weight = ${l.weight})"
+      val applyText = s"text${i+1} = apply_lora(text$i, lora$i, weight = ${l.weight})"
+      lines += applyText
+      textSetup += applyText
     val unet = s"unet${loras.size}"
     val text = s"text${loras.size}"
+    val textProgram = textSetup.result()
     lazy val adapter = path(h("model").str)
     val inputs = scala.collection.mutable.LinkedHashMap.empty[String,BufferedImage]
     sonar.flatMap(_.image).foreach(im=>inputs("sonar_ref")=im)
@@ -96,7 +104,7 @@ private[vulkan] object VulkanGraph:
       n
     else if clipIo.nonEmpty then
       lines += s"unet = $unet"
-      clipIo.get.build("pos", prompt, text, enc, lines)
+      clipIo.get.build("pos", prompt, text, enc, textProgram, engine, () => check(), lines)
       lines += "pos = predictor(unet, latent_pos)"
       1
     else if unetHooks.nonEmpty || Set("sonar","semantic_guidance","neutral_prompt")(hook) || latentHook || up.nonEmpty || hiresPass || soft.nonEmpty || inverse || postDiff.nonEmpty then
@@ -161,7 +169,7 @@ private[vulkan] object VulkanGraph:
       1
     if !Set("ip_adapter","revision")(hook) then
       clipIo match
-        case Some(session) => session.build("neg", p.negativePrompt, text, enc, lines)
+        case Some(session) => session.build("neg", p.negativePrompt, text, enc, textProgram, engine, () => check(), lines)
         case None => lines += s"latent_neg = encode_prompt($text, ${quoted(p.negativePrompt)}, $enc)"
       lines += s"neg = predictor(unet, latent_neg$unetArgs)"
     val positive = if hook == "semantic_guidance" then VulkanSemanticGuidance.prepare(h,text,enc,family=="sdxl",lines) else "pos"

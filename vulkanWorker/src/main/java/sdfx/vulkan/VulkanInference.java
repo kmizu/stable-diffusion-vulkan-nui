@@ -599,6 +599,13 @@ public final class VulkanInference implements AutoCloseable {
         return dglWithImages(program, inputs, resultName, noises, this::copyImage);
     }
 
+    public synchronized void writeDglTensors(String program) {
+        ensureOpen();
+        try (var arena = Arena.ofConfined()) {
+            dglProgram(arena, program, Map.of(), "value", tensor -> null);
+        }
+    }
+
     public synchronized float[] detectBoxes(String source, BufferedImage image) {
         return dglWithImages(source, Map.of("input", image), "boxes", Map.of(), tensor -> {
             long size = (long)call("sd_tensor_byte_size",tensor);

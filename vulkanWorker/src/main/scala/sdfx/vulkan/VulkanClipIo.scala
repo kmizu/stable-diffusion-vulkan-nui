@@ -100,6 +100,7 @@ private[vulkan] object VulkanClipIo:
   private enum Piece:
     case File(name: String)
     case Prompt(text: String, clipSkip: Option[Int] = None)
+    case Eval(order: Int, expression: VulkanClipEval.Expression)
 
   private def quotedEnd(value: String, start: Int): (Int, Int) =
     val quote = value(start).toString
@@ -162,7 +163,7 @@ private[vulkan] object VulkanClipIo:
       Piece.Prompt(text, Some(skips(index.min(skips.size - 1))))
     }
 
-  private val Directive = """\?([a-zA-Z_]\w*)\(""".r
+  private val Directive = """\?([a-zA-Z][a-zA-Z0-9]*?)(?:_(-?\d+))?\(""".r
   private def pieces(prompt: String, directives: Boolean): Vector[Piece] =
     val out = Vector.newBuilder[Piece]
     var i = 0
@@ -190,7 +191,9 @@ private[vulkan] object VulkanClipIo:
             if depth != 0 then invalid("unbalanced directive")
             val name = call.group(1).toLowerCase(Locale.ROOT)
             if name == "prompt" then out ++= promptDirective(prompt.substring(start, end - 1))
-            else if name == "eval" || name.matches("eval_\\d+") then VulkanProtocol.unsupported("Clip I/O eval directives")
+            else if name == "eval" then
+              val order = Option(call.group(2)).fold(0)(_.toIntOption.getOrElse(invalid("?eval order is out of range")))
+              out += Piece.Eval(order, VulkanClipEval.compile(prompt.substring(start,end-1)))
             else invalid(s"unknown directive ?$name")
             i = end
           case None =>
@@ -235,8 +238,8 @@ private[vulkan] object VulkanClipIo:
       writeNpy(path, matrix)
       path
 
-    def build(label: String, prompt: String, encoder: String, encoding: String,
-        lines: scala.collection.mutable.Builder[String, Vector[String]]): Unit =
+    def build(label: String, prompt: String, encoder: String, encoding: String, textSetup: Vector[String],
+        engine: VulkanInference, check: () => Unit, lines: scala.collection.mutable.Builder[String, Vector[String]]): Unit =
       val positive = label == "pos"
       val inputMode = if !flag("input_enabled") then "off"
         else mode(if positive then "positive_mode" else "negative_mode", if positive then "simple" else "off")
@@ -270,20 +273,27 @@ private[vulkan] object VulkanClipIo:
           exports += ((path, pooled, destination))
       if inputMode == "off" then lines += s"latent_$label = $condition"
       else
-        val inputs = pieces(prompt, inputMode == "directive")
-        if inputs.isEmpty || inputs.size > 64 then invalid("supply between 1 and 64 input pieces")
+        val parsed = pieces(prompt, inputMode == "directive")
+        val evals = parsed.zipWithIndex.collect { case (Piece.Eval(order, expression), index) => (order,index,expression) }
+          .sortBy((order,index,_) => (order,index))
+        val inputs = parsed.filter {
+          case _: Piece.Eval => false
+          case _ => true
+        }
+        if inputs.isEmpty || parsed.size > 64 then invalid("supply between 1 and 64 input pieces and directives")
+        val pieceLines = Vector.newBuilder[String]
         var fileTokens = 0
         var pooled: Option[String] = None
         val tensors = inputs.zipWithIndex.map { (piece, index) =>
           val name = s"clip_${label}_$index"
           piece match
             case Piece.Prompt(text, skip) =>
-              lines += s"${name}_encoded = ${encode(text, skip)}"
+              pieceLines += s"${name}_encoded = ${encode(text, skip)}"
               val encoded = s"${name}_encoded.crossattn"
-              lines += s"$name = tensor::reshape($encoded,[$width,tensor::shape($encoded)[1]])"
+              pieceLines += s"$name = tensor::reshape($encoded,[$width,tensor::shape($encoded)[1]])"
               if width == 2048 && pooled.isEmpty then
-                lines += s"${name}_flat = tensor::reshape(${name}_encoded.vector,[tensor::numel(${name}_encoded.vector)])"
-                lines += s"${name}_pool = tensor::crop(${name}_flat, axes = [0], start = [0], size = [1280])"
+                pieceLines += s"${name}_flat = tensor::reshape(${name}_encoded.vector,[tensor::numel(${name}_encoded.vector)])"
+                pieceLines += s"${name}_pool = tensor::crop(${name}_flat, axes = [0], start = [0], size = [1280])"
                 pooled = Some(s"${name}_pool")
             case Piece.File(path) =>
               val file = Seq(path, s"$path.csv", s"$path.pt").iterator.map(target).find(Files.isRegularFile(_))
@@ -292,15 +302,47 @@ private[vulkan] object VulkanClipIo:
                 else readCsv(file, width) -> None
               fileTokens += matrix.tokens
               if fileTokens > MaxTokens then invalid(s"conditioning exceeds $MaxTokens tokens")
-              lines += s"$name = tensor::load(${quoted(stage(matrix).toString)})"
+              pieceLines += s"$name = tensor::load(${quoted(stage(matrix).toString)})"
               if width == 2048 && pooled.isEmpty then pool.foreach { values =>
                 val path = stage(Matrix(1,1280,values))
-                lines += s"${name}_pool = tensor::reshape(tensor::load(${quoted(path.toString)}), [1280])"
+                pieceLines += s"${name}_pool = tensor::reshape(tensor::load(${quoted(path.toString)}), [1280])"
                 pooled = Some(s"${name}_pool")
               }
+            case _: Piece.Eval => throw new IllegalStateException("Unexpected directive in conditioning pieces")
           name
         }
-        val cross = if tensors.size == 1 then tensors.head else s"tensor::concat(${tensors.mkString("[", ",", "]")}, axis = 1)"
+        val joined = if tensors.size == 1 then tensors.head else s"tensor::concat(${tensors.mkString("[", ",", "]")}, axis = 1)"
+        val setup = pieceLines.result()
+        val cross = if evals.isEmpty then
+          lines ++= setup
+          joined
+        else
+          val input = scratch.resolve(s"eval-$label.npy")
+          val poolFile = pooled.map(_ => scratch.resolve(s"eval-pool-$label.npy"))
+          val savePool = pooled.zip(poolFile).map { (value,path) =>
+            s"tensor::save(${quoted(path.toString)}, tensor::reshape($value,[1280,1]))"
+          }
+          val prepare = textSetup ++ setup ++ savePool ++ Vector(
+            s"tensor::save(${quoted(input.toString)}, $joined)",
+            "return {value = tensor::zeros([1])}")
+          check()
+          engine.writeDglTensors(s"fn main() {\n${prepare.mkString("\n")}\n}")
+          val matrix = readNpy(input, width)
+          for (_, _, expression) <- evals do
+            for row <- 0 until matrix.tokens do
+              check()
+              for col <- 0 until width do
+                val index = row * width + col
+                val updated = expression(matrix.values(index),row,col)
+                if !updated.isFinite then invalid("?eval produced NaN or infinite values")
+                matrix.values(index) = updated
+          writeNpy(input,matrix)
+          pooled = poolFile.map { path =>
+            val name = s"clip_${label}_evaluated_pool"
+            lines += s"$name = tensor::reshape(tensor::load(${quoted(path.toString)}),[1280])"
+            name
+          }
+          s"tensor::load(${quoted(input.toString)})"
         val vector = if width != 2048 then "" else pooled.fold(s", vector = $condition.vector") { pool =>
           lines += s"${label}_vector_flat = tensor::reshape($condition.vector,[tensor::numel($condition.vector)])"
           lines += s"${label}_vector_replaced = tensor::replace_slice(${label}_vector_flat,$pool,axis = 0,start = 0)"
