@@ -88,7 +88,7 @@ private[vulkan] object VulkanPromptFusion:
               val innerB = add(b,scale(subtract(a,next),1d/6d))
               bezier(Vector(a,innerA,innerB,b),ratio)
 
-  final class Schedule private[VulkanPromptFusion](positive: Vector[String], negative: Vector[String]):
+  final class Schedule(positive: Vector[String], negative: Vector[String]):
     def predictors(config: String, lines: mutable.Builder[String,Vector[String]]): Unit =
       def build(name: String, conditions: Vector[String]): Unit =
         val unique = conditions.distinct.zipWithIndex.toMap

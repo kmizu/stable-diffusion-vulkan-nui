@@ -1,0 +1,146 @@
+diff --git a/src/dgl/ops/prompt.h b/src/dgl/ops/prompt.h
+--- a/src/dgl/ops/prompt.h
++++ b/src/dgl/ops/prompt.h
+@@ -30,4 +30,5 @@
+         bool clip_no_special_tokens = false;
+         bool clip_return_tokens = false;
++        bool clip_negpip = false;
+         std::optional<std::string> system;
+         std::optional<std::vector<PromptMedia>> media;
+diff --git a/src/dgl/bindings/components.cpp b/src/dgl/bindings/components.cpp
+--- a/src/dgl/bindings/components.cpp
++++ b/src/dgl/bindings/components.cpp
+@@ -83,4 +83,5 @@
+         options.clip_no_special_tokens = get_bool(args, "clip_no_special_tokens");
+         options.clip_return_tokens = get_bool(args, "clip_return_tokens");
++        options.clip_negpip = get_bool(args, "clip_negpip");
+         if (args.count("system"))
+             options.system = get_string(args, "system");
+diff --git a/src/dgl/bindings/registration.cpp b/src/dgl/bindings/registration.cpp
+--- a/src/dgl/bindings/registration.cpp
++++ b/src/dgl/bindings/registration.cpp
+@@ -480,5 +480,6 @@
+              optional("clip_bypass_normalization", Kind::Boolean, false),
+              optional("clip_no_special_tokens", Kind::Boolean, false),
+-             optional("clip_return_tokens", Kind::Boolean, false)},
++             optional("clip_return_tokens", Kind::Boolean, false),
++             optional("clip_negpip", Kind::Boolean, false)},
+             condition_signature(),
+             encode_prompt);
+diff --git a/src/dgl/ops/prompt.cpp b/src/dgl/ops/prompt.cpp
+--- a/src/dgl/ops/prompt.cpp
++++ b/src/dgl/ops/prompt.cpp
+@@ -3,8 +3,11 @@
+ #include <algorithm>
+ #include <filesystem>
++#include <iomanip>
++#include <sstream>
+ #include <set>
+ #include "conditioning/conditioner.hpp"
+ #include "core/file_access.h"
+ #include "core/image_tensor.h"
++#include "core/util.h"
+ #include "dgl/models/text_encoder.h"
+ #include "dgl/ops/image.h"
+@@ -64,5 +67,81 @@
+     }
+
++    namespace {
++        std::string escape_negpip_text(const std::string& text) {
++            std::string result;
++            for (const auto c : text) {
++                if (c == '\\' || c == '(' || c == ')' || c == '[' || c == ']')
++                    result += '\\';
++                result += c;
++            }
++            return result;
++        }
++
++        std::string negpip_weighted(const std::string& literal, float weight) {
++            if (weight == 1.f)
++                return literal;
++            std::ostringstream result;
++            result.imbue(std::locale::classic());
++            result << '(' << literal << ':' << std::fixed << std::setprecision(50) << weight << ')';
++            return result.str();
++        }
++
++        SDCondition encode_negpip(models::TextEncoder& model, PromptEncodingOptions options) {
++            options.clip_negpip = false;
++            const auto spans = parse_prompt_attention(options.text);
++            std::string clean;
++            std::vector<std::string> targets;
++            for (const auto& [text, weight] : spans) {
++                if (text == "BREAK" && weight == -1.f)
++                    clean += " BREAK ";
++                else if (weight < 0.f && !text.empty())
++                    targets.push_back(negpip_weighted(escape_negpip_text(text), -weight));
++                else if (weight >= 0.f)
++                    clean += negpip_weighted(escape_negpip_text(text), weight);
++            }
++            if (targets.empty())
++                return encode_prompt(model, std::move(options));
++            if (options.raw || options.clip_no_special_tokens || options.media || options.image_bindings ||
++                !model.supports_textual_inversion())
++                throw std::runtime_error("NegPiP requires a padded SD CLIP text encoder");
++            if (targets.size() > 64)
++                throw std::runtime_error("NegPiP supports at most 64 negative terms per prompt");
++            options.text = std::move(clean);
++            auto condition = encode_prompt(model, options);
++            const auto width = condition.c_crossattn.shape()[0];
++            std::vector<float> data;
++            auto append = [&](const Tensor<float>& tensor, size_t from, size_t until, float sign) {
++                for (size_t row = from; row < until; ++row) {
++                    const auto* src = tensor.data() + row*width;
++                    data.insert(data.end(), src, src+width);
++                    data.push_back(sign);
++                }
++            };
++            append(condition.c_crossattn,0,condition.c_crossattn.shape()[1],1.f);
++            options.clip_return_tokens = true;
++            for (auto& target : targets) {
++                options.text = std::move(target);
++                auto term = encode_prompt(model, options);
++                const auto& ids = term.c_clip_ids.values();
++                if (ids.size() != size_t(term.c_crossattn.shape()[1]) || ids.size()%77 != 0)
++                    throw std::runtime_error("NegPiP received an invalid CLIP token sequence");
++                for (size_t offset = 0; offset < ids.size(); offset += 77) {
++                    const auto first = ids.begin()+offset+1;
++                    const auto last = ids.begin()+offset+77;
++                    const auto eos = std::find(first,last,49407);
++                    // Retain the first EOS but omit BOS and padding.
++                    append(term.c_crossattn,offset+1,eos == last ? offset+77 : size_t(eos-ids.begin()+1),-1.f);
++                }
++            }
++            const auto rows = int64_t(data.size()/(width+1));
++            condition.c_crossattn = Tensor<float>({width+1,rows},std::move(data));
++            condition.c_clip_ids = {};
++            return condition;
++        }
++    }
++
+     SDCondition encode_prompt(models::TextEncoder& model, PromptEncodingOptions options) {
++        if (options.clip_negpip)
++            return encode_negpip(model, std::move(options));
+         if (options.raw && options.system)
+             throw std::runtime_error("raw prompt encoding cannot be combined with system");
+diff --git a/src/model/common/block.hpp b/src/model/common/block.hpp
+--- a/src/model/common/block.hpp
++++ b/src/model/common/block.hpp
+@@ -406,4 +406,9 @@
+         auto to_out_0 = std::dynamic_pointer_cast<Linear>(blocks["to_out.0"]);
+
++        ggml_tensor* value_signs = nullptr;
++        if (enable_ip && context->ne[0] == context_dim+1) {
++            value_signs = ggml_ext_slice(ctx,context,0,context_dim,context_dim+1);
++            context = ggml_ext_slice(ctx,context,0,0,context_dim);
++        }
+         int64_t n         = x->ne[2];
+         int64_t n_token   = x->ne[1];
+@@ -418,4 +423,6 @@
+         auto k = to_k->forward(ctx, context);  // [N, n_context, inner_dim]
+         auto v = to_v->forward(ctx, context);  // [N, n_context, inner_dim]
++        if (value_signs)
++            v = ggml_mul(ctx->ggml_ctx, v, ggml_repeat(ctx->ggml_ctx,value_signs,v));
+         if (xtra_dim) {
+             context->ne[0] = 320;  // reset dim to orig

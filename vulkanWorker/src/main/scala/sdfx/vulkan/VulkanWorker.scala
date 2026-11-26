@@ -92,6 +92,7 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
       (if backend.supportsUnetResize() then VulkanUnetHooks.resizeHooks.toVector.sorted else Vector.empty) ++
       Option.when(backend.supportsTiledDiffusion())(VulkanUnetHooks.tiledDiffusion).toVector ++
       Option.when(backend.supportsLatentModifier())(VulkanLatentModifier.id).toVector ++
+      Option.when(backend.supportsNegPip())(VulkanNegPip.id).toVector ++
       Option.when(backend.supportsDynamicThreshold())("dynamic_thresholding") ++
       (if backend.supportsSvd() then Vector("img2vid","novel_view") else Vector.empty) ++ Option.when(sdfx.vulkan.tools.VulkanCharaImport.available)("chara_searcher") ++ Option.when(sdfx.vulkan.tools.VulkanBlip.available && !sdfx.vulkan.tools.VulkanWdTagger.available)("caption") ++ Option.when(sdfx.vulkan.tools.VulkanCustomCode.enabled)("custom_code") ++ sdfx.vulkan.tools.VulkanWdTagger.features ++ Option.when(sdfx.vulkan.tools.VulkanFaceRestore.available)("face_restore") ++ Vector("vulkan_nsfw") ++ Option.when(sdfx.vulkan.tools.VulkanSafety.available)("nsfw_checker")))
 
@@ -489,9 +490,11 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
       val image = sdfx.vulkan.tools.DiffusionImageInput.readRgb(Path.of(path), maxBytes = 200000000L)
       (image, VulkanTools.differenceMask(config, image, () => job.cancelled))
     }
-    val graph = p.hooks.iterator.collectFirst { case (key, config) if key != VulkanLatentModifier.id && VulkanGraph.hooks(key) &&
-      !config.obj.get("enabled").contains(ujson.Bool(false)) && VulkanFusionPrompt.applies(key,p.prompt,p.negativePrompt) &&
-      (key != VulkanUnetHooks.tiledDiffusion || VulkanUnetHooks.needsTiles(config,p.width,p.height)) => key }
+    val graph = Option.when(VulkanNegPip.applies(p,p.prompt,p.negativePrompt))(VulkanNegPip.id)
+      .orElse(p.hooks.iterator.collectFirst { case (key, config)
+        if key != VulkanLatentModifier.id && key != VulkanNegPip.id && VulkanGraph.hooks(key) &&
+          !config.obj.get("enabled").contains(ujson.Bool(false)) && VulkanFusionPrompt.applies(key,p.prompt,p.negativePrompt) &&
+          (key != VulkanUnetHooks.tiledDiffusion || VulkanUnetHooks.needsTiles(config,p.width,p.height)) => key })
       .orElse(VulkanLatentModifier.config(p).map(_ => VulkanLatentModifier.id))
       .orElse(Option.when(tweak.nonEmpty || separateHires && p.hires.upscaler.startsWith("Latent"))(VulkanGraph.latentHires))
     val graphRequest = if graph.nonEmpty || refinement.nonEmpty then req.copy(controlnetPaths = resolveControls(req,job)) else req
@@ -587,9 +590,11 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
               VulkanClipIo.refinementConfig(p.hooks(VulkanClipIo.id), prompt == activePrompt, negative == p.negativePrompt)
             }
             val scheduleHooks = p.hooks.filter { (key, value) =>
-              VulkanFusionPrompt.textHooks(key) && !value.obj.get("enabled").contains(ujson.Bool(false))
+              (VulkanFusionPrompt.textHooks(key) || key == VulkanNegPip.id) && !value.obj.get("enabled").contains(ujson.Bool(false))
             }
-            val textGraph = scheduleHooks.keysIterator.find(key => VulkanFusionPrompt.applies(key,prompt,negative))
+            val refinementClock = refinementParams.copy(img2img = p.img2img.map(_.copy(denoisingStrength = strength)))
+            val textGraph = Option.when(VulkanNegPip.applies(refinementClock,prompt,negative))(VulkanNegPip.id)
+              .orElse(scheduleHooks.keysIterator.find(key => VulkanFusionPrompt.textHooks(key) && VulkanFusionPrompt.applies(key,prompt,negative)))
             if clip.nonEmpty && textGraph.nonEmpty then unsupported("Clip I/O and prompt scheduling in the same refinement")
             val unetHooks = p.hooks.filter { (key, value) =>
               VulkanUnetHooks.hooks(key) && !value.obj.get("enabled").contains(ujson.Bool(false)) &&
