@@ -152,7 +152,13 @@ Numeric `#cmd` expressions use the JVM evaluator and the legacy lifecycle helper
 
 Advanced `#cmd` scripts, layer-level context, dynamic ranks, extended Neutral Prompt operators and their combinations remain open. `random()` draws when planning each branch and step and is independent of the image seed. One-component detection currently reads SafeTensors keys. Other weight formats and detector-driven refinement combinations have separate coverage gaps.
 
-Further Python generation hooks without a corresponding verified implementation in this inventory include `aesthetic_gradients`, `compile` and `incantations`.
+### Aesthetic Gradients
+
+Aesthetic Gradients trains a job-local copy of the checkpoint's CLIP-L text encoder in float32 with Adam on the selected Vulkan device. Base img2img and inpainting can blend the personalized conditioning into either prompt side. For SDXL the blend replaces only the CLIP-L channels and reuses the original pooled conditioning. The worker accepts supported SD1.x and SDXL SafeTensors checkpoints, reads `.pt` or `.safetensors` aesthetic embeddings, and records the SHA-256 of the embedding actually used in PNG infotext for replay.
+
+The current path uses the pinned CLIP ViT-L/14 asset shared with embedding creation. It supports up to 16 CLIP chunks per training prompt. Aesthetic-text slerp, Hires passes, combinations with LoRA or ControlNet, and alternate checkpoint formats remain open.
+
+Further Python generation hooks without a corresponding verified implementation in this inventory include `compile` and `incantations`.
 
 ### Boundaries of the port
 

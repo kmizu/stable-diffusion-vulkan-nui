@@ -102,6 +102,7 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
       Option.when(backend.supportsLlul())(VulkanLlul.id).toVector ++
       Option.when(backend.supportsCharacteristic())(VulkanCharacteristic.id).toVector ++
       Option.when(backend.supportsComposableLora())(VulkanComposableLora.id).toVector ++
+      Option.when(backend.supportsAestheticTraining())(VulkanGraph.aestheticHook).toVector ++
       Option.when(backend.supportsAgentAttention())(VulkanAgentAttention.id).toVector ++
       Option.when(backend.supportsDynamicThreshold())("dynamic_thresholding") ++
       (if backend.supportsSvd() then Vector("img2vid","novel_view") else Vector.empty) ++ Option.when(sdfx.vulkan.tools.VulkanCharaImport.available)("chara_searcher") ++ Option.when(sdfx.vulkan.tools.VulkanBlip.available && !sdfx.vulkan.tools.VulkanWdTagger.available)("caption") ++ Option.when(sdfx.vulkan.tools.VulkanCustomCode.enabled)("custom_code") ++ sdfx.vulkan.tools.VulkanWdTagger.features ++ Option.when(sdfx.vulkan.tools.VulkanFaceRestore.available)("face_restore") ++ Vector("vulkan_nsfw") ++ Option.when(sdfx.vulkan.tools.VulkanSafety.available)("nsfw_checker")))
@@ -551,6 +552,7 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
         if key != VulkanLatentModifier.id && key != VulkanNegPip.id && VulkanGraph.hooks(key) &&
           !(hasCacheGraph && VulkanGraph.cacheGuidanceHooks(key)) &&
           !config.obj.get("enabled").contains(ujson.Bool(false)) && VulkanFusionPrompt.applies(key,p.prompt,p.negativePrompt) &&
+          (key != VulkanGraph.aestheticHook || sdfx.vulkan.tools.VulkanAestheticTraining.settings(config).active) &&
           (key != VulkanCdTuner.id || cdTuner.nonEmpty) &&
           (key != VulkanUnetHooks.tiledDiffusion || VulkanUnetHooks.needsTiles(config,p.width,p.height)) => key })
       .orElse(VulkanLatentModifier.config(p).map(_ => VulkanLatentModifier.id))
@@ -604,9 +606,16 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
         val adapted = req.copy(params = p.copy(prompt = activePrompt, loras = if composable then Nil else planned.get.loras))
         prepareConditioning(adapted, job, resources)
       }
+      var aestheticHash = Option.empty[String]
       val rendered = graph match
         case Some(hook) => VulkanGraph.render(backend, device.id(), model, loadRequest.get, graphRequest, hook,
-          activePrompt, planned.fold(p.loras)(_.loras), seed, gen.scheduler, () => job.cancelled, pass, difference, fooocus = fooocusAssets)
+          activePrompt, planned.fold(p.loras)(_.loras), seed, gen.scheduler, () => job.cancelled, pass, difference,
+          fooocus = fooocusAssets, aestheticDigest = hash => aestheticHash = Some(hash),
+          aestheticProgress = (step, loss) =>
+            emit(Obj("id" -> job.id, "type" -> "event", "event" -> "progress", "step" -> step,
+              "total" -> sdfx.vulkan.tools.VulkanAestheticTraining.settings(p.hooks(VulkanGraph.aestheticHook)).steps,
+              "pass" -> "aesthetic_gradients", "loss" -> loss.toDouble, "image" -> index,
+              "images" -> order.size, "batch_size" -> 1)))
         case None =>
           val generated = backend.generate(activePrompt, p.negativePrompt, p.width, p.height, p.steps, p.cfgScale, seed,
             samplers(p.samplerName), schedulers(gen.scheduler), p.clipSkip, imageOptions, activeConditioning, progress(None))
@@ -759,7 +768,8 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
           modelKeywordSourcePrompt = planned.map(_.source),
           hiresSeed = pass.map(_.seed), hiresSubseed = pass.map(_.subseed), hiresRepeat = pass.map(_.repeat),
           hiresSubseedStrength = pass.map(_.strength), hiresSeedResizeFromW = pass.map(_.width), hiresSeedResizeFromH = pass.map(_.height),
-          infotextFields = Seq("Vulkan device" -> display(device)) ++ score.toSeq.flatMap(_.fields), pngChunks = score.toSeq.flatMap(_.chunks))
+          infotextFields = Seq("Vulkan device" -> display(device)) ++ aestheticHash.toSeq.map("Aesthetic embedding SHA256" -> _) ++
+            score.toSeq.flatMap(_.fields), pngChunks = score.toSeq.flatMap(_.chunks))
       }
     }
     val diagnostics = for

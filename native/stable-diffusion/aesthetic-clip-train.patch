@@ -1,0 +1,261 @@
+--- /dev/null
++++ b/src/extensions/aesthetic_train.cpp
+@@ -0,0 +1,258 @@
++#include <array>
++#include <cmath>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <memory>
++#include <stdexcept>
++#include <string>
++#include <vector>
++#include "ggml.h"
++#include "ggml-alloc.h"
++#include "ggml-backend.h"
++#include "stable-diffusion.h"
++#include "core/util.h"
++
++namespace {
++    constexpr int width = 768;
++    constexpr int heads = 12;
++    constexpr int head_width = width / heads;
++    constexpr int intermediate = 3072;
++    constexpr int layers = 12;
++    constexpr int vocabulary = 49408;
++    constexpr int tokens = 77;
++    constexpr size_t graph_capacity = 16384;
++
++    using Tensor = ggml_tensor*;
++    template<class T, void(*Free)(T*)>
++    using Owner = std::unique_ptr<T, decltype(Free)>;
++
++    struct Parameters {
++        Tensor weights, bias;
++    };
++    struct Block {
++        Parameters norm1;
++        std::array<Parameters, 4> attention;
++        Parameters norm2, fc1, fc2;
++    };
++
++    Tensor normalize(ggml_context* ctx, Tensor x, bool centered) {
++        if (centered) {
++            auto avg = ggml_scale(ctx, ggml_sum_rows(ctx, x), 1.0f / x->ne[0]);
++            x = ggml_sub(ctx, x, ggml_repeat(ctx, avg, x));
++        }
++        auto square = ggml_sum_rows(ctx, ggml_sqr(ctx, x));
++        if (centered) square = ggml_scale_bias(ctx, square, 1.0f / x->ne[0], 1e-5f);
++        return ggml_div(ctx, x, ggml_repeat(ctx, ggml_sqrt(ctx, square), x));
++    }
++
++    Tensor affine_norm(ggml_context* ctx, Tensor x, Parameters p) {
++        return ggml_add(ctx, ggml_mul(ctx, normalize(ctx, x, true), p.weights), p.bias);
++    }
++
++    Tensor linear(ggml_context* ctx, Tensor x, Parameters p) {
++        return ggml_add(ctx, ggml_mul_mat(ctx, p.weights, x), p.bias);
++    }
++
++    Tensor as_heads(ggml_context* ctx, Tensor projection, int chunks) {
++        return ggml_cont(ctx, ggml_permute(ctx,
++            ggml_reshape_4d(ctx, projection, head_width, heads, tokens, chunks), 0, 2, 1, 3));
++    }
++
++    Tensor attend(ggml_context* ctx, Tensor x, Tensor mask, const Block& block, int chunks) {
++        auto normalized = affine_norm(ctx, x, block.norm1);
++        auto q = as_heads(ctx, linear(ctx, normalized, block.attention[0]), chunks);
++        auto k = as_heads(ctx, linear(ctx, normalized, block.attention[1]), chunks);
++        auto v = ggml_reshape_4d(ctx, linear(ctx, normalized, block.attention[2]), head_width, heads, tokens, chunks);
++        auto logits = ggml_mul_mat(ctx, k, q);
++        auto weights = ggml_soft_max_ext(ctx, logits, mask, 1.f / std::sqrt(float(head_width)), 0.f);
++        auto values = ggml_cont(ctx, ggml_permute(ctx, v, 1, 2, 0, 3));
++        auto head_result = ggml_mul_mat(ctx, values, weights);
++        auto joined = ggml_reshape_3d(ctx,
++            ggml_cont(ctx, ggml_permute(ctx, head_result, 0, 2, 1, 3)), width, tokens, chunks);
++        return ggml_add(ctx, x, linear(ctx, joined, block.attention[3]));
++    }
++
++    Tensor mlp(ggml_context* ctx, Tensor x, const Block& block) {
++        auto h = linear(ctx, affine_norm(ctx, x, block.norm2), block.fc1);
++        h = ggml_scale(ctx, ggml_silu(ctx, ggml_scale(ctx, h, 1.702f)), 1.f / 1.702f);
++        return ggml_add(ctx, x, linear(ctx, h, block.fc2));
++    }
++}
++
++using AestheticProgress = bool(*)(int step, float loss, void* user_data);
++
++extern "C" SD_API int sdv_aesthetic_train(const char* device, const char* input, const char* output,
++                                           int steps, float rate, AestheticProgress progress, void* user_data,
++                                           char* error, size_t error_size) {
++    try {
++        if (!device || !input || !output || steps < 1 || steps > 200 || !(rate > 0) || !std::isfinite(rate) ||
++            std::string(device).rfind("Vulkan", 0) != 0)
++            throw std::runtime_error("Invalid aesthetic training parameters");
++        if (progress && !progress(0, 0.f, user_data))
++            return 1;
++        Owner<ggml_backend, ggml_backend_free> gpu(ggml_backend_init_by_name(device, nullptr), ggml_backend_free);
++        Owner<ggml_backend, ggml_backend_free> cpu(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr), ggml_backend_free);
++        if (!gpu || !cpu) throw std::runtime_error("Cannot initialize Vulkan training backend");
++        Owner<ggml_context, ggml_free> params(ggml_init({1<<20, nullptr, true}),ggml_free);
++        Owner<ggml_context, ggml_free> graph(ggml_init({64<<20, nullptr, true}),ggml_free);
++        std::ifstream data(std::filesystem::u8path(input), std::ios::binary);
++        int32_t chunks = 0;
++        data.read(reinterpret_cast<char*>(&chunks),sizeof(chunks));
++        if (chunks < 1 || chunks > 16) throw std::runtime_error("Bad prompt chunk count");
++        auto pctx=params.get(), ctx=graph.get();
++        auto ids=ggml_new_tensor_1d(pctx, GGML_TYPE_I32, tokens*chunks);
++        auto positions=ggml_new_tensor_1d(pctx, GGML_TYPE_I32, chunks);
++        auto target=ggml_new_tensor_1d(pctx, GGML_TYPE_F32, width);
++        auto mask=ggml_new_tensor_2d(pctx, GGML_TYPE_F32, tokens,tokens);
++        std::vector<Tensor> trainable;
++        auto tensor = [&](int dimension, int rows, bool train=true) {
++            auto t = rows ? ggml_new_tensor_2d(pctx,GGML_TYPE_F32,dimension,rows) :
++                ggml_new_tensor_1d(pctx,GGML_TYPE_F32,dimension);
++            if (train) {
++                ggml_set_param(t);
++                trainable.push_back(t);
++            }
++            return t;
++        };
++        auto affine = [&](int in,int out) { return Parameters{tensor(in,out),tensor(out,0)}; };
++        auto norm = [&] { return Parameters{tensor(width,0),tensor(width,0)}; };
++        auto token_embed=tensor(width,vocabulary), position_embed=tensor(width,tokens);
++        std::array<Block,layers> blocks;
++        for (auto& block : blocks) {
++            block.norm1=norm();
++            for (auto& parameter : block.attention) parameter=affine(width,width);
++            block.norm2=norm();
++            block.fc1=affine(width,intermediate);
++            block.fc2=affine(intermediate,width);
++        }
++        auto final_norm=norm();
++        auto projection=tensor(width,width,false);
++        auto seed_gradient=tensor(1,0,false);
++        auto optimizer_args=tensor(7,0,false);
++        std::vector<Parameters> moments;
++        for (auto t : trainable) {
++            moments.push_back({
++                ggml_new_tensor(pctx, GGML_TYPE_F32, GGML_MAX_DIMS, t->ne),
++                ggml_new_tensor(pctx, GGML_TYPE_F32, GGML_MAX_DIMS, t->ne)
++            });
++        }
++        Owner<ggml_backend_buffer,ggml_backend_buffer_free> buffer(ggml_backend_alloc_ctx_tensors(pctx,gpu.get()),ggml_backend_buffer_free);
++        if (!buffer) throw std::runtime_error("Cannot allocate CLIP parameters");
++        ggml_backend_buffer_clear(buffer.get(),0);
++        float one=1.f;
++        ggml_backend_tensor_set(seed_gradient,&one,0,sizeof(one));
++        const auto read = [&](void* address, size_t bytes) {
++            if (!data.read(static_cast<char*>(address), bytes))
++                throw std::runtime_error("Truncated CLIP training data");
++        };
++        const auto read_tensor = [&](Tensor t) {
++            std::vector<float> values(ggml_nelements(t));
++            read(values.data(), ggml_nbytes(t));
++            for (float value : values)
++                if (!std::isfinite(value)) throw std::runtime_error("Non-finite CLIP training tensor");
++            ggml_backend_tensor_set(t, values.data(), 0, ggml_nbytes(t));
++        };
++        std::vector<int32_t> ids_data(tokens * chunks), eos_data(chunks);
++        read(ids_data.data(), ggml_nbytes(ids));
++        read(eos_data.data(), ggml_nbytes(positions));
++        for (int i = 0; i < chunks; ++i) {
++            const int eos = eos_data[i];
++            if (eos < i * tokens || eos >= (i + 1) * tokens || ids_data[eos] != 49407)
++                throw std::runtime_error("Invalid CLIP training EOS position");
++        }
++        for (int id : ids_data)
++            if (id < 0 || id >= vocabulary)
++                throw std::runtime_error("Invalid CLIP training token");
++        ggml_backend_tensor_set(ids, ids_data.data(), 0, ggml_nbytes(ids));
++        ggml_backend_tensor_set(positions, eos_data.data(), 0, ggml_nbytes(positions));
++        read_tensor(target);
++        for (auto t : trainable) {
++            if (progress && !progress(0, 0.f, user_data))
++                return 1;
++            read_tensor(t);
++        }
++        read_tensor(projection);
++        if (data.peek() != std::ifstream::traits_type::eof())
++            throw std::runtime_error("Unexpected trailing CLIP training data");
++        data.close();
++        std::array<float,tokens*tokens> causal;
++        for (int row=0;row<tokens;++row)
++            for (int col=0;col<tokens;++col)
++                causal[row*tokens+col] = col>row ? -INFINITY : 0.f;
++        ggml_backend_tensor_set(mask,causal.data(),0,sizeof(causal));
++
++        auto embedded=ggml_get_rows(ctx,token_embed,ids);
++        auto hidden=ggml_add(ctx,ggml_reshape_3d(ctx,embedded,width,tokens,chunks),position_embed);
++        for (auto& block : blocks) hidden=mlp(ctx,attend(ctx,hidden,mask,block,chunks),block);
++        auto eos=ggml_get_rows(ctx,ggml_reshape_2d(ctx,hidden,width,tokens*chunks),positions);
++        auto projected=ggml_mul_mat(ctx,projection,affine_norm(ctx,eos,final_norm));
++        auto similarity=ggml_mul(ctx,normalize(ctx,projected,false),target);
++        auto objective=ggml_scale(ctx,ggml_sum(ctx,similarity),-1.f/chunks);
++
++        ggml_backend_t devices[] = {gpu.get(), cpu.get()};
++        Owner<ggml_backend_sched, ggml_backend_sched_free> sched(
++            ggml_backend_sched_new(devices, nullptr, 2, graph_capacity, false, true),ggml_backend_sched_free);
++        auto computation=ggml_new_graph_custom(ctx,graph_capacity,true);
++        ggml_set_loss(objective);
++        ggml_set_output(objective);
++        ggml_build_forward_expand(computation,objective);
++        std::vector<Tensor> gradients(ggml_graph_n_nodes(computation),nullptr);
++        gradients.back()=seed_gradient;
++        ggml_build_backward_expand(ctx,computation,gradients.data());
++        std::vector<Tensor> updates;
++        for (size_t i=0;i<trainable.size();++i) {
++            auto* weight=trainable[i];
++            auto* gradient=ggml_graph_get_grad(computation,weight);
++            auto m=moments[i];
++            if (!gradient) throw std::runtime_error("CLIP parameter is missing its gradient");
++            auto update=ggml_opt_step_adamw(ctx,weight,gradient,m.weights,m.bias,optimizer_args);
++            ggml_build_forward_expand(computation,update);
++            updates.push_back(update);
++        }
++        if (progress && !progress(0, 0.f, user_data))
++            return 1;
++        if (!ggml_backend_sched_alloc_graph(sched.get(),computation))
++            throw std::runtime_error("Cannot allocate training graph");
++        for (auto update : updates)
++            if (ggml_backend_sched_get_tensor_backend(sched.get(), update) != gpu.get())
++                throw std::runtime_error("The selected Vulkan adapter cannot run CLIP Adam updates");
++        for (int step = 1; step <= steps; ++step) {
++            if (progress && !progress(0, 0.f, user_data))
++                return 1;
++            constexpr float beta1 = .9f, beta2 = .999f;
++            const float arguments[] = {rate, beta1, beta2, 1e-8f, 0.f,
++                1.f / (1.f - std::pow(beta1, float(step))),
++                1.f / (1.f - std::pow(beta2, float(step)))};
++            ggml_backend_tensor_set(optimizer_args, arguments, 0, sizeof(arguments));
++            if (ggml_backend_sched_graph_compute(sched.get(), computation) != GGML_STATUS_SUCCESS)
++                throw std::runtime_error("Vulkan training graph failed");
++            float loss = 0;
++            ggml_backend_tensor_get(objective, &loss, 0, sizeof(loss));
++            if (!std::isfinite(loss))
++                throw std::runtime_error("Non-finite CLIP loss");
++            if (progress && !progress(step, loss, user_data))
++                return 1;
++        }
++
++        std::ofstream result(std::filesystem::u8path(output), std::ios::binary | std::ios::trunc);
++        for (auto t : trainable) {
++            std::vector<char> bytes(ggml_nbytes(t));
++            ggml_backend_tensor_get(t, bytes.data(), 0, bytes.size());
++            if (!result.write(bytes.data(), bytes.size()))
++                throw std::runtime_error("Could not write trained CLIP weights");
++            if (progress && !progress(0, 0.f, user_data))
++                return 1;
++        }
++        result.close();
++        if (!result)
++            throw std::runtime_error("Could not close trained CLIP weights");
++        return 0;
++    } catch (const std::exception& exception) {
++        if (error && error_size > 0) {
++            std::strncpy(error, exception.what(), error_size - 1);
++            error[error_size - 1] = '\0';
++        }
++        return -1;
++    }
++}

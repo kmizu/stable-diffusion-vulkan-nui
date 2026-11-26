@@ -13,7 +13,10 @@ private[vulkan] object VulkanClipTorchFile:
   final case class Tensor(shape: Vector[Int], data: Array[Float])
   private def invalid(detail: String): Nothing = VulkanProtocol.invalid(s"Clip I/O PT: $detail")
 
-  def read(path: Path): (Tensor, Option[Tensor]) =
+  def read(path: Path): (Tensor, Option[Tensor]) = read(path, aesthetic = false)
+  def readAesthetic(path: Path): Tensor = read(path, aesthetic = true)._1
+
+  private def read(path: Path, aesthetic: Boolean): (Tensor, Option[Tensor]) =
     Using.resource(new ZipFile(path.toFile)) { zip =>
       val descriptors = zip.entries().asScala.filter(_.getName.endsWith("/data.pkl")).take(2).toList
       if descriptors.size != 1 then invalid("expected one tensor descriptor")
@@ -63,6 +66,14 @@ private[vulkan] object VulkanClipTorchFile:
         case _ => invalid("expected a tensor")
 
       TorchYoloPickle.tensorPayload(bytes("data.pkl", 1024 * 1024)) match
+        case table: java.util.Map[?, ?] if aesthetic =>
+          val available = table.values().asScala.iterator.collect { case value: TorchYoloPickle.Tensor => value }.take(2).toVector
+          val selected = Option(table.get("embedding")).orElse(Option(table.get("aesthetic_embedding")))
+            .orElse(available match
+              case Vector(only) => Some(only)
+              case _ => None)
+            .getOrElse(invalid("archive has no aesthetic embedding tensor"))
+          tensor(selected) -> None
         case table: java.util.Map[?, ?] =>
           val cond = Seq("cond", "conditioning", "c").iterator.map(name => table.get(name))
             .find(_ != null).getOrElse(invalid("archive has no conditioning tensor"))

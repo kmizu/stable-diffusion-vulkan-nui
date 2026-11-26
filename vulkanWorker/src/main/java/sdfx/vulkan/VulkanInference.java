@@ -71,6 +71,10 @@ public final class VulkanInference implements AutoCloseable {
         void update(int step, int pass, int passSteps, boolean noisy, BufferedImage image);
     }
 
+    @FunctionalInterface public interface AestheticProgress {
+        boolean update(int step, float loss);
+    }
+
     private Double eta;
     private static final FunctionDescriptor PREVIEW = FunctionDescriptor.ofVoid(
         JAVA_INT, JAVA_INT, ADDRESS, JAVA_BOOLEAN, ADDRESS);
@@ -79,6 +83,8 @@ public final class VulkanInference implements AutoCloseable {
     private static final MemorySegment NULL = MemorySegment.NULL;
     private static final FunctionDescriptor PROGRESS = FunctionDescriptor.ofVoid(ADDRESS, ADDRESS);
     private static final FunctionDescriptor LOG = FunctionDescriptor.ofVoid(JAVA_INT, ADDRESS, ADDRESS);
+    private static final FunctionDescriptor AESTHETIC_PROGRESS = FunctionDescriptor.of(JAVA_BOOLEAN, JAVA_INT, JAVA_FLOAT, ADDRESS);
+    private static final MethodHandle AESTHETIC_HANDLER;
     private static final MethodHandle EVENT_HANDLER;
     private static final MemorySegment LOG_STUB;
     private static final MemorySegment QUIET_PROGRESS;
@@ -91,6 +97,8 @@ public final class VulkanInference implements AutoCloseable {
                     MemorySegment.class, boolean.class, MemorySegment.class));
             EVENT_HANDLER = lookup.findStatic(VulkanInference.class, "onProgress",
                 MethodType.methodType(void.class, Progress.class, MemorySegment.class, MemorySegment.class));
+            AESTHETIC_HANDLER = lookup.findStatic(VulkanInference.class, "onAestheticProgress",
+                MethodType.methodType(boolean.class, AestheticProgress.class, int.class, float.class, MemorySegment.class));
             var log = lookup.findStatic(VulkanInference.class, "onLog",
                 MethodType.methodType(void.class, int.class, MemorySegment.class, MemorySegment.class));
             // Both loader and sampler print bars to stdout when the global callback is absent.
@@ -124,6 +132,9 @@ public final class VulkanInference implements AutoCloseable {
             calls.put("ggml_backend_dev_memory", LINKER.downcallHandle(base.findOrThrow("ggml_backend_dev_memory"),
                 FunctionDescriptor.ofVoid(ADDRESS, ADDRESS, ADDRESS)));
             symbols = SymbolLookup.libraryLookup(dir.resolve("stable-diffusion.dll"), library);
+            if (symbols.find("sdv_aesthetic_train").isPresent())
+                bind("sdv_aesthetic_train", JAVA_INT, ADDRESS, ADDRESS, ADDRESS, JAVA_INT, JAVA_FLOAT,
+                    ADDRESS, ADDRESS, ADDRESS, JAVA_LONG);
             bind("sd_set_log_callback", null, ADDRESS, ADDRESS);
             call("sd_set_log_callback", LOG_STUB, NULL);
             bind("sd_set_progress_callback", null, ADDRESS, ADDRESS);
@@ -220,6 +231,32 @@ public final class VulkanInference implements AutoCloseable {
             var p = event.reinterpret(48);
             sink.update(cString(p.get(ADDRESS, 0)), p.get(JAVA_LONG, 32), p.get(JAVA_LONG, 40));
         } catch (Throwable ignored) { /* Exceptions must never cross native callbacks. */ }
+    }
+
+    private static boolean onAestheticProgress(AestheticProgress sink, int step, float loss, MemorySegment unused) {
+        try {
+            return sink.update(step, loss);
+        } catch (Throwable e) {
+            return false;
+        }
+    }
+
+    public boolean supportsAestheticTraining() {
+        return calls.containsKey("sdv_aesthetic_train");
+    }
+
+    public synchronized void trainAesthetic(String device, Path input, Path output, int steps, float rate,
+                                             AestheticProgress progress) {
+        if (!supportsAestheticTraining()) throw new IllegalStateException("Aesthetic training is unavailable");
+        try (var arena = Arena.ofConfined()) {
+            var callback = LINKER.upcallStub(AESTHETIC_HANDLER.bindTo(progress), AESTHETIC_PROGRESS, arena);
+            var error = arena.allocate(2048);
+            int status = (int) call("sdv_aesthetic_train", arena.allocateFrom(device),
+                arena.allocateFrom(input.toAbsolutePath().toString()), arena.allocateFrom(output.toAbsolutePath().toString()),
+                steps, rate, callback, NULL, error, error.byteSize());
+            if (status == 1) throw new CancellationException();
+            if (status != 0) throw new NativeFailure(status, error.getString(0));
+        }
     }
 
     private void onPreview(Preview sink, int step, int count, MemorySegment frames, boolean noisy, MemorySegment unused) {

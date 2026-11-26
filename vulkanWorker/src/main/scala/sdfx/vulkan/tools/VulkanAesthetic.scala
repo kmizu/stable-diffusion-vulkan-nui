@@ -14,13 +14,13 @@ private[vulkan] object VulkanAesthetic:
   private val revision = "32bd64288804d66eefd0ccbe215aa642df71cc41"
   private val sha = "a2bf730a0c7debf160f7a6b50b3aaf3703e7e88ac73de7a314903141db026dcb"
   private val repo = "openai/clip-vit-large-patch14"
-  private def cache:Path = sys.env.get("SDFX_AESTHETIC_GRADIENTS_CACHE").map(Path.of(_)).getOrElse {
+  def cache:Path = sys.env.get("SDFX_AESTHETIC_GRADIENTS_CACHE").map(Path.of(_)).getOrElse {
     val root=Path.of(sys.props("user.home"),".cache")
     val current=root.resolve("stable-diffusion-nui/aesthetic_gradients")
     val old=root.resolve("stablediffusion-nui/aesthetic_gradients")
     if !Files.exists(current) && Files.exists(old) then old else current
   }
-  private def folders:Vector[Path] =
+  def folders:Vector[Path] =
     sys.env.get("SDFX_AESTHETIC_EMBEDDINGS").toVector.flatMap(_.split(File.pathSeparator)).filter(_.trim.nonEmpty).map(Path.of(_)) :+ cache.resolve("embeddings")
   private def files(dir:Path):Vector[Path] =
     Using.resource(Files.list(dir))(_.iterator.asScala.filter(Files.isRegularFile(_)).toVector.sortBy(_.toString))
@@ -51,9 +51,12 @@ private[vulkan] object VulkanAesthetic:
       entry("data.pkl",buf.toByteArray);entry("data/0",bytes.array());entry("version","3\n".getBytes(UTF_8));entry("byteorder","little".getBytes(UTF_8))
     }
 
-  def visionProgram(root:Path,device:String,check:()=>Unit,progress:(String,Int,Int)=>Unit):String =
+  def referenceWeights(root:Path,check:()=>Unit,progress:(String,Int,Int)=>Unit):Path =
     val cacheDir=Files.createDirectories(root.resolve("openai__clip-vit-large-patch14").resolve(revision))
-    val weights=VulkanClip.asset(cacheDir,"model.safetensors",s"https://huggingface.co/$repo/resolve/$revision/model.safetensors",sha,check,progress)
+    VulkanClip.asset(cacheDir,"model.safetensors",s"https://huggingface.co/$repo/resolve/$revision/model.safetensors",sha,check,progress)
+
+  def visionProgram(root:Path,device:String,check:()=>Unit,progress:(String,Int,Int)=>Unit):String =
+    val weights=referenceWeights(root,check,progress)
     val file=ujson.write(ujson.Str(weights.toAbsolutePath.toString));val adapter=ujson.write(ujson.Str(device))
     s"""fn main(input) {
       vision = load_vision_encoder($file, backend=$adapter, params_backend=$adapter)

@@ -3,6 +3,16 @@
 
 
 
+## Windows v0.61 — Aesthetic Gradients in img2img
+
+An isolated full CLIP-L training run updated 196 parameter tensors on Vulkan with each adapter. Three Adam iterations moved the SD1.5 loss from −0.245517 to −0.560078 on RTX 3090 and the SDXL loss from −0.231040 to −0.381057 on Radeon 780M. The maximum absolute difference from independent CPU PyTorch was 0.000731 for SD1.5 and 0.000571 for SDXL.
+
+Direct masked jobs produced different pixels inside the mask at blend weights 0.25 and 1.0. All pixels outside the mask matched the source. The staged `SDV-NUI.exe` used the trained CLIP-L overlay and wrote the embedding fingerprint to PNG infotext in masked SDXL on RTX 3090 and masked SD1.5 on Radeon 780M. Both selected Vulkan with `cuda=false`. An incorrect fingerprint was rejected, and interrupting a 100-step training job after its first progress event cancelled the native call.
+
+A separate unmasked SDXL img2img job on RTX 3090 used positive personalization with an empty negative prompt. The masked and unmasked outputs were inspected. The short unmasked run rendered a recognizable fox with strong saturation and visible texture artifacts.
+
+All 67 Vulkan worker tests and 14 aesthetic plugin tests passed. The ZIP SHA-256 is `d01c3369d02b9ae9119a4b16bdeb85d94a0a2bd6e8c7a4e1ce285ae8ebef3115`. The archived launcher, desktop JAR, worker JAR and inference DLL matched the tested staging files.
+
 ## Windows v0.60 — Composable LoRA layer counts
 
 The staged `SDV-NUI.exe` ran masked img2img through MCP with `cuda=false` on RTX 3090 with SDXL and Radeon 780M with SD1.5. Active LoRA evaluations counted 788 layers and 192 layers respectively, matching independent counts of the adapters' U-Net tensor groups. Branches with zero weight reported zero layer evaluations. PNGs and plots were inspected, and the generated images matched the v0.59 runs pixel for pixel.
