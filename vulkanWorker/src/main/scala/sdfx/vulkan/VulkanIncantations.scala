@@ -48,6 +48,7 @@ private[vulkan] object VulkanIncantations:
 
   final case class Seg(blur: Double, start: Int, end: Int) extends StepWindow
   final case class Pag(scale: Float, start: Int, end: Int, sanf: Boolean) extends StepWindow
+  final case class Scfg(scale: Float, start: Int, end: Int, r: Int, min: Float, max: Float, clamp: Float) extends StepWindow
 
   def seg(hooks: Map[String, Value]): Option[Seg] =
     configured(hooks).filter(flag(_, "seg_active")).flatMap { config =>
@@ -63,8 +64,21 @@ private[vulkan] object VulkanIncantations:
         flag(config, "pag_sanf")))
     }
 
+  def scfg(hooks: Map[String, Value]): Option[Scfg] =
+    configured(hooks).filter(flag(_, "scfg_active")).flatMap { config =>
+      def value(field: String, default: Double): Float =
+        val result = number(config, field, default).toFloat
+        if !result.isFinite then VulkanProtocol.invalid(s"Incantations S-CFG: $field must fit in float32")
+        result
+      val r = step(config, "scfg_r", 4)
+      if r < 1 then VulkanProtocol.invalid("Incantations S-CFG R must be at least 1")
+      val scale = value("scfg_scale", 1)
+      Option.when(scale > 0)(Scfg(scale, step(config, "scfg_start_step", 0), step(config, "scfg_end_step", 150),
+        r, value("scfg_rate_min", 0.8), value("scfg_rate_max", 3), value("scfg_rate_clamp", 0)))
+    }
+
   def attentionAt(hooks: Map[String, Value], count: Int): Boolean =
-    seg(hooks).exists(_.canApply(count)) || pag(hooks).exists(_.canApply(count))
+    seg(hooks).exists(_.canApply(count)) || pag(hooks).exists(_.canApply(count)) || scfg(hooks).exists(_.canApply(count))
 
   def attentionPasses(p: GenerationParams): Boolean =
     val base = p.img2img.fold(p.steps)(i => VulkanImageInputs.img2imgSteps(p.steps, i.denoisingStrength))
@@ -73,6 +87,11 @@ private[vulkan] object VulkanIncantations:
   def segArguments(hooks: Map[String, Value], width: Int, height: Int, count: Int): String =
     seg(hooks).filter(_.canApply(count)).fold("") { config =>
       s", seg_blur = ${config.blur}, seg_start = ${config.start}, seg_end = ${config.end}, seg_width = $width, seg_height = $height"
+    }
+
+  def scfgArguments(hooks: Map[String, Value], width: Int, height: Int, count: Int): String =
+    scfg(hooks).filter(_.canApply(count)).fold("") { c =>
+      s", scfg_scale = ${c.scale}, scfg_r = ${c.r}, scfg_start = ${c.start}, scfg_end = ${c.end}, scfg_min = ${c.min}, scfg_max = ${c.max}, scfg_clamp = ${c.clamp}, scfg_width = $width, scfg_height = $height"
     }
 
   def pagGraph(hooks: Map[String, Value], count: Int, unet: String, condition: String, args: String,
@@ -84,11 +103,9 @@ private[vulkan] object VulkanIncantations:
     }
 
   def validate(p: GenerationParams): Unit = configured(p.hooks).foreach { config =>
-    val unsupported = Seq("scfg_active" -> "S-CFG", "t2i0_active" -> "Multi-Concept T2I-Zero").collect {
-      case (field, name) if flag(config, field) => name
-    }
-    if unsupported.nonEmpty then VulkanProtocol.unsupported(s"Incantations ${unsupported.mkString(", ")}")
+    if flag(config, "t2i0_active") then VulkanProtocol.unsupported("Incantations Multi-Concept T2I-Zero")
     val attention = Option.when(seg(p.hooks).nonEmpty)("SEG").orElse(Option.when(pag(p.hooks).nonEmpty)("PAG"))
+      .orElse(Option.when(scfg(p.hooks).nonEmpty)("S-CFG"))
     attention.foreach { feature =>
       val refinement = Img2ImgHiresMetadata.active(p.hooks).filter(_("denoise").num > 0)
       if p.cfgScale <= 1 || p.hires.enabled && p.hires.cfgScale.exists(_ <= 1) ||

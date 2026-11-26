@@ -787,6 +787,10 @@ public final class VulkanInference implements AutoCloseable {
         return cString(ptr("sd_dgl_builtin_catalog")).contains("incantations_pag");
     }
 
+    public boolean supportsScfg() {
+        return cString(ptr("sd_dgl_builtin_catalog")).contains("`scfg_scale?");
+    }
+
     public boolean supportsCharacteristic() {
         return cString(ptr("sd_dgl_builtin_catalog")).contains("`characteristic?");
     }

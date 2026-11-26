@@ -161,6 +161,7 @@ private[vulkan] object VulkanGraph:
     val patchedAttention = reference.nonEmpty || lllite.nonEmpty || agent.nonEmpty || llul.nonEmpty
     val incantations = hook == VulkanIncantations.id && VulkanIncantations.attentionPasses(p)
     val segArgs = if incantations then VulkanIncantations.segArguments(p.hooks, p.width, p.height, passSteps) else ""
+    val scfgArgs = if incantations then VulkanIncantations.scfgArguments(p.hooks, p.width, p.height, passSteps) else ""
     val incantationsPag = incantations && VulkanIncantations.pag(p.hooks).exists(_.canApply(passSteps))
     val patchedInputs = customText || unetGraph || modifier.nonEmpty || fooocus.nonEmpty || cdTuner.nonEmpty || cacheGraph || patchedAttention || characteristic.nonEmpty || composable.nonEmpty || aesthetic.nonEmpty || incantations
     val supportsControl = unetGraph || cdTuner.nonEmpty || tgate.nonEmpty || patchedAttention || aesthetic.nonEmpty || incantations || modifier.nonEmpty && !customText
@@ -506,7 +507,7 @@ private[vulkan] object VulkanGraph:
           val negRef = reference.fold("")(_.args("ref", positive = false))
           val llliteArgs = lllite.fold("")((config, path) => config.args(path, "lllite_hint"))
           val llulArgs = llul.filter(_.canApply(p.steps)).fold("")(_.args(p.width, p.height, "llul_mask", p.steps))
-          lines += s"pos = predictor(unet, $positiveInput$concat$unetArgs$fooocusArgs${cdArgs(false)}$posRef$llliteArgs$llulArgs)"
+          lines += s"pos = predictor(unet, $positiveInput$concat$unetArgs$fooocusArgs${cdArgs(false)}$posRef$llliteArgs$llulArgs$scfgArgs)"
           val blank = if aesthetic.fold(p.negativePrompt.nonEmpty)(_ => p.negativePrompt.trim.nonEmpty) then ""
             else if lllite.nonEmpty then ", lllite_blank_negative = true"
             else if llul.nonEmpty then ", llul_blank_negative = true"

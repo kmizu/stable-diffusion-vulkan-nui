@@ -3,6 +3,16 @@
 
 
 
+## Windows v0.69 — Incantations S-CFG
+
+An independent two-dimensional reference matched the native projected attention maps within `2.02e-7` and the final spatial residual within `1.4e-7`. The fixture compared full attention propagation with query-row blocking across three blocks, including a shorter last block. All 75 Vulkan worker tests and six Incantations plugin tests passed.
+
+The final DLL ran masked SD1.5 and SDXL at 512 × 512 on Radeon 780M. On SD1.5 with Euler a, the inactive window matched ordinary generation pixel for pixel. The active window used one attention pair at R=1 and 16 at R=4, and the two outputs differed inside the mask. SDXL with Euler logged 70 pairs at R=4. The runs preserved each unmasked pixel. The short SDXL runs showed visible banding in the edit. A same-seed four-step Euler a comparison reproduced the banding with S-CFG disabled.
+
+The staged `SDV-NUI.exe` ran both checkpoints on Radeon 780M through MCP with a system-only PATH. Both reported `cuda=false`, preserved every unmasked pixel, and stored the S-CFG scale and R in the output PNG. The generated images were inspected. The Windows ZIP SHA-256 is `5cd7b5960c0850c86eabd92bfb718db6b3e7e56d267ffa113d738731d2b05d45`. Its launcher, desktop JAR, Vulkan worker JAR and inference DLL matched the tested staging files.
+
+The final DLL ran both 576 × 576 Hires paths on Radeon 780M with SDXL, S-CFG, SEG, PAG/SANF and the CFG Scheduler. Both images were inspected. RTX 3090 ran both 832 × 832 Hires paths before query-row blocking was added. Final 3090 retests encountered host-memory exhaustion and Vulkan device loss during ordinary generation.
+
 ## Windows v0.68 — Incantations PAG and SANF
 
 The native SANF calculation matched an independent reflect-Gaussian and per-pixel channel-softmax reference across 160 values in two rectangular batches. The maximum absolute error was `1.2e-7`. A tied softmax selected the CFG residual.

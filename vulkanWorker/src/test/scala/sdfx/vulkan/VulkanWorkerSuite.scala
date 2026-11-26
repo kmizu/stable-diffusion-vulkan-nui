@@ -144,6 +144,14 @@ class VulkanWorkerSuite extends munit.FunSuite:
     assert(error.message.contains("SEG with sampler Heun"))
   }
 
+  test("Incantations S-CFG serializes the selected resolutions and guidance controls") {
+    val hooks = Map("incantations" -> ujson.Obj("scfg_active" -> true, "scfg_scale" -> 1.25,
+      "scfg_r" -> 3, "scfg_start_step" -> 1, "scfg_end_step" -> 4, "scfg_rate_clamp" -> 3))
+    assertEquals(VulkanIncantations.scfgArguments(hooks, 640, 512, 5),
+      ", scfg_scale = 1.25, scfg_r = 3, scfg_start = 1, scfg_end = 4, scfg_min = 0.8, scfg_max = 3.0, scfg_clamp = 3.0, scfg_width = 640, scfg_height = 512")
+    assertEquals(VulkanIncantations.scfgArguments(hooks, 640, 512, 2), "")
+  }
+
   test("Incantations PAG adds a windowed perturbed positive branch only when reachable") {
     val hooks = Map("incantations" -> ujson.Obj("pag_active" -> "yes", "pag_scale" -> 1.75,
       "pag_sanf" -> true, "pag_start_step" -> 2, "pag_end_step" -> 6))

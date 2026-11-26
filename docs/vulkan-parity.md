@@ -168,7 +168,9 @@ Smoothed Energy Guidance (SEG) supports Euler and Euler a on the SD 1.x, SD 2.x 
 
 Incantations PAG has additive guidance and Saliency-Adaptive Noise Fusion (SANF), with an inclusive window on Euler and Euler a. It replaces the first middle-block self-attention output with its raw Value projection in a separate positive prediction. It combines with SEG and the Incantations CFG Scheduler, including regular Hires and the independent Img2Img Hires Fix. The window follows the Vulkan sampler's retained evaluations. Plain img2img can retain one more evaluation than the old Diffusers path at fractional strength.
 
-S-CFG and Multi-Concept T2I-Zero remain open. The `compile` hook also remains open.
+S-CFG reads head-averaged self- and cross-attention from the conditional branch, aggregates the selected resolutions, and applies the legacy spatial rate to the CFG residual. It supports the legacy window, resolution count, minimum, maximum and clamp on Euler and Euler a, including both Hires paths and combinations with SEG, PAG, SANF and the CFG Scheduler. Large self-attention maps are computed in query-row blocks with all keys participating in each softmax. The cost still grows with the number of spatial tokens and propagation iterations.
+
+Multi-Concept T2I-Zero and the `compile` hook remain open.
 
 ### Boundaries of the port
 

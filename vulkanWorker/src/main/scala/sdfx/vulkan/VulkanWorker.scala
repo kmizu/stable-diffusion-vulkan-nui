@@ -530,6 +530,8 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
       unsupported("This Vulkan runtime lacks Incantations SEG")
     if VulkanIncantations.pag(p.hooks).nonEmpty && !backend.supportsIncantationsPag() then
       unsupported("This Vulkan runtime lacks Incantations PAG")
+    if VulkanIncantations.scfg(p.hooks).nonEmpty && !backend.supportsScfg() then
+      unsupported("This Vulkan runtime lacks Incantations S-CFG")
     val hires = VulkanImageInputs.hires(req)
     val separateHires = VulkanImageInputs.separateHires(req)
     val refinement = Img2ImgHiresMetadata.active(p.hooks)

@@ -90,6 +90,7 @@ private[vulkan] object VulkanHiresGraph:
     else ""
     val aa = h.upscaler.contains("antialiased")
     val seg = VulkanIncantations.segArguments(p.hooks, p.width, p.height, count)
+    val scfg = VulkanIncantations.scfgArguments(p.hooks, p.width, p.height, count)
     val incantations = VulkanIncantations.attentionPasses(p)
     val pag = VulkanIncantations.pag(p.hooks).exists(_.canApply(count))
     val randomAlgorithm = if llul.nonEmpty || characteristic.nonEmpty || composable.nonEmpty || aesthetic.nonEmpty || incantations then "cuda" else "cpu"
@@ -133,7 +134,7 @@ private[vulkan] object VulkanHiresGraph:
       val ref = reference.fold("")(_.args("hr_ref", positive = name == "pos"))
       val encoded = aesthetic.fold(s"encode_prompt($text, ${q(prompt)}, $encoding)")(
         _.encode(s"hr_${name}_condition", text, prompt, encoding, name == "neg", adapters, lines))
-      val segArgs = if name == "neg" then seg else ""
+      val branchArguments = if name == "neg" then seg else scfg
       val blank = if name != "neg" || aesthetic.fold(prompt.nonEmpty)(_ => prompt.trim.nonEmpty) then ""
         else if lllite.nonEmpty then ", lllite_blank_negative = true"
         else if llul.nonEmpty then ", llul_blank_negative = true"
@@ -141,7 +142,7 @@ private[vulkan] object VulkanHiresGraph:
         else ""
       val condition = controlWeight.fold(encoded)(weight =>
         s"controlnet::apply($encoded, control_model, hr_control_hint, strength = $weight)")
-      lines += s"hr_$name = predictor($unet, $condition$concat$cdt$cacheArgs$ref$agentArgs$llliteArgs$llulArgs$blank$segArgs)"
+      lines += s"hr_$name = predictor($unet, $condition$concat$cdt$cacheArgs$ref$agentArgs$llliteArgs$llulArgs$blank$branchArguments)"
       if name == "pos" && pag then
         pagGraph = VulkanIncantations.pagGraph(p.hooks, count, unet, condition, concat, "hr_pos", "hr_incantations_base", "hr_guided")
     val sampler = h.samplerName.getOrElse(p.samplerName)
