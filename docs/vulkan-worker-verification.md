@@ -2,6 +2,13 @@
 
 
 
+
+## Windows v0.39
+
+The ZIP SHA-256 is `6829b85761a96f35318f66999ebe6380bb0baa60cb0285e82541534b4f122a31`. Using the bundled JDK and Vulkan DLL over MCP, the executable exported an unpadded conditioning PT and read it back for img2img. That image matched a `?prompt(..., no_padding=True)` and identity `?eval` on both Radeon 780M with SD1.5 at 512 x 512 and RTX 3090 with SDXL at 768 x 768. A fresh extraction of the ZIP also passed the MCP replay with SD1.5 on RTX 3090.
+
+The two unpadded SD1.5 CLIP output rows each reached cosine similarity above 0.99999 against an independent CPU Transformers run with the same checkpoint and two input tokens. Export-only options retained the original generation pixels in paired tests.
+
 ## Windows v0.38
 
 The v0.38 package includes the patched Vulkan DLL, JVM script runtime and the optional WD, character search and BLIP base models. Its ZIP SHA-256 is `e412150bfe62ce744bf0874b87cd6c27a67366f9fa7b11687b89b7514586c217`.
