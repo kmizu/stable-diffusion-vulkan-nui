@@ -13,6 +13,8 @@ An SDXL SafeTensors copy with canonical CLIP-L names also ran on RTX 3090 throug
 
 The staged `SDV-NUI.exe` resolved the `.ckpt` and `.gguf` names through MCP, generated on both adapters with `cuda=false`, wrote the slerp settings and embedding fingerprint, and preserved all unmasked pixels. All 69 Vulkan worker tests and 14 aesthetic plugin tests passed. The ZIP SHA-256 is `c0e544d457d4c4273fc9f4459c1234668a6f9010d54a1e853712e205d58b29a6`. The archived launcher, desktop JAR, worker JAR and inference DLL matched the tested staging files.
 
+The same v0.65 executable also ran masked Aesthetic Gradients with Q8_0 GGUF checkpoints built from `animekawa_v10` and `animaPencilXL_v500`. Radeon 780M generated SD1.5 at 512 × 512 and RTX 3090 generated SDXL at 768 × 768, both with `cuda=false`. Each image kept all unmasked pixels and recorded the style settings and embedding fingerprint. Both images were inspected. For each checkpoint, all 589,824 values of one quantized CLIP-L query projection matched an independent FP32 decode of the GGUF blocks byte for byte.
+
 ## Windows v0.64 — Aesthetic Gradients with LoRA
 
 An independent CPU PyTorch check formed a rank-two Q-projection delta and applied the fixture's alpha and adapter weight before three Adam updates. On Radeon 780M, maximum absolute loss differences were 0.000357 for SD1.5 and 0.000456 for SDXL. On RTX 3090 the SDXL difference was 0.000084 at the first step and 0.003500 at the third. The same merged weights feed the Aesthetic style projection before training.
