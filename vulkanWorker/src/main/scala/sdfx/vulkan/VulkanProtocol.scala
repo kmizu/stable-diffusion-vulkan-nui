@@ -80,10 +80,18 @@ private[vulkan] object VulkanProtocol:
       if !Files.isDirectory(base) then Nil
       else Using.resource(Files.walk(base)) { walk =>
         walk.iterator().asScala.filter(p => Files.isRegularFile(p) && checkpoint(p)).map { p =>
-          val name = base.relativize(p).toString.replace('\\', '/').dropRight(".safetensors".length)
+          val relative = base.relativize(p).toString.replace('\\', '/')
+          val name = checkpointName(relative)
           ModelEntry(name, p.toString, "unknown", Files.size(p).toDouble / (1024 * 1024))
         }.toVector
       }
     }
     Obj("models" -> Json.toJs(entries.distinctBy(_.path).sortBy(_.name.toLowerCase(Locale.ROOT))))
-  def checkpoint(path: Path): Boolean = path.getFileName.toString.toLowerCase(Locale.ROOT).endsWith(".safetensors")
+  val checkpointExtensions = Vector(".safetensors", ".ckpt", ".gguf", ".pt", ".pth", ".bin")
+  def checkpointName(filename: String): String =
+    if filename.toLowerCase(Locale.ROOT).endsWith(".safetensors") then filename.dropRight(".safetensors".length)
+    else filename
+
+  def checkpoint(path: Path): Boolean =
+    val name = path.getFileName.toString.toLowerCase(Locale.ROOT)
+    checkpointExtensions.exists(name.endsWith)

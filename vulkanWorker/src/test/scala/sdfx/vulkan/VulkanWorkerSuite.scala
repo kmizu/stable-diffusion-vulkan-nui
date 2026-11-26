@@ -92,13 +92,14 @@ class VulkanWorkerSuite extends munit.FunSuite:
   test("registry uses final extension and preserves names of nested checkpoints") {
     val root = java.nio.file.Files.createTempDirectory("vulkan-catalog")
     val folder = java.nio.file.Files.createDirectory(root.resolve("anime"))
-    val model = java.nio.file.Files.createFile(folder.resolve("animagine-xl-3.1.SAFETENSORS"))
+    val models = List("animagine-xl-3.1.SAFETENSORS", "animagine-xl-3.1.ckpt", "paint-xl.Q8.GGUF")
+      .map(name => java.nio.file.Files.createFile(folder.resolve(name)))
     try
       val files = VulkanProtocol.models(ujson.Obj("dirs" -> ujson.Arr(root.toString, folder.toString)))("models").arr
-      assertEquals(files.map(_("name").str).toList, List("anime/animagine-xl-3.1"))
-      assertEquals(files.head("path").str, model.toString)
+      assertEquals(files.map(_("name").str).toList, List("anime/animagine-xl-3.1", "anime/animagine-xl-3.1.ckpt", "anime/paint-xl.Q8.GGUF"))
+      assertEquals(files.map(_("path").str).toList, models.map(_.toString))
     finally
-      java.nio.file.Files.delete(model)
+      models.foreach(java.nio.file.Files.delete)
       java.nio.file.Files.delete(folder)
       java.nio.file.Files.delete(root)
   }

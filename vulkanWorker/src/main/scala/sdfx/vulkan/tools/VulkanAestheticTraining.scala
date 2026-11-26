@@ -147,7 +147,8 @@ private[vulkan] object VulkanAestheticTraining:
   def train(engine: VulkanInference, device: String, checkpoint: Path, sdxl: Boolean, prompt: String,
       config: Settings, folder: Path, loras: Seq[(String, Float)], cancelled: () => Boolean,
       progress: (Int, Float) => Unit): (Path, String) =
-    if !checkpoint.getFileName.toString.toLowerCase(java.util.Locale.ROOT).endsWith(".safetensors") then
+    val safeTensor = checkpoint.getFileName.toString.toLowerCase(java.util.Locale.ROOT).endsWith(".safetensors")
+    if !safeTensor && !engine.supportsAestheticCheckpointExtraction() then
       VulkanProtocol.unsupported("Aesthetic Gradients with a checkpoint outside SafeTensors")
     val style = styleChunk(config)
     if loras.nonEmpty && !engine.supportsAestheticLora() then
@@ -162,8 +163,20 @@ private[vulkan] object VulkanAestheticTraining:
     val trained = Files.createTempFile(folder, "clip-trained-", ".bin")
     val prefix = if sdxl then "conditioner.embedders.0.transformer." else "cond_stage_model.transformer."
     val ids = chunks(prompt)
-    Using.resources(CheckpointIO.open(checkpoint), CheckpointIO.open(reference),
-      new DataOutputStream(new BufferedOutputStream(Files.newOutputStream(input)))) { (source, stock, stream) =>
+    Using.Manager { use =>
+      val source = Option.when(safeTensor)(use(CheckpointIO.open(checkpoint)))
+      val requested = parameters.filterNot(parameter => sdxl && parameter.reference)
+      val extract = engine.supportsAestheticCheckpointExtraction() &&
+        source.forall(file => requested.exists(p => !file.tensors.contains(prefix + p.name)))
+      val raw = Option.when(extract) {
+        val names = requested.map(p => s"cond_stage_model.transformer.${p.name}").toArray
+        val dimensions = requested.flatMap(_.shape.reverse.padTo(2, 1L)).toArray
+        val path = Files.createTempFile(folder, "clip-checkpoint-", ".bin")
+        engine.extractAestheticClip(checkpoint, path, names, dimensions, (_, _) => !cancelled())
+        use(new BufferedInputStream(Files.newInputStream(path)))
+      }
+      val stock = use(CheckpointIO.open(reference))
+      val stream = use(new DataOutputStream(new BufferedOutputStream(Files.newOutputStream(input))))
       def writeInt(value: Int): Unit = stream.writeInt(Integer.reverseBytes(value))
       def writeTensor(file: CheckpointIO.File, key: String, parameter: Parameter): Unit =
         context.checkCancelled()
@@ -177,7 +190,13 @@ private[vulkan] object VulkanAestheticTraining:
       stream.write(CheckpointIO.encode(target, "F32"))
       parameters.foreach { parameter =>
         if sdxl && parameter.reference then writeTensor(stock, parameter.name, parameter)
-        else writeTensor(source, prefix + parameter.name, parameter)
+        else raw match
+          case Some(reader) =>
+            context.checkCancelled()
+            val bytes = reader.readNBytes(parameter.bytes)
+            if bytes.length != parameter.bytes then VulkanProtocol.invalid(s"Incomplete CLIP-L parameter ${parameter.name}")
+            stream.write(bytes)
+          case None => writeTensor(source.get, prefix + parameter.name, parameter)
       }
       writeTensor(stock, projection.name, projection)
       style.foreach { tokens =>
@@ -195,7 +214,7 @@ private[vulkan] object VulkanAestheticTraining:
           writeInt(bytes.length)
           stream.write(bytes)
         }
-    }
+    }.get
     engine.trainAesthetic(device, input, trained, config.steps, config.rate, (step, loss) =>
       if step > 0 && !cancelled() then progress(step, loss)
       !cancelled())

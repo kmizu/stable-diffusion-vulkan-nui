@@ -393,7 +393,7 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
   private def loadModel(req: LoadModelRequest): Value =
     val opts = VulkanConditioning.options(req, device.id())
     val path = Path.of(req.path).toAbsolutePath.normalize()
-    if !Files.isRegularFile(path) || !checkpoint(path) then invalid(s"A .safetensors checkpoint file is required: $path")
+    if !Files.isRegularFile(path) || !checkpoint(path) then invalid(s"A supported checkpoint file is required: $path")
     val start = System.nanoTime()
     try
       val hash = BrowserFiles.sha256(path).take(10)
@@ -404,7 +404,7 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
         case "SD 1.x" => "sd15"
         case "SDXL" => "sdxl"
         case other => other
-      val model = LoadedModel(path.getFileName.toString.dropRight(".safetensors".length), path.toString,
+      val model = LoadedModel(checkpointName(path.getFileName.toString), path.toString,
         kind, hash, (System.nanoTime() - start) / 1000000, vae.map(VulkanConditioning.stem), vaeHash,
         modelToken = Some(UUID.randomUUID().toString), vaePath = vae)
       loaded = Some(model)

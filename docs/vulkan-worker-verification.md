@@ -3,6 +3,16 @@
 
 
 
+## Windows v0.65 — PyTorch checkpoint and GGUF selection
+
+The Vulkan worker loaded an SD1.5 PyTorch ZIP `.ckpt` on Radeon 780M at 512 × 512 and an unquantized F16/F32 SDXL `.gguf` on RTX 3090 at 768 × 768. Both checkpoints were made from the same weights as the original SafeTensors fixtures. Independent decoding of a CLIP-L projection matrix and a layer-norm bias matched the output of the new extract function byte for byte. The extractor rejected an incorrect tensor shape and handled cancellation before opening the checkpoint.
+
+Changing the Aesthetic blend weight from 0.25 to 1.0 with the same seed changed both masked images and preserved every unmasked channel. The images were inspected. Zero mask blur left a visible boundary in the short test runs.
+
+An SDXL SafeTensors copy with canonical CLIP-L names also ran on RTX 3090 through native extraction. Compared with the GGUF run at the same seed and weight, the mean absolute difference inside the mask was 2.65 per 8-bit channel. Both formats preserved all unmasked pixels. The native read completes its current loading call before cancel returns.
+
+The staged `SDV-NUI.exe` resolved the `.ckpt` and `.gguf` names through MCP, generated on both adapters with `cuda=false`, wrote the slerp settings and embedding fingerprint, and preserved all unmasked pixels. All 69 Vulkan worker tests and 14 aesthetic plugin tests passed. The ZIP SHA-256 is `c0e544d457d4c4273fc9f4459c1234668a6f9010d54a1e853712e205d58b29a6`. The archived launcher, desktop JAR, worker JAR and inference DLL matched the tested staging files.
+
 ## Windows v0.64 — Aesthetic Gradients with LoRA
 
 An independent CPU PyTorch check formed a rank-two Q-projection delta and applied the fixture's alpha and adapter weight before three Adam updates. On Radeon 780M, maximum absolute loss differences were 0.000357 for SD1.5 and 0.000456 for SDXL. On RTX 3090 the SDXL difference was 0.000084 at the first step and 0.003500 at the third. The same merged weights feed the Aesthetic style projection before training.

@@ -8,6 +8,8 @@ Install the graphics manufacturer's Vulkan-capable Windows driver. The package i
 
 The worker supports SD1.5 and SDXL txt2img, img2img, masked inpainting, hires passes, external VAEs, LoRAs, textual inversion and single-network ControlNet. Sampler and scheduler choices come from the worker. See the [feature inventory](vulkan-parity.md) for individual commands, extension hooks and limits.
 
+Select a full single-file checkpoint in SafeTensors, PyTorch checkpoint or GGUF format. The model list keeps `.ckpt`, `.pt`, `.pth`, `.bin` and `.gguf` in the selection name so files with the same stem can be selected separately.
+
 When an img2img hook runs on a Vulkan graph, the worker resizes the internal canvas to the dimensions the model requires and restores the requested output size after decoding. Masked img2img composites at the output size using the original image and mask.
 
 For Fooocus Inpaint, put `inpaint_v26.fooocus.patch` and `fooocus_inpaint_head.pth` together in a configured ControlNet model directory. Enable **Fooocus Inpaint** in img2img, select the patch, and supply an image and mask with an SDXL checkpoint. An explicit head path overrides the sibling file. The start and end sliders control the head's denoising window. The patch's weight deltas apply throughout the masked pass.

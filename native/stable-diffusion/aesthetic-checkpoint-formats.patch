@@ -1,0 +1,68 @@
+--- a/src/extensions/aesthetic_train.cpp
++++ b/src/extensions/aesthetic_train.cpp
+@@ -180,6 +180,65 @@
+
+ extern "C" SD_API bool sdv_aesthetic_supports_slerp() { return true; }
+ extern "C" SD_API bool sdv_aesthetic_supports_lora() { return true; }
++
++extern "C" SD_API int sdv_aesthetic_extract_clip(const char* checkpoint, const char* output,
++                                                 int count, const char* const* names, const int64_t* dimensions,
++                                                 AestheticProgress progress, void* user_data,
++                                                 char* error, size_t error_size) {
++    try {
++        if (!checkpoint || !output || !names || !dimensions || count <= 0 || count > 196)
++            throw std::runtime_error("Invalid CLIP-L extraction request");
++        if (progress && !progress(0, 0.f, user_data)) return 1;
++        ModelLoader loader;
++        if (!loader.init_from_file_and_convert_name(checkpoint))
++            throw std::runtime_error("Cannot open CLIP-L checkpoint");
++        loader.set_n_threads(4);
++        const auto& catalog = loader.get_tensor_storage_map();
++        Owner<ggml_context, ggml_free> context(ggml_init({size_t(count) * ggml_tensor_overhead(), nullptr, true}), ggml_free);
++        Owner<ggml_backend, ggml_backend_free> cpu(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr), ggml_backend_free);
++        if (!context || !cpu) throw std::runtime_error("Cannot initialize CLIP-L checkpoint extraction");
++        std::map<std::string, Tensor> tensors;
++        std::vector<Tensor> ordered;
++        std::set<std::string> selected;
++        for (int i = 0; i < count; ++i) {
++            if (!names[i] || !starts_with(names[i], clip_prefix))
++                throw std::runtime_error("Invalid CLIP-L checkpoint parameter name");
++            const auto d0 = dimensions[2*i], d1 = dimensions[2*i+1];
++            const auto it = catalog.find(names[i]);
++            if (it == catalog.end()) throw std::runtime_error(std::string("Missing CLIP-L parameter ") + names[i]);
++            const auto& source = it->second;
++            if (d0 <= 0 || d0 > 3072 || d1 <= 0 || d1 > vocabulary || source.ne[0] != d0 ||
++                source.ne[1] != d1 || source.ne[2] != 1 || source.ne[3] != 1 || !selected.insert(names[i]).second)
++                throw std::runtime_error(std::string("Invalid CLIP-L parameter ") + names[i]);
++            auto tensor = ggml_new_tensor_2d(context.get(), GGML_TYPE_F32, d0, d1);
++            tensors.emplace(names[i], tensor);
++            ordered.push_back(tensor);
++        }
++        Owner<ggml_backend_buffer, ggml_backend_buffer_free> buffer(
++            ggml_backend_alloc_ctx_tensors(context.get(), cpu.get()), ggml_backend_buffer_free);
++        if (!buffer) throw std::runtime_error("Cannot allocate CLIP-L checkpoint parameters");
++        const auto target = [&](const TensorStorage& storage, Tensor* destination) {
++            const auto found = tensors.find(storage.name);
++            *destination = found == tensors.end() ? nullptr : found->second;
++            return true;
++        };
++        if (progress && !progress(0, 0.f, user_data)) return 1;
++        if (!loader.load_tensors(target, false, &selected, false))
++            throw std::runtime_error("Cannot read CLIP-L checkpoint parameters");
++        std::ofstream stream(std::filesystem::u8path(output), std::ios::binary);
++        for (auto tensor : ordered) {
++            if (progress && !progress(0, 0.f, user_data)) return 1;
++            if (!stream.write(static_cast<const char*>(tensor->data), ggml_nbytes(tensor)))
++                throw std::runtime_error("Cannot write extracted CLIP-L checkpoint parameters");
++        }
++        stream.close();
++        if (!stream) throw std::runtime_error("Cannot finalize extracted CLIP-L checkpoint parameters");
++        return 0;
++    } catch (const std::exception& e) {
++        if (error && error_size) std::snprintf(error, error_size, "%s", e.what());
++        return -1;
++    }
++}
+
+ extern "C" SD_API int sdv_aesthetic_train(const char* device, const char* input, const char* output,
+                                            int steps, float rate, AestheticProgress progress, void* user_data,

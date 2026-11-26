@@ -135,6 +135,9 @@ public final class VulkanInference implements AutoCloseable {
             if (symbols.find("sdv_aesthetic_train").isPresent())
                 bind("sdv_aesthetic_train", JAVA_INT, ADDRESS, ADDRESS, ADDRESS, JAVA_INT, JAVA_FLOAT,
                     ADDRESS, ADDRESS, ADDRESS, JAVA_LONG);
+            if (symbols.find("sdv_aesthetic_extract_clip").isPresent())
+                bind("sdv_aesthetic_extract_clip", JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, ADDRESS, ADDRESS,
+                    ADDRESS, ADDRESS, ADDRESS, JAVA_LONG);
             bind("sd_set_log_callback", null, ADDRESS, ADDRESS);
             call("sd_set_log_callback", LOG_STUB, NULL);
             bind("sd_set_progress_callback", null, ADDRESS, ADDRESS);
@@ -251,6 +254,28 @@ public final class VulkanInference implements AutoCloseable {
 
     public boolean supportsAestheticLora() {
         return symbols.find("sdv_aesthetic_supports_lora").isPresent();
+    }
+
+    public boolean supportsAestheticCheckpointExtraction() {
+        return calls.containsKey("sdv_aesthetic_extract_clip");
+    }
+
+    public synchronized void extractAestheticClip(Path checkpoint, Path output, String[] names, long[] dimensions,
+                                                   AestheticProgress progress) {
+        if (names.length == 0 || dimensions.length != 2 * names.length)
+            throw new IllegalArgumentException("Invalid CLIP-L checkpoint extraction request");
+        try (var arena = Arena.ofConfined()) {
+            var nativeNames = arena.allocate(ADDRESS, names.length);
+            for (int i = 0; i < names.length; i++)
+                nativeNames.setAtIndex(ADDRESS, i, arena.allocateFrom(names[i]));
+            var shape = arena.allocateFrom(JAVA_LONG, dimensions);
+            var callback = LINKER.upcallStub(AESTHETIC_HANDLER.bindTo(progress), AESTHETIC_PROGRESS, arena);
+            var error = arena.allocate(2048);
+            int status = (int) call("sdv_aesthetic_extract_clip", arena.allocateFrom(checkpoint.toString()),
+                arena.allocateFrom(output.toString()), names.length, nativeNames, shape, callback, NULL, error, error.byteSize());
+            if (status == 1) throw new CancellationException();
+            if (status != 0) throw new NativeFailure(status, error.getString(0));
+        }
     }
 
     public synchronized void trainAesthetic(String device, Path input, Path output, int steps, float rate,
