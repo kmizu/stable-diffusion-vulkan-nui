@@ -71,6 +71,16 @@ pnnx.exe gfpgan.onnx 'inputshape=[1,3,512,512]' 'fp16=0'
 
 Place `gfpgan.ncnn.bin` and `gfpgan.ncnn.param` together in a configured face restoration model directory. Select the BIN in Restore faces or Restore faces (extras). The JVM detects frontal faces and blends restored crops at the selected visibility.
 
+## Output safety filters
+
+The Windows package includes the NudeNet detector under `vulkan/bin/nsfw`. For the optional Stable Diffusion Safety Checker and NSFWJS, prepare the model files with [the converter](../scripts/build_vulkan_safety.py).
+
+```powershell
+python scripts/build_vulkan_safety.py --safety C:/models/safety_checker.bin --nsfwjs C:/models/nsfwjs.onnx --pnnx C:/tools/pnnx.exe --output C:/SDV-NUI/vulkan/bin/nsfw
+```
+
+The converter verifies the source hashes before preparing the files. The installed app uses the converted files without Python. To store the models elsewhere, set `SDFX_VULKAN_NSFW_DIR` to a directory containing the NudeNet and optional model files.
+
 ## SD-CN-Animation optical flow
 
 The video-to-video plugin uses torchvision RAFT Small C_T_V2 or Large C_T_SKHT_V2. Install the encoder and update weights for the chosen model alongside the packaged ncnn bridge. A separate build machine with PyTorch, torchvision and pnnx can prepare both variants. The following command was tested with PyTorch 2.1.2, torchvision 0.16.2 and pnnx 20261020.

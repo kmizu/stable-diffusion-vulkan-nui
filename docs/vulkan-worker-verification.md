@@ -3,6 +3,10 @@
 
 
 
+## Windows v0.45
+
+The ZIP SHA-256 is `8afb4687c47c1b01ab53fcec7a8a2546d9cd286505e0faa41b84a17a3208c0fd`. The bundled MCP `img2img` tool processed a negative-weight term through NegPiP on Radeon 780M with SD1.5 at 512 × 512. The executable from a fresh ZIP extraction repeated the test on RTX 3090 with SDXL at 768 × 768. Both workers reported `cuda=false` with a system-only PATH.
+
 ## Windows v0.44
 
 The ZIP SHA-256 is `cbe8d5908949acacca63ca626f9a40c39092938a40cc3ac8df7d3a616bfec17e`. The packaged MCP `img2img` tool ran FreeU inpainting with a PNG mask and zero mask blur. The staged executable ran SD1.5 at 512 × 512 on Radeon 780M. The executable from a fresh ZIP extraction ran SDXL at 768 × 768 on RTX 3090. Both kept every source pixel outside the mask, used a system-only PATH and reported `cuda=false`.
