@@ -3,6 +3,16 @@
 
 
 
+## Windows v0.55 — Characteristic Guidance
+
+Direct masked SDXL img2img on RTX 3090 at 768 × 768 and SD1.5 on Radeon 780M at 512 × 512 exercised the native characteristic solver. The corrected output differed inside the edit, and both adapters retained every unmasked pixel. The one-iteration fallback matched ordinary img2img pixel for pixel. RTX 3090 also reproduced the corrected seed exactly, matched the disabled job at CFG scale 1, matched the fallback with an empty negative prompt and exercised three quantile bands per latent channel.
+
+RTX 3090 exercised 832 × 832 Latent Hires, 576 × 576 Lanczos Hires and a two-evaluation window with reuse. The Lanczos path keeps built-in resizing in FP32. The complete Lanczos fallback image still differed at the pixel level from the ordinary end-to-end Hires route. The four-step, CFG 10 stress cases showed color artifacts with ordinary and corrected sampling. All 52 Vulkan worker tests and four Characteristic Guidance plugin tests passed. The images were inspected. [Characteristic Guidance paper](https://proceedings.mlr.press/v235/zheng24f.html).
+
+A separate eight-step SDXL run at CFG 6 converged in five iterations and retained the recognizable fox and meadow in both outputs. The two masked images differed inside the edit and matched outside it.
+
+The staged `SDV-NUI.exe` ran both masked models over MCP with a system-only PATH and `cuda=false`. The first evaluation converged in six iterations on RTX 3090 and five on Radeon 780M. Both PNGs recorded the CHG parameters and preserved unmasked RGB. The ZIP SHA-256 is `1cfe531dcddfa63af25fbbd67ed61da12832febef949c22f8d38425bf1eb4a16`. The archived launcher, application JAR, worker JAR and inference DLL matched the staged files.
+
 ## Windows v0.54 — Graph image dimensions
 
 Vulkan graph img2img now prepares the input image, generation mask and conditioning images at the model's internal canvas size. The worker restores the requested dimensions before compositing with the original mask. Latent Hires uses an internally aligned target as well.

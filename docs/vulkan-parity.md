@@ -136,7 +136,11 @@ LLuL crops a selected U-Net feature region, enlarges it for a second layer evalu
 
 The packaged executable ran masked SD1.5 and SDXL img2img through MCP on Radeon 780M and RTX 3090 respectively. Direct tests also covered the four advanced layer types, odd-width feature grids and both SDXL Latent Hires passes. [Verification and tested limits](vulkan-worker-verification.md#windows-v053--llul).
 
-Further Python generation hooks without a corresponding verified implementation in this inventory include `aesthetic_gradients`, `characteristic_guidance`, `compile`, `composable_lora` and `incantations`.
+### Characteristic Guidance
+
+The sampler computes a latent correction by re-evaluating the conditional and unconditional U-Net branches on Vulkan. The solver uses a global direction or per-channel quantile bands for ridge projection, Anderson acceleration and the previous step's converged correction as a warm start. Each Hires pass has its own solver. An evaluation that fails to converge uses ordinary CFG. The worker supports four-channel SD1.x, SD2.x and SDXL U-Nets with epsilon or v-prediction. IP-Adapter and ControlNet combinations are currently unsupported. [Characteristic Guidance paper](https://proceedings.mlr.press/v235/zheng24f.html).
+
+Further Python generation hooks without a corresponding verified implementation in this inventory include `aesthetic_gradients`, `compile`, `composable_lora` and `incantations`.
 
 ### Boundaries of the port
 

@@ -100,6 +100,7 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
       Option.when(backend.supportsReferenceOnly())(VulkanReference.id).toVector ++
       Option.when(backend.supportsLLLite())(VulkanLLLite.id).toVector ++
       Option.when(backend.supportsLlul())(VulkanLlul.id).toVector ++
+      Option.when(backend.supportsCharacteristic())(VulkanCharacteristic.id).toVector ++
       Option.when(backend.supportsAgentAttention())(VulkanAgentAttention.id).toVector ++
       Option.when(backend.supportsDynamicThreshold())("dynamic_thresholding") ++
       (if backend.supportsSvd() then Vector("img2vid","novel_view") else Vector.empty) ++ Option.when(sdfx.vulkan.tools.VulkanCharaImport.available)("chara_searcher") ++ Option.when(sdfx.vulkan.tools.VulkanBlip.available && !sdfx.vulkan.tools.VulkanWdTagger.available)("caption") ++ Option.when(sdfx.vulkan.tools.VulkanCustomCode.enabled)("custom_code") ++ sdfx.vulkan.tools.VulkanWdTagger.features ++ Option.when(sdfx.vulkan.tools.VulkanFaceRestore.available)("face_restore") ++ Vector("vulkan_nsfw") ++ Option.when(sdfx.vulkan.tools.VulkanSafety.available)("nsfw_checker")))
@@ -496,8 +497,17 @@ private final class VulkanWorker(backend: VulkanInference, selection: Option[Str
         !llul.canApply(requested.steps) &&
           !(requested.hires.enabled && llul.canApply(VulkanHiresGraph.fullSteps(requested)))
       }
+    val skipCharacteristic = requested.hooks.get(VulkanCharacteristic.id)
+      .filterNot(_.obj.get("enabled").contains(ujson.Bool(false)))
+      .exists { raw =>
+        val config = VulkanCharacteristic.parse(raw)
+        val base = config.applicable(requested.steps, requested.cfgScale)
+        val hires = requested.hires.enabled && config.applicable(requested.steps, requested.hires.cfgScale.getOrElse(requested.cfgScale))
+        !base && !hires
+      }
     val effectiveHooks = requested.hooks -- Option.when(skipSag)("sag") -- Option.when(skipAgent)(VulkanAgentAttention.id) --
-      Option.when(skipLLLite)(VulkanLLLite.id) -- Option.when(skipLlul)(VulkanLlul.id)
+      Option.when(skipLLLite)(VulkanLLLite.id) -- Option.when(skipLlul)(VulkanLlul.id) --
+      Option.when(skipCharacteristic)(VulkanCharacteristic.id)
     val req = if effectiveHooks.size == requested.hooks.size then gen.request
       else gen.request.copy(params = requested.copy(hooks = effectiveHooks))
     val p = req.params

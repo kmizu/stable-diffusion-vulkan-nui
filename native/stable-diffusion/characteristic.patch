@@ -1,0 +1,505 @@
+--- /dev/null
++++ b/src/dgl/ops/characteristic.h
+@@ -0,0 +1,32 @@
++#pragma once
++
++#include <functional>
++#include <vector>
++
++namespace sd::nui {
++    using ChgVector = std::vector<float>;
++
++    struct ChgConfig {
++        double regularization = 1, regularization_range = 1, reuse = 1;
++        double tolerance = 1e-4, step_size = 1, annealing_speed = .4, annealing_strength = .5;
++        int iterations = 50, bins = 0, memory = 2;
++    };
++
++    struct ChgResult {
++        ChgVector correction;
++        double residual;
++        double regularization;
++        int iterations;
++        bool converged;
++    };
++
++    class ChgSolver {
++        ChgVector previous_;
++        double previous_alpha_ = 0;
++
++    public:
++        ChgResult solve(const ChgConfig& config, size_t plane, size_t channels,
++                        double alpha, double final_alpha,
++                        const std::function<ChgVector(const ChgVector&)>& direction);
++    };
++}
+--- /dev/null
++++ b/src/dgl/ops/characteristic.cpp
+@@ -0,0 +1,252 @@
++#include "characteristic.h"
++
++#include <algorithm>
++#include <cmath>
++#include <deque>
++#include <limits>
++#include <numeric>
++#include <stdexcept>
++
++namespace sd::nui {
++    namespace {
++        using Vector = std::vector<double>;
++
++        double dot(const Vector& a, const Vector& b) {
++            return std::inner_product(a.begin(), a.end(), b.begin(), 0.);
++        }
++
++        void add_scaled(Vector& target, const Vector& source, double scale) {
++            for (size_t i = 0; i < target.size(); ++i)
++                target[i] += source[i] * scale;
++        }
++
++        // A quantile band and its channel select exactly one column at each coordinate.
++        // The columns are disjoint, so the ridge normal matrix is diagonal.
++        class Basis {
++            Vector values_;
++            std::vector<size_t> columns_;
++            Vector norms_;
++
++        public:
++            Basis(const ChgVector& direction, size_t plane, size_t channels, size_t bands)
++                : values_(direction.begin(), direction.end()), columns_(direction.size()),
++                  norms_(bands ? channels * bands : 1) {
++                if (bands) {
++                    for (size_t channel = 0; channel < channels; ++channel) {
++                        const size_t offset = channel * plane;
++                        Vector sorted(values_.begin() + offset, values_.begin() + offset + plane);
++                        std::sort(sorted.begin(), sorted.end(), std::greater<double>());
++                        Vector thresholds;
++                        for (size_t band = 1; band < bands; ++band) {
++                            const double index = double(plane - 1) * band / bands;
++                            const size_t lower = size_t(index);
++                            const double fraction = index - lower;
++                            thresholds.push_back(-(sorted[lower] * (1 - fraction) + sorted[std::min(lower + 1, plane - 1)] * fraction));
++                        }
++                        for (size_t i = offset; i < offset + plane; ++i) {
++                            const auto band = std::upper_bound(thresholds.begin(), thresholds.end(), -values_[i]);
++                            columns_[i] = channel * bands + size_t(band - thresholds.begin());
++                        }
++                    }
++                }
++                for (size_t i = 0; i < values_.size(); ++i)
++                    norms_[columns_[i]] += values_[i] * values_[i];
++                for (double& squared : norms_)
++                    squared = std::max(1e-4, std::sqrt(squared));
++                for (size_t i = 0; i < values_.size(); ++i)
++                    values_[i] /= norms_[columns_[i]];
++                std::fill(norms_.begin(), norms_.end(), 0.);
++                for (size_t i = 0; i < values_.size(); ++i)
++                    norms_[columns_[i]] += values_[i] * values_[i];
++            }
++
++            ChgVector project(const ChgVector& input, double ridge) const {
++                Vector coefficients(norms_.size());
++                for (size_t i = 0; i < input.size(); ++i)
++                    coefficients[columns_[i]] += values_[i] * input[i];
++                for (size_t i = 0; i < norms_.size(); ++i)
++                    coefficients[i] /= std::max(1e-4, norms_[i] + ridge);
++                ChgVector output(input.size());
++                for (size_t i = 0; i < output.size(); ++i)
++                    output[i] = float(values_[i] * coefficients[columns_[i]]);
++                return output;
++            }
++        };
++
++        // Spectral pseudo-inverse of the small symmetric normal matrix for rank-deficient histories.
++        Vector solve_singular(const std::vector<Vector>& columns, const Vector& rhs) {
++            const auto n = columns.size();
++            std::vector<Vector> a(n, Vector(n)), eigen(n, Vector(n));
++            Vector b(n), result(n);
++            for (size_t i = 0; i < n; ++i) {
++                eigen[i][i] = 1;
++                b[i] = dot(columns[i], rhs);
++                for (size_t j = 0; j <= i; ++j)
++                    a[i][j] = a[j][i] = dot(columns[i], columns[j]);
++            }
++            for (int sweep = 0; sweep < 32; ++sweep) {
++                double largest = 0;
++                for (size_t i = 0; i < n; ++i) {
++                    for (size_t j = i + 1; j < n; ++j) {
++                        const double off = a[i][j];
++                        largest = std::max(largest, std::abs(off));
++                        if (std::abs(off) <= 1e-12)
++                            continue;
++                        const double angle = .5 * std::atan2(2 * off, a[j][j] - a[i][i]);
++                        const double c = std::cos(angle), s = std::sin(angle);
++                        const double ai = a[i][i], aj = a[j][j];
++                        a[i][i] = c*c*ai - 2*c*s*off + s*s*aj;
++                        a[j][j] = s*s*ai + 2*c*s*off + c*c*aj;
++                        a[i][j] = a[j][i] = 0;
++                        for (size_t k = 0; k < n; ++k) {
++                            if (k != i && k != j) {
++                                const double ki = a[k][i], kj = a[k][j];
++                                a[k][i] = a[i][k] = c * ki - s * kj;
++                                a[k][j] = a[j][k] = s * ki + c * kj;
++                            }
++                            const double ki = eigen[i][k], kj = eigen[j][k];
++                            eigen[i][k] = c * ki - s * kj;
++                            eigen[j][k] = s * ki + c * kj;
++                        }
++                    }
++                }
++                if (largest <= 1e-12)
++                    break;
++            }
++            for (size_t i = 0; i < n; ++i)
++                add_scaled(result, eigen[i], dot(eigen[i], b) / std::max(a[i][i], 1e-4));
++            return result;
++        }
++
++        Vector least_squares(const std::vector<Vector>& columns, const Vector& rhs) {
++            const auto n = columns.size();
++            auto orthogonal = columns;
++            std::vector<Vector> r(n, Vector(n));
++            Vector result(n);
++            for (size_t j = 0; j < n; ++j) {
++                auto& q = orthogonal[j];
++                // Reorthogonalize to keep nearly collinear residuals well conditioned.
++                for (int pass = 0; pass < 2; ++pass)
++                    for (size_t i = 0; i < j; ++i) {
++                        const double component = dot(q, orthogonal[i]);
++                        r[i][j] += component;
++                        add_scaled(q, orthogonal[i], -component);
++                    }
++                r[j][j] = std::sqrt(dot(q, q));
++                if (r[j][j] <= 1e-8)
++                    return solve_singular(columns, rhs);
++                for (double& element : q)
++                    element /= r[j][j];
++                result[j] = dot(q, rhs);
++            }
++            for (size_t j = n; j-- > 0;) {
++                for (size_t k = j + 1; k < n; ++k)
++                    result[j] -= r[j][k] * result[k];
++                result[j] /= r[j][j];
++            }
++            return result;
++        }
++
++        class Anderson {
++            struct Difference { Vector point, residual; };
++            std::deque<Difference> differences_;
++            Vector previous_point_, previous_residual_;
++            size_t memory_;
++
++        public:
++            explicit Anderson(size_t memory) : memory_(memory) {}
++
++            void accelerate(Vector& point, Vector& residual) {
++                if (!previous_point_.empty()) {
++                    auto dp = point, dr = residual;
++                    add_scaled(dp, previous_point_, -1);
++                    add_scaled(dr, previous_residual_, -1);
++                    differences_.push_back({std::move(dp), std::move(dr)});
++                    if (differences_.size() > memory_)
++                        differences_.pop_front();
++                }
++                previous_point_ = point;
++                previous_residual_ = residual;
++                std::vector<Vector> columns;
++                Vector norms;
++                for (const auto& change : differences_) {
++                    norms.push_back(std::max(1e-4, std::sqrt(dot(change.residual, change.residual))));
++                    auto& column = columns.emplace_back(change.residual);
++                    for (double& value : column)
++                        value /= norms.back();
++                }
++                const auto coefficients = least_squares(columns, residual);
++                for (size_t i = 0; i < columns.size(); ++i) {
++                    add_scaled(point, differences_[i].point, -coefficients[i] / norms[i]);
++                    add_scaled(residual, columns[i], -coefficients[i]);
++                }
++            }
++        };
++
++        bool finite(const ChgVector& v) {
++            return std::all_of(v.begin(), v.end(), [](float x) { return std::isfinite(x); });
++        }
++    }
++
++    ChgResult ChgSolver::solve(const ChgConfig& config, size_t plane, size_t channels,
++                               double alpha, double final_alpha,
++                               const std::function<ChgVector(const ChgVector&)>& direction) {
++        const size_t count = plane * channels;
++        if (!count || !plane || !channels || config.iterations < 1 || config.memory < 1 || config.bins < 0 ||
++            !(alpha > 0 && alpha < 1 && final_alpha > 0 && final_alpha < 1) ||
++            !(config.regularization_range > 0 && config.annealing_strength > 0))
++            throw std::invalid_argument("invalid Characteristic Guidance solver configuration");
++        const auto evaluate = [&](const ChgVector& x) {
++            auto result = direction(x);
++            if (result.size() != count)
++                throw std::invalid_argument("Characteristic Guidance direction changed size");
++            return result;
++        };
++        const ChgVector zero(count);
++        ChgVector x(count);
++        if (previous_.size() == count) {
++            const double factor = config.reuse * (previous_alpha_ / alpha) *
++                                  ((1 - alpha) / (1 - previous_alpha_));
++            for (size_t i = 0; i < count; ++i)
++                x[i] = float(previous_[i] * factor);
++        }
++        const double target = config.regularization * std::pow(final_alpha / alpha, 1 / config.regularization_range);
++        double ridge = std::max(5., config.regularization);
++        ChgResult result{zero, std::numeric_limits<double>::infinity(), target, 0, false};
++        const auto at_zero = evaluate(zero);
++        if (finite(at_zero)) {
++            const Basis basis(at_zero, plane, channels, size_t(config.bins));
++            Anderson history(config.bins ? size_t(config.memory) : 1);
++            for (int i = 0; i < config.iterations; ++i) {
++                ++result.iterations;
++                const bool is_zero = std::all_of(x.begin(), x.end(), [](float value) { return value == 0; });
++                auto field = is_zero ? at_zero : evaluate(x);
++                if (i != 0)
++                    field = basis.project(field, ridge);
++                Vector point(x.begin(), x.end()), residual(count + 1);
++                for (size_t j = 0; j < count; ++j)
++                    residual[j] = point[j] - field[j];
++                const double annealing = std::sqrt(ridge * config.annealing_strength);
++                point.push_back(annealing);
++                residual.back() = config.annealing_speed * (annealing - std::sqrt(target * config.annealing_strength));
++                const auto rms = std::sqrt(dot(residual, residual) / residual.size());
++                if (!std::isfinite(rms))
++                    break;
++                result.residual = std::min(result.residual, rms);
++                if (rms < config.tolerance) {
++                    result.correction = std::move(x);
++                    result.converged = true;
++                    break;
++                }
++                history.accelerate(point, residual);
++                add_scaled(point, residual, -config.step_size);
++                for (size_t j = 0; j < count; ++j)
++                    x[j] = float(point[j]);
++                ridge = point.back() * point.back() / config.annealing_strength;
++            }
++        }
++        previous_ = result.correction;
++        previous_alpha_ = alpha;
++        return result;
++    }
++}
+--- a/src/dgl/ops/predictor.h
++++ b/src/dgl/ops/predictor.h
+@@ -15,6 +15,7 @@
+ #include "dgl/models/denoising_parameterization.h"
+ #include "dgl/models/diffusion_model.h"
+ #include "dgl/models/diffusion_prediction.h"
++#include "dgl/ops/characteristic.h"
+ #include "dgl/ops/control.h"
+ #include "dgl/ops/ip_adapter.h"
+ #include "dgl/ops/latent_modifier.h"
+@@ -53,6 +54,8 @@
+         int cfg_cache_interval = 0;
+         float cfg_cache_start = 0.25f;
+         LatentModifierOptions latent_modifier;
++        std::optional<sd::nui::ChgConfig> characteristic;
++        int characteristic_start = 0, characteristic_stop = 0;
+         std::vector<float> scale_schedule;
+
+         float scale_at(int step) const;
+@@ -121,6 +124,7 @@
+         std::unique_ptr<Resources> resources_;
+         std::map<const ApgPredictor*, sd::guidance::AdaptiveProjectedGuidance> apg_;
+         std::map<const GuidanceBranches*, std::mt19937> latent_noise_;
++        std::map<const GuidanceBranches*, sd::nui::ChgSolver> characteristic_;
+
+     public:
+         PredictionExecution(const Predictor& root, const std::vector<float>& sigmas, const PredictionExecutionOptions& options);
+--- a/src/dgl/models/diffusion_prediction.h
++++ b/src/dgl/models/diffusion_prediction.h
+@@ -68,6 +68,7 @@
+         const sd::Tensor<float>& mask;
+         int index            = 1;
+         int unet_evaluation  = 0;
++        float timestep_override = std::numeric_limits<float>::quiet_NaN();
+         size_t schedule_size = 0;
+         // Native caches use the signed solver marker to identify intermediate evaluations.
+         int solver_index                            = 1;
+--- a/src/dgl/models/dit.cpp
++++ b/src/dgl/models/dit.cpp
+@@ -380,6 +380,8 @@
+         if (parameterization.prediction() == SEFI_FLOW_PRED && !has_semantic_time)
+             throw std::runtime_error("SeFi predictions require both noise times; use sefi::sample");
+         auto base_times = has_semantic_time ? std::vector<float>{sigma * TIMESTEPS} : std::vector<float>{parameterization.timestep(sigma)};
++        if (std::isfinite(step.timestep_override))
++            base_times.front() = step.timestep_override;
+         if (options.transform) {
+             const auto transformed = options.transform({sigma, base_times.front(), scaling[2], scaling[0], scaling[1]});
+             base_times.front()     = transformed.timestep;
+--- a/src/dgl/bindings/registration.cpp
++++ b/src/dgl/bindings/registration.cpp
+@@ -610,7 +610,7 @@
+              integer("llul_up", 0, 2, 1), integer("llul_down", 0, 5, 1),
+              optional("llul_up_aa", Kind::Boolean, false), optional("llul_down_aa", Kind::Boolean, false),
+              optional("llul_slerp", Kind::Boolean, false), optional("llul_fp32", Kind::Boolean, false),
+-             optional("llul_blank_negative", Kind::Boolean, false),
++             optional("llul_blank_negative", Kind::Boolean, false), optional("sdxl_blank_negative", Kind::Boolean, false),
+              optional_list("llul_filters", Kind::String), optional("llul_mask", Kind::Tensor),
+              number("lllite_strength", 0, 10, 1), number("lllite_start", 0, 1, 0), number("lllite_end", 0, 1, 1),
+              number("reference_weight", 0, 2, 0), number("reference_style", 0, 1, 0.5),
+@@ -648,7 +648,9 @@
+             optional("image_only", Kind::Predictor), number("image_scale", 0, 1000, 1), optional_list("schedule", Kind::Number), number("pag_adaptive_decay",0,1,0), number("sag_scale",0,30,0),
+             integer("cfg_cache_interval", 0, 20, 0), number("cfg_cache_start", 0, 1, 0.25),
+             optional("latent_modifier", Kind::Dict)};
+-        registry["cfg"] = make_operation(guidance_branches, {Kind::Predictor}, make_cfg);
++        auto cfg = guidance_branches;
++        cfg.push_back(optional("characteristic", Kind::Dict));
++        registry["cfg"] = make_operation(std::move(cfg), {Kind::Predictor}, make_cfg);
+         auto apg        = guidance_branches;
+         apg.insert(apg.end(),
+                    {number("eta", -sigma_limit, sigma_limit, 1), number("momentum", -sigma_limit, sigma_limit, 0),
+--- a/src/dgl/bindings/predictor.cpp
++++ b/src/dgl/bindings/predictor.cpp
+@@ -303,7 +303,8 @@
+         output.condition = read_condition(condition, args);
+         auto& c          = output.condition;
+         if (((output.options.lllite && get_bool(args, "lllite_blank_negative")) ||
+-             (output.options.llul && sd_version_is_sdxl(engine.version()) && get_bool(args, "llul_blank_negative"))) &&
++             (sd_version_is_sdxl(engine.version()) && (get_bool(args, "sdxl_blank_negative") ||
++              (output.options.llul && get_bool(args, "llul_blank_negative"))))) &&
+             output.resolved_parameterization().prediction() != EDM_V_PRED) {
+             if (c.c_vector.empty() || c.c_vector.shape()[0] < 1280)
+                 throw std::runtime_error("SDXL negative conditioning is missing its pooled embedding");
+@@ -381,7 +381,36 @@
+     }
+
+     Value make_cfg(Values& args, RunState&) {
+-        return predictor_value(CfgPredictor{guidance_branches(args)});
++        auto branches = guidance_branches(args);
++        if (args.count("characteristic")) {
++            const auto& values = args.at("characteristic").fields;
++            sd::nui::ChgConfig chg;
++            chg.regularization = get_number(values, "regularization");
++            chg.regularization_range = get_number(values, "regularization_range");
++            chg.reuse = get_number(values, "reuse");
++            chg.tolerance = get_number(values, "tolerance");
++            chg.step_size = get_number(values, "step_size");
++            chg.annealing_speed = get_number(values, "annealing_speed");
++            chg.annealing_strength = get_number(values, "annealing_strength");
++            const auto iterations = get_int(values, "iterations");
++            const auto bins = get_int(values, "bins");
++            const auto memory = get_int(values, "memory");
++            const auto start = get_int(values, "start");
++            const auto stop = get_int(values, "stop");
++            if (iterations < 1 || iterations > INT_MAX || bins < 0 || bins > INT_MAX ||
++                memory < 1 || memory > INT_MAX || start < 0 || stop < 0 || start > INT_MAX || stop > INT_MAX ||
++                chg.regularization < 0 || chg.regularization_range <= 0 || chg.annealing_strength <= 0 ||
++                branches.scale < 1 || branches.image_only || branches.sag_scale || branches.pag_adaptive_decay ||
++                branches.cfg_cache_interval || !branches.scale_schedule.empty())
++                throw std::runtime_error("Invalid Characteristic Guidance configuration");
++            chg.iterations = int(iterations);
++            chg.bins = int(bins);
++            chg.memory = int(memory);
++            branches.characteristic = chg;
++            branches.characteristic_start = int(start);
++            branches.characteristic_stop = int(stop);
++        }
++        return predictor_value(CfgPredictor{std::move(branches)});
+     }
+
+     Value make_apg(Values& args, RunState&) {
+--- a/src/dgl/ops/predictor.cpp
++++ b/src/dgl/ops/predictor.cpp
+@@ -10,6 +10,8 @@
+ #include "dgl/models/ip_adapter.h"
+ #include "dgl/models/pulid.h"
+ #include "dgl/ops/spectrum_cache.h"
++#include "dgl/run_events.h"
++#include "runtime/denoiser.hpp"
+ #include "runtime/sample-cache.h"
+
+ namespace sd::dgl::ops {
+@@ -690,12 +692,83 @@
+             return {{}, modify_latent(branches, scale, unconditional + (denoised(pos) - unconditional) * scale)};
+         }
+
++        std::optional<Result> characteristic(const GuidanceBranches& branches, float scale) {
++            const int index = step_.unet_evaluation - 1;
++            if (!branches.characteristic || scale == 1 || index < branches.characteristic_start ||
++                index >= branches.characteristic_stop)
++                return {};
++            const auto& positive = active_branch(*branches.positive);
++            const auto& negative = active_branch(*branches.negative);
++            const auto* pos = std::get_if<ModelPredictor>(&positive.node);
++            const auto* neg = std::get_if<ModelPredictor>(&negative.node);
++            const auto& shape = x_.shape();
++            if (!pos || !neg || &pos->dit() != &neg->dit() || !sd_version_is_unet(pos->dit().version()) ||
++                shape.size() != 4 || shape[2] != 4 || shape[3] != 1 || pos->controls || neg->controls)
++                throw std::runtime_error("Characteristic Guidance requires compatible U-Net CFG branches");
++            const auto& parameters = pos->resolved_parameterization();
++            const auto prediction = parameters.prediction();
++            if (!parameters.compatible_forward(neg->resolved_parameterization()) ||
++                (prediction != EPS_PRED && prediction != V_PRED))
++                throw std::runtime_error("Characteristic Guidance requires epsilon or v-prediction");
++            if (!(sigma_ > 0))
++                return {};
++
++            auto* schedule = parameters.native();
++            const auto alpha_for_sigma = [](double sigma) { return 1 / (1 + sigma * sigma); };
++            const float timestep = std::round(parameters.timestep(sigma_));
++            const double alpha = alpha_for_sigma(schedule->t_to_sigma(timestep));
++            const double final_alpha = alpha_for_sigma(schedule->t_to_sigma(TIMESTEPS - 1));
++            const auto scaling = parameters.scalings(sigma_);
++            const double amplitude = std::sqrt(1 - alpha) / scaling[2] *
++                                     (prediction == V_PRED ? std::sqrt(scaling[0]) : 1);
++            const auto run = [&](const ModelPredictor& branch, const sd::nui::ChgVector& correction,
++                                 float shift, bool inner) {
++                check_run_cancelled();
++                auto shifted = x_;
++                for (size_t i = 0; i < correction.size(); ++i)
++                    shifted.data()[i] += shift * correction[i];
++                auto step = step_;
++                if (inner)
++                    step.timestep_override = timestep;
++                return execution_.resources_->predict_model(branch, shifted, sigma_, step, state_);
++            };
++            const auto direction = [&](const sd::nui::ChgVector& correction) {
++                auto p = run(*pos, correction, scale - 1, true);
++                auto n = run(*neg, correction, scale, true);
++                sd::nui::ChgVector field(correction.size());
++                for (size_t i = 0; i < field.size(); ++i)
++                    field[i] = float((n.output.data()[i] - p.output.data()[i]) * amplitude);
++                return field;
++            };
++            auto& solver = execution_.characteristic_[&branches];
++            const auto result = solver.solve(*branches.characteristic, size_t(shape[0] * shape[1]), 4,
++                                             alpha, final_alpha, direction);
++            LOG_INFO("Characteristic Guidance evaluation %d: %s after %d iterations (residual %.7g, ridge %.7g)",
++                     step_.unet_evaluation, result.converged ? "converged" : "plain CFG fallback",
++                     result.iterations, result.residual, result.regularization);
++            if (!result.converged)
++                return {};
++            auto p = run(*pos, result.correction, scale - 1, false);
++            auto n = run(*neg, result.correction, scale, false);
++            if (unconditional_ == &negative) {
++                auto denoised = to_denoised(n, n.output);
++                for (size_t i = 0; i < result.correction.size(); ++i)
++                    denoised.data()[i] += n.skip_scale * scale * result.correction[i];
++                results_.emplace(&negative, Result{n, std::move(denoised)});
++            }
++            // In the guided combination the shift contributions to the skip term cancel.
++            const auto output = n.output + (p.output - n.output) * scale;
++            return Result{{}, to_denoised(p, output)};
++        }
++
+         Result cfg(const GuidanceBranches& branches) {
+             auto scale = branches.scale_at(step_.index);
+             if (branches.pag_adaptive_decay > 0.f) {
+                 const auto& parameterization = primary_predictor(*branches.positive).resolved_parameterization();
+                 scale = std::max(1.f, scale - branches.pag_adaptive_decay * (1000.f - parameterization.timestep(sigma_)));
+             }
++            if (auto corrected = characteristic(branches, scale))
++                return std::move(*corrected);
+             if (branches.cfg_cache_interval >= 2 && scale > 1.f && !branches.image_only &&
+                 branches.sag_scale == 0.f && branches.negative.get() != unconditional_)
+                 return cached_cfg(branches, scale);

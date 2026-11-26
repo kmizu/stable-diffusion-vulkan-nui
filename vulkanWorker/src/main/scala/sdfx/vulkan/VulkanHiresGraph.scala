@@ -20,7 +20,8 @@ private[vulkan] object VulkanHiresGraph:
       reference: Option[VulkanReference.Config] = None,
       agent: Option[VulkanAgentAttention.Config] = None, controlWeight: Option[Double] = None,
       inpaint: Boolean = false, lllite: Option[(VulkanLLLite.Config, String)] = None,
-      llul: Option[VulkanLlul.Config] = None): Vector[String] =
+      llul: Option[VulkanLlul.Config] = None,
+      characteristic: Option[VulkanCharacteristic.Config] = None): Vector[String] =
     import VulkanProtocol.{invalid,unsupported}
     val p = req.params
     val h = p.hires
@@ -68,20 +69,27 @@ private[vulkan] object VulkanHiresGraph:
       ", concat = hr_inpaint_condition"
     else ""
     val aa = h.upscaler.contains("antialiased")
-    val randomAlgorithm = if llul.nonEmpty then "cuda" else "cpu"
+    val randomAlgorithm = if llul.nonEmpty || characteristic.nonEmpty then "cuda" else "cpu"
     lines += s"""hr_rng = make_rng("$randomAlgorithm", seed = $seed)"""
     if h.upscaler.startsWith("Latent") then
       lines += s"hr_base = tensor::interpolate(latent, size = [${width/8},${height/8}], mode = ${q(method)}, antialias = $aa)"
     else
       val saturation = cdTuner.fold("")(_.decoderArgs)
-      lines += s"hr_pixels = vae_decode(vae, unet_to_vae_latents(vae, latent)$tiled$saturation)"
-      val input = req.upscalerPaths.get(h.upscaler).fold("hr_pixels") { file =>
+      val floatPixels = characteristic.nonEmpty
+      val dtype = if floatPixels then ", dtype = \"f32\"" else ""
+      lines += s"hr_pixels = vae_decode(vae, unet_to_vae_latents(vae, latent)$tiled$saturation$dtype)"
+      val pixelModel = req.upscalerPaths.get(h.upscaler)
+      val input = pixelModel.fold("hr_pixels") { file =>
         lines += s"hr_upscaler = load_upscaler(${q(VulkanConditioning.file(file,"upscaler"))}, backend = ${q(device)})"
-        lines += "hr_large = upscale(hr_upscaler, hr_pixels)"
+        val pixels = if floatPixels then "image::to_u8(hr_pixels)" else "hr_pixels"
+        lines += s"hr_large = upscale(hr_upscaler, $pixels)"
         "hr_large"
       }
-      lines += s"hr_resized = tensor::interpolate($input, size = [$width,$height], axes = [1,2], mode = ${q(method)})"
-      lines += s"hr_base = vae_to_unet_latents(vae, vae_encode(vae, image::to_f32(hr_resized), rng = hr_rng$tiled))"
+      val floatResize = floatPixels && pixelModel.isEmpty
+      val axes = if floatResize then "" else ", axes = [1,2]"
+      lines += s"hr_resized = tensor::interpolate($input, size = [$width,$height]$axes, mode = ${q(method)})"
+      val pixels = if floatResize then "hr_resized" else "image::to_f32(hr_resized)"
+      lines += s"hr_base = vae_to_unet_latents(vae, vae_encode(vae, $pixels, rng = hr_rng$tiled))"
     val llliteArgs = lllite.fold("") { (config, path) =>
       val hint = if config.image.nonEmpty then "hr_lllite_image"
         else if h.upscaler.startsWith("Latent") then
@@ -100,6 +108,7 @@ private[vulkan] object VulkanHiresGraph:
       val blank = if name != "neg" || prompt.nonEmpty then ""
         else if lllite.nonEmpty then ", lllite_blank_negative = true"
         else if llul.nonEmpty then ", llul_blank_negative = true"
+        else if characteristic.nonEmpty then ", sdxl_blank_negative = true"
         else ""
       val condition = controlWeight.fold(encoded)(weight =>
         s"controlnet::apply($encoded, control_model, hr_control_hint, strength = $weight)")
@@ -112,7 +121,8 @@ private[vulkan] object VulkanHiresGraph:
     val count = (full*h.denoisingStrength).toInt.min(full).max(1)
     val cfg = h.cfgScale.getOrElse(p.cfgScale)
     val cfgTiming = if cacheArgs.nonEmpty then VulkanGraph.cacheCfgArguments(p.hooks, cfg, count) else ""
-    lines += s"hr_guided = cfg(hr_pos, hr_neg, scale = $cfg$cfgTiming)"
+    val chgArgs = characteristic.fold("")(_.args(p.steps, cfg))
+    lines += s"hr_guided = cfg(hr_pos, hr_neg, scale = $cfg$cfgTiming$chgArgs)"
     lines += s"hr_full = make_sigmas(hr_guided, latent = hr_base, scheduler = ${q(scheduler)}, steps = $full)"
     lines += s"hr_sigmas = hr_full[${full-count}:]"
     val noise = if customNoise then "hr_noise" else "tensor::randn_like(hr_base, rng = hr_rng)"
